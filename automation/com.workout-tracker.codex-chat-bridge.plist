@@ -47,9 +47,9 @@
   <integer>10</integer>
 
   <key>StandardOutPath</key>
-  <string>__RUNTIME_ROOT__/logs/launchd.out.log</string>
+  <string>/dev/null</string>
 
   <key>StandardErrorPath</key>
-  <string>__RUNTIME_ROOT__/logs/launchd.err.log</string>
+  <string>/dev/null</string>
 </dict>
 </plist>

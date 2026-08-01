@@ -12,8 +12,11 @@ export function CoachStatus({
   const active = context?.activeWorkout ?? null
   const setCount =
     active?.exercises.reduce((sum, exercise) => sum + exercise.sets.length, 0) ?? 0
-  const working = (remote?.counts.queued ?? 0) + (remote?.counts.processing ?? 0) > 0
+  const queued = (remote?.counts.queued ?? 0) > 0
+  const processing = (remote?.counts.processing ?? 0) > 0
+  const working = queued || processing
   const online = remote?.bridge?.online === true
+  const workLabel = online ? (processing ? 'Thinking' : 'Queued') : 'Waiting for Mac'
 
   return (
     <div
@@ -47,7 +50,12 @@ export function CoachStatus({
       </span>
       {working && (
         <span className="shrink-0 inline-flex items-center gap-1.5 text-[11px] text-[var(--color-fg-dim)]">
-          <LoaderCircle size={12} className="animate-spin" /> Thinking
+          {online ? (
+            <LoaderCircle size={12} className="animate-spin" />
+          ) : (
+            <WifiOff size={12} />
+          )}
+          {workLabel}
         </span>
       )}
     </div>

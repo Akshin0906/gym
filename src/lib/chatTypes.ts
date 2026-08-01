@@ -46,6 +46,12 @@ export interface CoachQueueCounts {
   proposed: number
 }
 
+export interface CoachPendingJob {
+  id: string
+  status: 'queued' | 'leased'
+  createdAt: number
+}
+
 export interface CoachConversationState {
   conversation: {
     id: string
@@ -54,7 +60,9 @@ export interface CoachConversationState {
   } | null
   bridge: CoachBridgeState | null
   counts: CoachQueueCounts
+  pendingJobs: CoachPendingJob[]
   latestMessageSequence: number
+  latestProposalUpdatedAt: number
 }
 
 export interface CoachTranscriptPage {
@@ -119,11 +127,16 @@ export type CoachActionScope =
   | 'one_time_workout'
   | 'program'
 
+export type CoachActionStateHashes = {
+  [Scope in CoachActionScope]: string
+}
+
 export interface CoachActionPlan {
   title: string
   summary: string
   scope: CoachActionScope
   sourceStateHash: string
+  sourceActionStateHash: string
   actions: CoachAction[]
 }
 
@@ -137,6 +150,7 @@ export interface CoachActionResult {
   proposalId: string
   appliedAt: number
   sourceStateHash: string
+  sourceActionStateHash: string
   replayed: boolean
   changes: CoachActionChange[]
   activeSessionId?: string

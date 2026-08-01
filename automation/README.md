@@ -124,8 +124,13 @@ an OpenAI API key.
   across bridge/App Server restarts.
 - D1 remains the canonical transcript. If a saved Codex thread cannot resume,
   a new thread is seeded from the immutable job context and D1 transcript.
+- Healthy resumed threads receive the fresh full workout context and current
+  message without resending transcript history that the thread already owns.
+  New and recovery threads receive the bounded D1 transcript seed as well.
 - The bridge has no inbound listener. It polls over HTTPS, renews an exclusive
-  job lease, and sends a heartbeat.
+  job lease, and sends a heartbeat. Empty claims back off from 2 seconds to a
+  10-second cap, reset immediately after activity or restart, and continue
+  emitting the independent 20-second heartbeat throughout idle waits.
 - A validated completion is written to a private local spool before upload, so
   an outage does not consume a duplicate model turn.
 - Codex receives no cloud secret. Apps, plugins, browser/computer use, hooks,
@@ -145,6 +150,13 @@ The launch agent wraps the bridge in `caffeinate -s`, which prevents system
 sleep while the Mac is connected to AC power. Runtime data lives under
 `~/.workout-tracker-codex-chat`.
 
+Operational logs are bounded: `logs/bridge.log` and App Server stderr rotate at
+2 MiB with three backups. Launchd's otherwise-unbounded raw stdout/stderr are
+discarded because the same bridge events are already captured by the rotating
+log. Updates retain the active release plus the newest releases, prune rejected
+completion diagnostics after 30 days or 50 files per category, and never prune
+validated root completion spools awaiting upload.
+
 The cloud worker contract is:
 
 - `POST /api/chat/automation/heartbeat`
@@ -156,6 +168,8 @@ The cloud worker contract is:
 All five requests authenticate with `X-Cloud-Automation-Secret`. Claimed jobs
 must use exactly `medium` or `xhigh`; a missing value safely defaults to
 `medium`. Action plans use the typed DSL in `codex_chat_output_schema.json` and
-are proposals only. The trusted bridge and worker bind them to the claimed
-context's `sourceStateHash`; the phone must still validate and confirm them
-before applying a local IndexedDB transaction.
+are proposals only. After validating model output, the trusted bridge binds a
+plan to both the claimed context's global `sourceStateHash` and the 64-character
+lowercase `actionStateHashes[scope]` value as `sourceActionStateHash`. The model
+cannot supply either trusted value. The phone must still validate and confirm
+the proposal before applying a local IndexedDB transaction.

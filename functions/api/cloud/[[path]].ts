@@ -3,7 +3,9 @@
 // and writes one fixed daily briefing per America/Los_Angeles date.
 
 import {
+  requireAutomationSecret,
   requireCloudAuth,
+  requireDeviceSession,
   type D1Database,
 } from '../../lib/cloudAuth'
 
@@ -110,6 +112,17 @@ function trimmedString(v: unknown, maxLength: number): string {
 function routePath(ctx: PagesContext): string {
   const raw = ctx.params.path
   return Array.isArray(raw) ? raw.join('/') : (raw ?? '')
+}
+
+function requireSameOriginForMutation(request: Request): Response | null {
+  const origin = request.headers.get('origin')
+  if (!origin) return null
+  try {
+    if (new URL(origin).origin === new URL(request.url).origin) return null
+  } catch {
+    // Malformed and opaque origins are not valid for cookie-authenticated writes.
+  }
+  return json(403, { error: 'cross_origin_request_rejected' })
 }
 
 function parseJson(raw: string): unknown | null {
@@ -708,11 +721,27 @@ async function handlePutMemory(ctx: PagesContext): Promise<Response> {
 
 export const onRequest = async (ctx: PagesContext): Promise<Response> => {
   try {
-    const authError = await requireCloudAuth(ctx.request, ctx.env)
-    if (authError) return authError
-
     const path = routePath(ctx)
     const method = ctx.request.method.toUpperCase()
+
+    if (path === 'snapshot' && method === 'PUT') {
+      const originError = requireSameOriginForMutation(ctx.request)
+      if (originError) return originError
+      const authError = await requireDeviceSession(ctx.request, ctx.env)
+      if (authError) return authError
+    } else if (
+      (path === 'memory' && method === 'PUT') ||
+      (path.match(/^briefing\/[^/]+$/) && method === 'PUT')
+    ) {
+      const authError = requireAutomationSecret(ctx.request, ctx.env)
+      if (authError) return authError
+    } else {
+      // Read routes are consumed by both the paired app and the local
+      // automation. The automation secret cannot mutate the phone snapshot.
+      const authError = await requireCloudAuth(ctx.request, ctx.env)
+      if (authError) return authError
+    }
+
     if (path === 'snapshot' && method === 'GET') {
       return await handleGetSnapshot(ctx.env.WORKOUT_DB)
     }
@@ -741,9 +770,7 @@ export const onRequest = async (ctx: PagesContext): Promise<Response> => {
   } catch (err) {
     // D1 / runtime failures would otherwise escape as a non-JSON HTML 500.
     // Keep the client on a parseable contract.
-    return json(500, {
-      error: 'internal_error',
-      detail: err instanceof Error ? err.message : String(err),
-    })
+    console.error('cloud api failure', err)
+    return json(500, { error: 'internal_error' })
   }
 }

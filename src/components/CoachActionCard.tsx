@@ -61,7 +61,6 @@ function ResultBadge({ status }: { status: CoachProposal['status'] }) {
 export function CoachActionCard({
   proposal,
   context,
-  currentStateHash,
   busy,
   error,
   onApply,
@@ -69,7 +68,6 @@ export function CoachActionCard({
 }: {
   proposal: CoachProposal
   context: CoachLiveContext | null
-  currentStateHash: string | null
   busy: boolean
   error: string | null
   onApply: () => void
@@ -85,8 +83,9 @@ export function CoachActionCard({
   const stale = Boolean(
     proposal.status === 'proposed' &&
       plan &&
-      currentStateHash &&
-      plan.sourceStateHash !== currentStateHash.toLowerCase(),
+      context?.actionStateHashes[plan.scope] &&
+      plan.sourceActionStateHash !==
+        context.actionStateHashes[plan.scope].toLowerCase(),
   )
   const remoteError =
     proposal.status === 'failed' &&
@@ -161,7 +160,7 @@ export function CoachActionCard({
               {invalid ??
                 error ??
                 remoteError ??
-                'Your workout changed since this was suggested. Ask Coach for an updated plan.'}
+                'The data this plan would change has been updated. Ask Coach for an updated plan.'}
             </span>
           </div>
         )}

@@ -5,6 +5,7 @@ import type {
   CoachActionPlan,
   CoachActionResult,
   CoachActionScope,
+  CoachActionStateHashes,
   PlannedExercise,
 } from '../../lib/chatTypes'
 
@@ -17,7 +18,7 @@ export class CoachActionValidationError extends Error {
 
 export class StaleCoachActionError extends Error {
   constructor() {
-    super('Your workout changed after Coach made this plan. Ask Coach to refresh it.')
+    super('The data this Coach plan would change has been updated. Ask Coach to refresh it.')
     this.name = 'StaleCoachActionError'
   }
 }
@@ -54,6 +55,14 @@ function nonNegativeInteger(value: unknown, label: string): number {
     throw new CoachActionValidationError(`${label} must be a whole number from 0 to 1000`)
   }
   return value as number
+}
+
+function requiredHash(value: unknown, label: string): string {
+  const hash = requiredString(value, label, 128).toLowerCase()
+  if (!/^[a-f0-9]{64}$/.test(hash)) {
+    throw new CoachActionValidationError(`${label} must be a SHA-256 fingerprint`)
+  }
+  return hash
 }
 
 function parsePlannedExercises(value: unknown, label: string): PlannedExercise[] {
@@ -228,14 +237,11 @@ export function parseCoachActionPlan(raw: unknown): CoachActionPlan {
   if (!isScope(raw.scope)) {
     throw new CoachActionValidationError('Action plan has an invalid scope')
   }
-  const sourceStateHash = requiredString(
-    raw.sourceStateHash,
-    'sourceStateHash',
-    128,
-  ).toLowerCase()
-  if (!/^[a-f0-9]{64}$/.test(sourceStateHash)) {
-    throw new CoachActionValidationError('Action plan has an invalid state fingerprint')
-  }
+  const sourceStateHash = requiredHash(raw.sourceStateHash, 'sourceStateHash')
+  const sourceActionStateHash = requiredHash(
+    raw.sourceActionStateHash,
+    'sourceActionStateHash',
+  )
   if (!Array.isArray(raw.actions) || raw.actions.length === 0 || raw.actions.length > 12) {
     throw new CoachActionValidationError('Action plan must contain 1 to 12 actions')
   }
@@ -244,6 +250,7 @@ export function parseCoachActionPlan(raw: unknown): CoachActionPlan {
     summary: requiredString(raw.summary, 'summary', 1000),
     scope: raw.scope,
     sourceStateHash,
+    sourceActionStateHash,
     actions: raw.actions.map(parseAction),
   }
   validateScope(plan)
@@ -310,18 +317,36 @@ export async function applyCoachActionPlan(args: {
   proposalId: string
   rawPlan: unknown
   currentStateHash: string
+  currentActionStateHashes: CoachActionStateHashes
 }): Promise<CoachActionResult> {
   const proposalId = requiredString(args.proposalId, 'proposalId')
   const plan = parseCoachActionPlan(args.rawPlan)
+  requiredHash(args.currentStateHash, 'currentStateHash')
+  const currentActionStateHash = requiredHash(
+    args.currentActionStateHashes[plan.scope],
+    `currentActionStateHashes.${plan.scope}`,
+  )
 
   const prior = await db.chatActionReceipts.get(proposalId)
   if (prior) {
     if (prior.sourceStateHash !== plan.sourceStateHash) {
       throw new CoachActionValidationError('Proposal ID conflicts with an applied action')
     }
-    return { ...parseStoredResult(prior.resultJson), replayed: true }
+    const stored = parseStoredResult(prior.resultJson)
+    if (
+      stored.sourceActionStateHash &&
+      stored.sourceActionStateHash !== plan.sourceActionStateHash
+    ) {
+      throw new CoachActionValidationError('Proposal ID conflicts with an applied action')
+    }
+    return {
+      ...stored,
+      sourceActionStateHash:
+        stored.sourceActionStateHash ?? plan.sourceActionStateHash,
+      replayed: true,
+    }
   }
-  if (args.currentStateHash.toLowerCase() !== plan.sourceStateHash) {
+  if (currentActionStateHash !== plan.sourceActionStateHash) {
     throw new StaleCoachActionError()
   }
 
@@ -344,7 +369,21 @@ export async function applyCoachActionPlan(args: {
             'Proposal ID conflicts with an applied action',
           )
         }
-        return { ...parseStoredResult(raced.resultJson), replayed: true }
+        const stored = parseStoredResult(raced.resultJson)
+        if (
+          stored.sourceActionStateHash &&
+          stored.sourceActionStateHash !== plan.sourceActionStateHash
+        ) {
+          throw new CoachActionValidationError(
+            'Proposal ID conflicts with an applied action',
+          )
+        }
+        return {
+          ...stored,
+          sourceActionStateHash:
+            stored.sourceActionStateHash ?? plan.sourceActionStateHash,
+          replayed: true,
+        }
       }
 
       const now = Date.now()
@@ -352,6 +391,7 @@ export async function applyCoachActionPlan(args: {
         proposalId,
         appliedAt: now,
         sourceStateHash: plan.sourceStateHash,
+        sourceActionStateHash: plan.sourceActionStateHash,
         replayed: false,
         changes: [],
       }
@@ -514,15 +554,27 @@ export async function applyCoachActionPlan(args: {
             break
           }
           case 'create_one_time_workout': {
+            await validatePlannedExerciseIds(action.exercises)
             const existing = await db.workoutSessions
               .filter((session) => session.completedAt === null)
-              .first()
-            if (existing) {
-              throw new CoachActionValidationError(
-                `Finish or discard ${existing.name} before starting another workout`,
-              )
+              .toArray()
+            if (existing.length > 0) {
+              const existingIds = existing.map((session) => session.id)
+              const existingSets = await db.loggedSets
+                .where('workoutSessionId')
+                .anyOf(existingIds)
+                .toArray()
+              const workedSessionId = existingSets[0]?.workoutSessionId
+              if (workedSessionId) {
+                const workedSession = existing.find(
+                  (session) => session.id === workedSessionId,
+                )
+                throw new CoachActionValidationError(
+                  `Finish or discard ${workedSession?.name ?? 'your active workout'} before starting another workout`,
+                )
+              }
+              await db.workoutSessions.bulkDelete(existingIds)
             }
-            await validatePlannedExerciseIds(action.exercises)
             const sessionId = crypto.randomUUID()
             await db.workoutSessions.add({
               id: sessionId,

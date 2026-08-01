@@ -146,7 +146,7 @@ export async function requireDeviceSession(
   env: CloudAuthEnv,
 ): Promise<Response | null> {
   if (!env.WORKOUT_DB) {
-    return json(500, { error: 'server_misconfigured: WORKOUT_DB unset' })
+    return json(500, { error: 'internal_error' })
   }
   const session = await readCloudSession(request, env)
   if (session) return null
@@ -158,12 +158,10 @@ export function requireAutomationSecret(
   env: CloudAuthEnv,
 ): Response | null {
   if (!env.WORKOUT_DB) {
-    return json(500, { error: 'server_misconfigured: WORKOUT_DB unset' })
+    return json(500, { error: 'internal_error' })
   }
   if (!env.CLOUD_AUTOMATION_SECRET?.trim()) {
-    return json(500, {
-      error: 'server_misconfigured: CLOUD_AUTOMATION_SECRET unset',
-    })
+    return json(500, { error: 'internal_error' })
   }
   if (hasAutomationAuth(request, env)) return null
   return json(401, { error: 'unauthorized' })
@@ -174,7 +172,7 @@ export async function requireCloudAuth(
   env: CloudAuthEnv,
 ): Promise<Response | null> {
   if (!env.WORKOUT_DB) {
-    return json(500, { error: 'server_misconfigured: WORKOUT_DB unset' })
+    return json(500, { error: 'internal_error' })
   }
   if (hasAutomationAuth(request, env)) return null
   return requireDeviceSession(request, env)

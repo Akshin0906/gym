@@ -28,7 +28,7 @@ export function Header({ title, subtitle, back, right }: HeaderProps) {
           onClick={() =>
             typeof back === 'string' ? navigate(back) : navigate(-1)
           }
-          className="-ml-1 p-1 text-[var(--color-fg-dim)] hover:text-[var(--color-fg)]"
+          className="-ml-2 min-h-11 min-w-11 grid place-items-center text-[var(--color-fg-dim)] hover:text-[var(--color-fg)]"
         >
           <ChevronLeft size={24} strokeWidth={2} />
         </button>
@@ -53,7 +53,7 @@ export function SettingsLink() {
     <Link
       to="/settings"
       aria-label="Settings"
-      className="p-2 text-[var(--color-fg-dim)] hover:text-[var(--color-fg)]"
+      className="min-h-11 min-w-11 grid place-items-center text-[var(--color-fg-dim)] hover:text-[var(--color-fg)]"
     >
       <Settings size={20} strokeWidth={1.75} />
     </Link>
@@ -74,7 +74,7 @@ export function CoachLink({
     <Link
       to={`/coach${search}`}
       aria-label="Open Coach"
-      className={`p-2 text-[var(--color-fg-dim)] hover:text-[var(--color-fg)] ${className}`}
+      className={`min-h-11 min-w-11 grid place-items-center text-[var(--color-fg-dim)] hover:text-[var(--color-fg)] ${className}`}
     >
       <MessageCircle size={20} strokeWidth={1.75} />
     </Link>

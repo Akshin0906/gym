@@ -107,10 +107,65 @@ os.replace(sys.argv[1], sys.argv[2])
 PY
 }
 
+prune_runtime() {
+  /usr/bin/python3 - "$RUNTIME_ROOT" <<'PY'
+import shutil
+import sys
+import time
+from pathlib import Path
+
+runtime = Path(sys.argv[1]).expanduser().resolve()
+releases = runtime / "releases"
+current_link = runtime / "current"
+active = current_link.resolve() if current_link.exists() else None
+
+if releases.is_dir():
+    candidates = sorted(
+        (path for path in releases.iterdir() if path.is_dir() and not path.is_symlink()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    keep = set(candidates[:3])
+    if active is not None:
+        keep.add(active)
+    for path in candidates:
+        if path not in keep:
+            shutil.rmtree(path)
+
+for path in runtime.glob(".current-next-*"):
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+
+# Root spool JSON files are validated completions awaiting publication and are
+# deliberately never pruned. Only rejected diagnostics are age/count bounded.
+now = time.time()
+for category in ("invalid", "stale"):
+    directory = runtime / "state" / "spool" / category
+    if not directory.is_dir():
+        continue
+    files = sorted(
+        (path for path in directory.glob("*.json") if path.is_file()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for index, path in enumerate(files):
+        if index >= 50 or now - path.stat().st_mtime > 30 * 24 * 60 * 60:
+            path.unlink()
+
+# Older versions sent launchd's raw streams to these unbounded files. The new
+# agent sends those streams to /dev/null and writes bounded bridge.log files.
+for name in ("launchd.out.log", "launchd.err.log"):
+    path = runtime / "logs" / name
+    if path.is_file():
+        path.unlink()
+PY
+}
+
 reload_agent() {
   mkdir -p "$AGENTS_DIR"
   render_plist
   launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+  prune_runtime
   launchctl bootstrap "$DOMAIN" "$PLIST_TARGET"
   launchctl enable "$DOMAIN/$LABEL"
 }

@@ -1,6 +1,7 @@
 import type {
   CoachConversationState,
   CoachMessage,
+  CoachPendingJob,
   CoachProposal,
   CoachProposalStatus,
   CoachReasoningEffort,
@@ -138,6 +139,17 @@ export async function fetchCoachState(): Promise<CoachConversationState> {
       }
     : null
   const countsRaw = isObject(raw.counts) ? raw.counts : {}
+  const pendingJobs = Array.isArray(raw.pendingJobs)
+    ? raw.pendingJobs.flatMap((item) => {
+        if (!isObject(item)) return []
+        const id = stringValue(item.id)
+        const status = item.status
+        if (!id || (status !== 'queued' && status !== 'leased')) return []
+        return [
+          { id, status, createdAt: numberValue(item.createdAt) } satisfies CoachPendingJob,
+        ]
+      })
+    : []
 
   return {
     conversation,
@@ -147,7 +159,9 @@ export async function fetchCoachState(): Promise<CoachConversationState> {
       processing: numberValue(countsRaw.processing),
       proposed: numberValue(countsRaw.proposed),
     },
+    pendingJobs,
     latestMessageSequence: numberValue(raw.latestMessageSequence),
+    latestProposalUpdatedAt: numberValue(raw.latestProposalUpdatedAt),
   }
 }
 
@@ -178,7 +192,7 @@ export async function fetchFullCoachTranscript(): Promise<CoachTranscriptPage> {
   let cursor = 0
   let hasMore = true
   let pages = 0
-  while (hasMore && pages < 25) {
+  while (hasMore && pages < 100) {
     const page = await fetchCoachTranscriptPage(cursor)
     messages.push(...page.messages)
     proposals.push(...page.proposals)
@@ -189,7 +203,16 @@ export async function fetchFullCoachTranscript(): Promise<CoachTranscriptPage> {
     hasMore = page.hasMore
     pages += 1
   }
+  if (hasMore) {
+    throw new Error('Coach transcript is too large to load safely')
+  }
   return { messages, proposals, nextCursor: cursor, hasMore }
+}
+
+export async function cancelCoachJob(jobId: string): Promise<void> {
+  await jsonRequest(`/api/chat/jobs/${encodeURIComponent(jobId)}/cancel`, {
+    method: 'POST',
+  })
 }
 
 export async function postCoachMessage(args: {

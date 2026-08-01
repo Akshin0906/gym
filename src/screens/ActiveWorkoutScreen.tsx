@@ -14,6 +14,7 @@ import {
   deleteSession,
   endSession,
   getLastSessionSetsForExercise,
+  getResumableSession,
   getSession,
   getSetsForSession,
   setSessionDoneExercises,
@@ -105,8 +106,18 @@ export function ActiveWorkoutScreen() {
       void loadAll(sessionId)
       return
     }
-    if (!hadSessionRef.current) navigate('/')
-  }, [sessionId, loadAll, navigate])
+    if (hadSessionRef.current) return
+
+    let cancelled = false
+    void getResumableSession().then((resumable) => {
+      if (cancelled) return
+      if (resumable) setActiveSession(resumable.id)
+      else navigate('/')
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [sessionId, loadAll, navigate, setActiveSession])
 
   async function handlePick(exerciseId: string) {
     if (!session) return

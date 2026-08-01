@@ -4,23 +4,6 @@ import tailwindcss from '@tailwindcss/vite'
 import { VitePWA } from 'vite-plugin-pwa'
 
 export default defineConfig({
-  build: {
-    rollupOptions: {
-      output: {
-        // Split the heavy, rarely-changing libs into their own chunks so the
-        // route splitting actually pays off: recharts (only on Stats + the
-        // active-workout detail overlay) and date-fns load on demand and are
-        // cached across deploys instead of riding in the main bundle.
-        manualChunks(id) {
-          if (id.includes('node_modules/recharts') || id.includes('node_modules/d3-')) {
-            return 'recharts'
-          }
-          if (id.includes('node_modules/date-fns')) return 'date-fns'
-          return undefined
-        },
-      },
-    },
-  },
   plugins: [
     react(),
     tailwindcss(),

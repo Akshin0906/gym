@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Bot, LoaderCircle, Sparkles, Trash2 } from 'lucide-react'
-import { useSearchParams } from 'react-router-dom'
+import { Bot, LoaderCircle, Sparkles, Trash2, WifiOff } from 'lucide-react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { CoachActionCard } from '../components/CoachActionCard'
 import { CoachComposer } from '../components/CoachComposer'
 import { CoachStatus } from '../components/CoachStatus'
@@ -8,11 +8,14 @@ import { Header } from '../components/Header'
 import {
   applyCoachActionPlan,
   getAppliedCoachActionResult,
+  parseCoachActionPlan,
 } from '../db/repositories/chatActions'
 import {
+  cancelCoachJob,
   clearCoachConversation,
   dismissCoachProposal,
   fetchCoachState,
+  fetchCoachTranscriptPage,
   fetchFullCoachTranscript,
   postCoachMessage,
   reportCoachProposalResult,
@@ -76,6 +79,7 @@ function MessageBubble({ message }: { message: CoachMessage }) {
 }
 
 export function CoachScreen() {
+  const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const preferredSessionId = searchParams.get('sessionId') ?? undefined
   const returnTo = safeReturnPath(searchParams.get('returnTo'))
@@ -84,95 +88,207 @@ export function CoachScreen() {
   const [messages, setMessages] = useState<CoachMessage[]>([])
   const [proposals, setProposals] = useState<CoachProposal[]>([])
   const [context, setContext] = useState<CoachLiveContext | null>(null)
-  const [stateHash, setStateHash] = useState<string | null>(null)
   const [localApplied, setLocalApplied] = useState<Map<string, CoachActionResult>>(
     () => new Map(),
   )
   const [loading, setLoading] = useState(true)
   const [sending, setSending] = useState(false)
+  const [cancellingJobId, setCancellingJobId] = useState<string | null>(null)
   const [busyProposalId, setBusyProposalId] = useState<string | null>(null)
   const [proposalErrors, setProposalErrors] = useState<Map<string, string>>(
     () => new Map(),
   )
   const [pageError, setPageError] = useState<string | null>(null)
-  const refreshInFlight = useRef(false)
+  const remoteRefreshInFlight = useRef(false)
+  const transcriptCursor = useRef(0)
+  const remoteRef = useRef<CoachConversationState | null>(null)
   const endRef = useRef<HTMLDivElement>(null)
 
-  const refresh = useCallback(
-    async (quiet = false) => {
-      if (refreshInFlight.current) return
-      refreshInFlight.current = true
-      const errors: string[] = []
-      try {
-        try {
-          const live = await buildLiveCoachContext(preferredSessionId)
-          setContext(live.context)
-          setStateHash(live.stateHash)
-        } catch (caught) {
-          errors.push(caught instanceof Error ? caught.message : String(caught))
-        }
+  const refreshLocalContext = useCallback(async () => {
+    const live = await buildLiveCoachContext(preferredSessionId)
+    setContext(live.context)
+    return live
+  }, [preferredSessionId])
 
-        try {
-          const [nextRemote, transcript] = await Promise.all([
-            fetchCoachState(),
-            fetchFullCoachTranscript(),
-          ])
-          setRemote(nextRemote)
-          setMessages(transcript.messages.sort((a, b) => a.sequence - b.sequence))
-          setProposals(
-            transcript.proposals.sort((a, b) => a.createdAt - b.createdAt),
-          )
-
-          const receiptPairs = await Promise.all(
-            transcript.proposals.map(async (proposal) => [
-              proposal.id,
-              await getAppliedCoachActionResult(proposal.id),
-            ] as const),
-          )
-          const receipts = new Map<string, CoachActionResult>()
-          for (const [id, result] of receiptPairs) {
-            if (result) receipts.set(id, result)
-          }
-          setLocalApplied(receipts)
-          for (const proposal of transcript.proposals) {
-            const receipt = receipts.get(proposal.id)
-            if (receipt && proposal.status === 'proposed') {
-              void reportCoachProposalResult(proposal.id, 'applied', {
-                result: receipt,
-              }).catch(() => {
-                // The receipt will safely retry this reconciliation next refresh.
-              })
-            }
-          }
-        } catch (caught) {
-          errors.push(caught instanceof Error ? caught.message : String(caught))
-        }
-        if (errors.length === 0) setPageError(null)
-        else if (!quiet) setPageError(errors[0])
-      } finally {
-        setLoading(false)
-        refreshInFlight.current = false
+  const reconcileReceipts = useCallback(async (incoming: CoachProposal[]) => {
+    if (incoming.length === 0) return
+    const receiptPairs = await Promise.all(
+      incoming.map(async (proposal) => [
+        proposal.id,
+        await getAppliedCoachActionResult(proposal.id),
+      ] as const),
+    )
+    const receipts = new Map<string, CoachActionResult>()
+    for (const [id, result] of receiptPairs) {
+      if (result) receipts.set(id, result)
+    }
+    setLocalApplied((current) => {
+      const next = new Map(current)
+      for (const [id, result] of receipts) next.set(id, result)
+      return next
+    })
+    for (const proposal of incoming) {
+      const receipt = receipts.get(proposal.id)
+      if (receipt && proposal.status === 'proposed') {
+        void reportCoachProposalResult(proposal.id, 'applied', {
+          result: receipt,
+        }).catch(() => {
+          // The durable local receipt safely retries on a later refresh.
+        })
       }
+    }
+  }, [])
+
+  const ingestTranscript = useCallback(
+    async (
+      transcript: {
+        messages: CoachMessage[]
+        proposals: CoachProposal[]
+        nextCursor: number
+      },
+      replace: boolean,
+    ) => {
+      transcriptCursor.current = transcript.nextCursor
+      const sortedMessages = transcript.messages.slice().sort((a, b) => a.sequence - b.sequence)
+      const sortedProposals = transcript.proposals.slice().sort((a, b) => a.createdAt - b.createdAt)
+      setMessages((current) =>
+        replace
+          ? sortedMessages
+          : mergeById(current, sortedMessages).sort((a, b) => a.sequence - b.sequence),
+      )
+      setProposals((current) =>
+        replace
+          ? sortedProposals
+          : mergeById(current, sortedProposals).sort((a, b) => a.createdAt - b.createdAt),
+      )
+      await reconcileReceipts(sortedProposals)
     },
-    [preferredSessionId],
+    [reconcileReceipts],
   )
 
+  const fetchIncrementalTranscript = useCallback(async (after: number) => {
+    const next = {
+      messages: [] as CoachMessage[],
+      proposals: [] as CoachProposal[],
+      nextCursor: after,
+    }
+    let hasMore = true
+    let pages = 0
+    while (hasMore && pages < 100) {
+      const page = await fetchCoachTranscriptPage(next.nextCursor)
+      next.messages.push(...page.messages)
+      next.proposals.push(...page.proposals)
+      if (page.hasMore && page.nextCursor <= next.nextCursor) {
+        throw new Error('Coach transcript cursor did not advance')
+      }
+      next.nextCursor = page.nextCursor
+      hasMore = page.hasMore
+      pages += 1
+    }
+    if (hasMore) throw new Error('Coach transcript is too large to update safely')
+    return next
+  }, [])
+
+  const refreshRemote = useCallback(
+    async (quiet = false) => {
+      if (remoteRefreshInFlight.current) return
+      remoteRefreshInFlight.current = true
+      try {
+        const previousRemote = remoteRef.current
+        const nextRemote = await fetchCoachState()
+        remoteRef.current = nextRemote
+        setRemote(nextRemote)
+        const proposalStateChanged =
+          previousRemote !== null &&
+          previousRemote.latestProposalUpdatedAt !==
+            nextRemote.latestProposalUpdatedAt
+        if (
+          nextRemote.latestMessageSequence < transcriptCursor.current ||
+          proposalStateChanged
+        ) {
+          await ingestTranscript(await fetchFullCoachTranscript(), true)
+        } else if (nextRemote.latestMessageSequence > transcriptCursor.current) {
+          await ingestTranscript(
+            await fetchIncrementalTranscript(transcriptCursor.current),
+            false,
+          )
+        }
+        setPageError(null)
+      } catch (caught) {
+        if (!quiet) {
+          setPageError(caught instanceof Error ? caught.message : String(caught))
+        }
+      } finally {
+        remoteRefreshInFlight.current = false
+      }
+    },
+    [fetchIncrementalTranscript, ingestTranscript],
+  )
+
+  const loadInitial = useCallback(async () => {
+    try {
+      const [live, nextRemote, transcript] = await Promise.all([
+        buildLiveCoachContext(preferredSessionId),
+        fetchCoachState(),
+        fetchFullCoachTranscript(),
+      ])
+      setContext(live.context)
+      remoteRef.current = nextRemote
+      setRemote(nextRemote)
+      await ingestTranscript(transcript, true)
+      setPageError(null)
+    } catch (caught) {
+      setPageError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setLoading(false)
+    }
+  }, [ingestTranscript, preferredSessionId])
+
   useEffect(() => {
-    void refresh()
-    const interval = window.setInterval(() => {
-      if (document.visibilityState === 'visible') void refresh(true)
-    }, 2500)
+    void loadInitial()
+  }, [loadInitial])
+
+  const pollDelay =
+    (remote?.counts.queued ?? 0) + (remote?.counts.processing ?? 0) > 0
+      ? 2500
+      : 10_000
+
+  useEffect(() => {
+    let stopped = false
+    let timeoutId: number | undefined
+    const schedule = () => {
+      timeoutId = window.setTimeout(
+        async () => {
+          if (!stopped && document.visibilityState === 'visible') {
+            await refreshRemote(true)
+          }
+          if (!stopped) schedule()
+        },
+        pollDelay,
+      )
+    }
+    schedule()
+    return () => {
+      stopped = true
+      if (timeoutId !== undefined) window.clearTimeout(timeoutId)
+    }
+  }, [pollDelay, refreshRemote])
+
+  useEffect(() => {
     const onVisible = () => {
-      if (document.visibilityState === 'visible') void refresh(true)
+      if (document.visibilityState !== 'visible') return
+      void refreshLocalContext().catch((caught) => {
+        setPageError(caught instanceof Error ? caught.message : String(caught))
+      })
+      void refreshRemote(true)
     }
     document.addEventListener('visibilitychange', onVisible)
     window.addEventListener('focus', onVisible)
     return () => {
-      window.clearInterval(interval)
       document.removeEventListener('visibilitychange', onVisible)
       window.removeEventListener('focus', onVisible)
     }
-  }, [refresh])
+  }, [refreshLocalContext, refreshRemote])
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: loading ? 'auto' : 'smooth' })
@@ -191,7 +307,8 @@ export function CoachScreen() {
   const orphanProposals = proposals.filter(
     (proposal) => !knownMessageIds.has(proposal.messageId),
   )
-  const thinking = (remote?.counts.queued ?? 0) + (remote?.counts.processing ?? 0) > 0
+  const pendingJob = remote?.pendingJobs[0] ?? null
+  const waitingForMac = Boolean(pendingJob && remote?.bridge?.online !== true)
 
   async function send(text: string, reasoningEffort: CoachReasoningEffort) {
     if (sending) return
@@ -200,7 +317,6 @@ export function CoachScreen() {
     try {
       const live = await buildLiveCoachContext(preferredSessionId)
       setContext(live.context)
-      setStateHash(live.stateHash)
       const response = await postCoachMessage({
         clientMessageId: crypto.randomUUID(),
         text,
@@ -215,7 +331,7 @@ export function CoachScreen() {
           ),
         )
       }
-      await refresh(true)
+      await refreshRemote(true)
     } catch (caught) {
       setPageError(caught instanceof Error ? caught.message : String(caught))
       throw caught
@@ -234,13 +350,18 @@ export function CoachScreen() {
     })
     try {
       const live = await buildLiveCoachContext(preferredSessionId)
+      const plan = parseCoachActionPlan(proposal.actionPlan)
       const result = await applyCoachActionPlan({
         proposalId: proposal.id,
         rawPlan: proposal.actionPlan,
         currentStateHash: live.stateHash,
+        currentActionStateHashes: live.context.actionStateHashes,
       })
       setLocalApplied((current) => new Map(current).set(proposal.id, result))
       if (result.activeSessionId) setActiveSession(result.activeSessionId)
+      if (plan.scope === 'one_time_workout' && result.activeSessionId) {
+        navigate('/workout')
+      }
 
       let syncWarning: string | undefined
       try {
@@ -251,7 +372,8 @@ export function CoachScreen() {
       await reportCoachProposalResult(proposal.id, 'applied', {
         result: syncWarning ? { ...result, syncWarning } : result,
       })
-      await refresh(true)
+      await refreshLocalContext()
+      await refreshRemote(true)
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : String(caught)
       setProposalErrors((current) => new Map(current).set(proposal.id, message))
@@ -288,6 +410,20 @@ export function CoachScreen() {
     }
   }
 
+  async function cancelPendingJob() {
+    if (!pendingJob || cancellingJobId) return
+    setCancellingJobId(pendingJob.id)
+    setPageError(null)
+    try {
+      await cancelCoachJob(pendingJob.id)
+      await refreshRemote(true)
+    } catch (caught) {
+      setPageError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setCancellingJobId(null)
+    }
+  }
+
   async function clearConversation() {
     if (!messages.length && !proposals.length) return
     if (!confirm('Clear this Coach conversation? Applied workout changes stay saved.')) {
@@ -297,9 +433,11 @@ export function CoachScreen() {
       await clearCoachConversation()
       setMessages([])
       setProposals([])
+      setLocalApplied(new Map())
       setProposalErrors(new Map())
       setPageError(null)
-      await refresh(true)
+      transcriptCursor.current = 0
+      await Promise.all([refreshLocalContext(), refreshRemote(true)])
     } catch (caught) {
       setPageError(caught instanceof Error ? caught.message : String(caught))
     }
@@ -315,7 +453,6 @@ export function CoachScreen() {
         key={proposal.id}
         proposal={shown}
         context={context}
-        currentStateHash={stateHash}
         busy={busyProposalId === proposal.id}
         error={proposalErrors.get(proposal.id) ?? null}
         onApply={() => void apply(proposal)}
@@ -336,7 +473,7 @@ export function CoachScreen() {
             onClick={() => void clearConversation()}
             disabled={messages.length === 0 && proposals.length === 0}
             aria-label="Clear Coach conversation"
-            className="p-2 text-[var(--color-fg-faint)] hover:text-red-300 disabled:opacity-30"
+            className="min-h-11 min-w-11 grid place-items-center text-[var(--color-fg-faint)] hover:text-red-300 disabled:opacity-30"
           >
             <Trash2 size={18} />
           </button>
@@ -345,7 +482,7 @@ export function CoachScreen() {
       <CoachStatus remote={remote} context={context} />
 
       <div className="flex-1 min-h-0 overflow-y-auto overscroll-y-contain">
-        <div className="max-w-md mx-auto px-3 py-4 space-y-3">
+        <div className="max-w-md mx-auto px-3 pt-4 pb-16 space-y-3">
           {pageError && (
             <div className="rounded-xl px-3 py-2 text-sm bg-red-950/35 text-red-200 border border-red-900/50">
               {pageError}
@@ -377,16 +514,35 @@ export function CoachScreen() {
           )}
 
           {orphanProposals.map(proposalCard)}
-          {thinking && (
-            <div className="flex items-center gap-2 text-sm text-[var(--color-fg-faint)] px-2 py-1">
-              <LoaderCircle size={15} className="animate-spin" /> Coach is thinking…
+          {pendingJob && (
+            <div className="flex min-h-11 items-center gap-2 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-1.5 text-sm text-[var(--color-fg-dim)]">
+              {waitingForMac ? (
+                <WifiOff size={15} className="shrink-0" aria-hidden="true" />
+              ) : (
+                <LoaderCircle
+                  size={15}
+                  className="shrink-0 animate-spin"
+                  aria-hidden="true"
+                />
+              )}
+              <span className="min-w-0 flex-1">
+                {waitingForMac ? 'Waiting for your Mac…' : 'Coach is thinking…'}
+              </span>
+              <button
+                type="button"
+                onClick={() => void cancelPendingJob()}
+                disabled={cancellingJobId === pendingJob.id}
+                className="min-h-11 shrink-0 rounded-lg px-3 text-xs font-semibold text-red-300 hover:bg-red-950/35 disabled:opacity-50"
+              >
+                {cancellingJobId === pendingJob.id ? 'Cancelling…' : 'Cancel'}
+              </button>
             </div>
           )}
           <div ref={endRef} />
         </div>
       </div>
 
-      <div className="max-w-md w-full mx-auto">
+      <div id="coach-composer" className="max-w-md w-full mx-auto">
         <CoachComposer
           hasActiveWorkout={Boolean(context?.activeWorkout)}
           disabled={sending}

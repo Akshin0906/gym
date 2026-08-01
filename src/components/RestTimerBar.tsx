@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { ChevronDown, Square, Timer as TimerIcon, X } from 'lucide-react'
 import { useTimer } from '../store/timer'
 import { vibrate } from '../lib/audio'
@@ -13,7 +13,13 @@ function snapToStep(seconds: number): number {
   return SLIDER_MIN + steps * SLIDER_STEP
 }
 
-export function RestTimerBar({ tabBarHidden = false }: { tabBarHidden?: boolean }) {
+export function RestTimerBar({
+  tabBarHidden = false,
+  coachMode = false,
+}: {
+  tabBarHidden?: boolean
+  coachMode?: boolean
+}) {
   const expiresAt = useTimer((s) => s.expiresAt)
   const originalSeconds = useTimer((s) => s.originalSeconds)
   const stop = useTimer((s) => s.stop)
@@ -21,8 +27,23 @@ export function RestTimerBar({ tabBarHidden = false }: { tabBarHidden?: boolean 
   const [now, setNow] = useState(Date.now)
   const [flashing, setFlashing] = useState(false)
   const [expanded, setExpanded] = useState(true)
+  const [coachComposerHeight, setCoachComposerHeight] = useState(0)
   const flashTimeoutRef = useRef<number | undefined>(undefined)
   const wasRunningRef = useRef(false)
+
+  useLayoutEffect(() => {
+    if (!coachMode) {
+      setCoachComposerHeight(0)
+      return
+    }
+    const composer = document.getElementById('coach-composer')
+    if (!composer) return
+    const update = () => setCoachComposerHeight(composer.getBoundingClientRect().height)
+    update()
+    const observer = new ResizeObserver(update)
+    observer.observe(composer)
+    return () => observer.disconnect()
+  }, [coachMode])
 
   useEffect(() => {
     if (expiresAt === null) return
@@ -187,11 +208,13 @@ export function RestTimerBar({ tabBarHidden = false }: { tabBarHidden?: boolean 
     <div
       className={`fixed inset-x-0 z-40 px-3 ${flashing ? 'animate-pulse' : ''}`}
       style={{
-        // On /workout the tab bar is hidden, so dock to the safe-area bottom
-        // instead of floating above a phantom tab-bar height.
-        bottom: tabBarHidden
-          ? 'env(safe-area-inset-bottom, 0px)'
-          : 'var(--tab-bar-height)',
+        // Coach keeps the timer immediately above its measured composer,
+        // including the conditional suggestion row and safe-area padding.
+        bottom: coachMode
+          ? `${coachComposerHeight}px`
+          : tabBarHidden
+            ? 'env(safe-area-inset-bottom, 0px)'
+            : 'var(--tab-bar-height)',
       }}
     >
       <div

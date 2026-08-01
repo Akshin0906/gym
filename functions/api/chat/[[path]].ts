@@ -111,6 +111,17 @@ const MAX_LEASE_MS = 600000
 const DEFAULT_RETRY_MS = 5000
 const MAX_RETRY_MS = 300000
 const TRANSCRIPT_LIMIT = 60
+const STATE_PENDING_JOB_LIMIT = 10
+const RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000
+const RETAIN_TERMINAL_JOBS = 500
+const RETAIN_RESOLVED_PROPOSALS = 500
+const RETAIN_TRANSCRIPT_MESSAGES = 120
+const ACTION_SCOPES = [
+  'active_workout',
+  'one_time_workout',
+  'program',
+] as const
+type ActionScope = (typeof ACTION_SCOPES)[number]
 
 class ApiError extends Error {
   readonly status: number
@@ -246,6 +257,30 @@ function validClientMessageId(value: string): boolean {
   return value.length >= 8 && validOpaqueId(value)
 }
 
+function validSha256Hex(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)
+}
+
+function isActionScope(value: unknown): value is ActionScope {
+  return (
+    typeof value === 'string' &&
+    (ACTION_SCOPES as readonly string[]).includes(value)
+  )
+}
+
+function trustedActionStateHash(
+  contextJson: string,
+  scope: ActionScope,
+): string {
+  const payload = parseJson(contextJson)
+  const hashes = isObject(payload) ? payload.actionStateHashes : null
+  const hash = isObject(hashes) ? hashes[scope] : null
+  if (!validSha256Hex(hash)) {
+    throw new ApiError(409, 'action_state_hash_unavailable')
+  }
+  return hash
+}
+
 function requireSameOriginForMutation(request: Request): Response | null {
   const method = request.method.toUpperCase()
   if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return null
@@ -364,8 +399,193 @@ async function readProposal(
     .first<ProposalRow>()
 }
 
+async function normalizeExpiredLeases(
+  db: D1Database,
+  now: number,
+): Promise<void> {
+  await db.batch([
+    db
+      .prepare(
+        `UPDATE codex_chat_jobs
+         SET status = 'failed', worker_id = NULL, lease_token = NULL,
+             lease_expires_at = NULL, claimed_at = NULL, completed_at = ?,
+             updated_at = ?,
+             last_error = COALESCE(last_error, 'max_attempts_exhausted')
+         WHERE attempts >= max_attempts
+           AND (
+             status = 'queued' OR
+             (status = 'leased' AND lease_expires_at <= ?)
+           )`,
+      )
+      .bind(now, now, now),
+    db
+      .prepare(
+        `UPDATE codex_chat_jobs
+         SET status = 'queued', available_at = ?, worker_id = NULL,
+             lease_token = NULL, lease_expires_at = NULL, claimed_at = NULL,
+             updated_at = ?, last_error = 'lease_expired'
+         WHERE status = 'leased'
+           AND lease_expires_at <= ?
+           AND attempts < max_attempts`,
+      )
+      .bind(now, now, now),
+    db
+      .prepare(
+        `UPDATE codex_chat_bridge_heartbeat
+         SET status = CASE WHEN status = 'working' THEN 'idle' ELSE status END,
+             active_job_id = NULL
+         WHERE id = ?
+           AND active_job_id IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1
+             FROM codex_chat_jobs j
+             WHERE j.id = codex_chat_bridge_heartbeat.active_job_id
+               AND j.status = 'leased'
+               AND j.lease_expires_at > ?
+           )`,
+      )
+      .bind(CONVERSATION_ID, now),
+  ])
+}
+
+async function pruneRetainedChatData(
+  db: D1Database,
+  now: number,
+): Promise<void> {
+  const row = await db
+    .prepare(
+      `SELECT last_retention_at
+       FROM codex_chat_maintenance
+       WHERE id = ?`,
+    )
+    .bind(CONVERSATION_ID)
+    .first<{ last_retention_at: number }>()
+  if (row && now - row.last_retention_at < RETENTION_INTERVAL_MS) return
+
+  await db.batch([
+    db
+      .prepare(
+        `DELETE FROM codex_chat_action_proposals
+         WHERE conversation_id = ?
+           AND status IN ('applied', 'failed', 'dismissed')
+           AND id NOT IN (
+             SELECT id
+             FROM codex_chat_action_proposals
+             WHERE conversation_id = ?
+               AND status IN ('applied', 'failed', 'dismissed')
+             ORDER BY updated_at DESC, created_at DESC
+             LIMIT ?
+           )`,
+      )
+      .bind(
+        CONVERSATION_ID,
+        CONVERSATION_ID,
+        RETAIN_RESOLVED_PROPOSALS,
+      ),
+    db
+      .prepare(
+        `DELETE FROM codex_chat_jobs
+         WHERE conversation_id = ?
+           AND status IN ('completed', 'failed', 'cancelled')
+           AND NOT EXISTS (
+             SELECT 1
+             FROM codex_chat_action_proposals p
+             WHERE p.job_id = codex_chat_jobs.id
+               AND p.status = 'proposed'
+           )
+           AND id NOT IN (
+             SELECT j.id
+             FROM codex_chat_jobs j
+             WHERE j.conversation_id = ?
+               AND j.status IN ('completed', 'failed', 'cancelled')
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM codex_chat_action_proposals p2
+                 WHERE p2.job_id = j.id
+                   AND p2.status = 'proposed'
+               )
+             ORDER BY j.updated_at DESC, j.created_at DESC
+             LIMIT ?
+           )`,
+      )
+      .bind(CONVERSATION_ID, CONVERSATION_ID, RETAIN_TERMINAL_JOBS),
+    db
+      .prepare(
+        `DELETE FROM codex_chat_contexts
+         WHERE conversation_id = ?
+           AND NOT EXISTS (
+             SELECT 1
+             FROM codex_chat_jobs j
+             WHERE j.context_id = codex_chat_contexts.id
+           )`,
+      )
+      .bind(CONVERSATION_ID),
+    db
+      .prepare(
+        `DELETE FROM codex_chat_messages
+         WHERE conversation_id = ?
+           AND sequence NOT IN (
+             SELECT sequence
+             FROM codex_chat_messages
+             WHERE conversation_id = ?
+             ORDER BY sequence DESC
+             LIMIT ?
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM codex_chat_jobs j
+             WHERE j.user_message_id = codex_chat_messages.id
+                OR j.assistant_message_id = codex_chat_messages.id
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM codex_chat_action_proposals p
+             WHERE p.assistant_message_id = codex_chat_messages.id
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM codex_chat_jobs pending
+             JOIN codex_chat_messages anchor
+               ON anchor.id = pending.user_message_id
+             WHERE pending.conversation_id = ?
+               AND pending.status IN ('queued', 'leased')
+               AND codex_chat_messages.sequence IN (
+                 SELECT tail.sequence
+                 FROM codex_chat_messages tail
+                 WHERE tail.conversation_id = pending.conversation_id
+                   AND tail.sequence <= anchor.sequence
+                 ORDER BY tail.sequence DESC
+                 LIMIT ?
+               )
+           )`,
+      )
+      .bind(
+        CONVERSATION_ID,
+        CONVERSATION_ID,
+        RETAIN_TRANSCRIPT_MESSAGES,
+        CONVERSATION_ID,
+        TRANSCRIPT_LIMIT,
+      ),
+    db
+      .prepare(
+        `INSERT INTO codex_chat_maintenance (id, last_retention_at)
+         VALUES (?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           last_retention_at = excluded.last_retention_at`,
+      )
+      .bind(CONVERSATION_ID, now),
+  ])
+}
+
+async function maintainChatData(db: D1Database, now: number): Promise<void> {
+  await normalizeExpiredLeases(db, now)
+  await pruneRetainedChatData(db, now)
+}
+
 async function handleGetState(db: D1Database): Promise<Response> {
-  const [conversation, heartbeat, counts, latest] = await Promise.all([
+  const now = Date.now()
+  await maintainChatData(db, now)
+  const [conversation, heartbeat, counts, latest, pendingJobs] = await Promise.all([
     readConversation(db),
     db
       .prepare(
@@ -380,12 +600,15 @@ async function handleGetState(db: D1Database): Promise<Response> {
         `SELECT
            COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0)
              AS queued_count,
-           COALESCE(SUM(CASE WHEN status = 'leased' THEN 1 ELSE 0 END), 0)
+           COALESCE(SUM(CASE
+             WHEN status = 'leased' AND lease_expires_at > ? THEN 1
+             ELSE 0
+           END), 0)
              AS processing_count
          FROM codex_chat_jobs
          WHERE conversation_id = ?`,
       )
-      .bind(CONVERSATION_ID)
+      .bind(now, CONVERSATION_ID)
       .first<{ queued_count: number; processing_count: number }>(),
     db
       .prepare(
@@ -395,18 +618,33 @@ async function handleGetState(db: D1Database): Promise<Response> {
       )
       .bind(CONVERSATION_ID)
       .first<{ latest_sequence: number }>(),
+    db
+      .prepare(
+        `SELECT id, status, created_at
+         FROM codex_chat_jobs
+         WHERE conversation_id = ? AND status IN ('queued', 'leased')
+         ORDER BY created_at DESC
+         LIMIT ?`,
+      )
+      .bind(CONVERSATION_ID, STATE_PENDING_JOB_LIMIT)
+      .all<{ id: string; status: 'queued' | 'leased'; created_at: number }>(),
   ])
 
-  const proposalCount = await db
+  const proposalState = await db
     .prepare(
-      `SELECT COUNT(*) AS proposal_count
+      `SELECT
+         COALESCE(SUM(CASE WHEN status = 'proposed' THEN 1 ELSE 0 END), 0)
+           AS proposal_count,
+         COALESCE(MAX(updated_at), 0) AS latest_proposal_updated_at
        FROM codex_chat_action_proposals
-       WHERE conversation_id = ? AND status = 'proposed'`,
+       WHERE conversation_id = ?`,
     )
     .bind(CONVERSATION_ID)
-    .first<{ proposal_count: number }>()
+    .first<{
+      proposal_count: number
+      latest_proposal_updated_at: number
+    }>()
 
-  const now = Date.now()
   return json(200, {
     conversation: conversation ? conversationResponse(conversation) : null,
     bridge: heartbeat
@@ -422,13 +660,22 @@ async function handleGetState(db: D1Database): Promise<Response> {
     counts: {
       queued: Number(counts?.queued_count ?? 0),
       processing: Number(counts?.processing_count ?? 0),
-      proposed: Number(proposalCount?.proposal_count ?? 0),
+      proposed: Number(proposalState?.proposal_count ?? 0),
     },
+    pendingJobs: (pendingJobs.results ?? []).map((job) => ({
+      id: job.id,
+      status: job.status,
+      createdAt: job.created_at,
+    })),
     latestMessageSequence: Number(latest?.latest_sequence ?? 0),
+    latestProposalUpdatedAt: Number(
+      proposalState?.latest_proposal_updated_at ?? 0,
+    ),
   })
 }
 
 async function handleGetMessages(ctx: PagesContext): Promise<Response> {
+  await maintainChatData(ctx.env.WORKOUT_DB, Date.now())
   const url = new URL(ctx.request.url)
   const rawAfter = url.searchParams.get('after') ?? '0'
   const rawLimit = url.searchParams.get('limit') ?? '50'
@@ -738,6 +985,54 @@ async function handleDismissProposal(
   return json(200, { proposal: proposal ? proposalResponse(proposal) : null })
 }
 
+async function handleCancelJob(
+  ctx: PagesContext,
+  jobId: string,
+): Promise<Response> {
+  if (!validOpaqueId(jobId)) throw new ApiError(400, 'invalid_job_id')
+  const now = Date.now()
+  const result = await ctx.env.WORKOUT_DB.prepare(
+    `UPDATE codex_chat_jobs
+     SET status = 'cancelled', worker_id = NULL, lease_token = NULL,
+         lease_expires_at = NULL, claimed_at = NULL, completed_at = ?,
+         last_error = NULL, completion_hash = NULL, updated_at = ?
+     WHERE id = ? AND conversation_id = ?
+       AND status IN ('queued', 'leased')`,
+  )
+    .bind(now, now, jobId, CONVERSATION_ID)
+    .run()
+
+  if ((result.meta?.changes ?? 0) !== 1) {
+    const existing = await readJob(ctx.env.WORKOUT_DB, jobId)
+    if (!existing || existing.conversation_id !== CONVERSATION_ID) {
+      throw new ApiError(404, 'job_not_found')
+    }
+    if (existing.status === 'cancelled') {
+      return json(200, { job: jobResponse(existing), replayed: true })
+    }
+    throw new ApiError(409, 'job_not_cancellable')
+  }
+
+  await ctx.env.WORKOUT_DB.batch([
+    ctx.env.WORKOUT_DB.prepare(
+      `UPDATE codex_chat_conversations
+       SET updated_at = ?
+       WHERE id = ?`,
+    ).bind(now, CONVERSATION_ID),
+    ctx.env.WORKOUT_DB.prepare(
+      `UPDATE codex_chat_bridge_heartbeat
+       SET status = CASE WHEN status = 'working' THEN 'idle' ELSE status END,
+           active_job_id = NULL
+       WHERE id = ? AND active_job_id = ?`,
+    ).bind(CONVERSATION_ID, jobId),
+  ])
+  const cancelled = await readJob(ctx.env.WORKOUT_DB, jobId)
+  return json(200, {
+    job: cancelled ? jobResponse(cancelled) : null,
+    replayed: false,
+  })
+}
+
 async function handleDeleteConversation(db: D1Database): Promise<Response> {
   await db.batch([
     db
@@ -801,22 +1096,6 @@ async function handleHeartbeat(ctx: PagesContext): Promise<Response> {
   })
 }
 
-async function failExhaustedJobs(db: D1Database, now: number): Promise<void> {
-  await db
-    .prepare(
-      `UPDATE codex_chat_jobs
-       SET status = 'failed', completed_at = ?, updated_at = ?,
-           last_error = COALESCE(last_error, 'max_attempts_exhausted')
-       WHERE attempts >= max_attempts
-         AND (
-           status = 'queued' OR
-           (status = 'leased' AND lease_expires_at <= ?)
-         )`,
-    )
-    .bind(now, now, now)
-    .run()
-}
-
 async function handleClaimJob(ctx: PagesContext): Promise<Response> {
   const body = await readJsonBody(ctx.request)
   const workerId = requiredString(body.workerId, 'workerId', 120)
@@ -829,7 +1108,7 @@ async function handleClaimJob(ctx: PagesContext): Promise<Response> {
     'leaseDurationMs',
   )
   const now = Date.now()
-  await failExhaustedJobs(ctx.env.WORKOUT_DB, now)
+  await maintainChatData(ctx.env.WORKOUT_DB, now)
 
   let claimed: JobRow | null = null
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -837,14 +1116,12 @@ async function handleClaimJob(ctx: PagesContext): Promise<Response> {
       `SELECT id
        FROM codex_chat_jobs
        WHERE attempts < max_attempts
-         AND (
-           (status = 'queued' AND available_at <= ?) OR
-           (status = 'leased' AND lease_expires_at <= ?)
-         )
+         AND status = 'queued'
+         AND available_at <= ?
        ORDER BY created_at ASC
        LIMIT 1`,
     )
-      .bind(now, now)
+      .bind(now)
       .first<{ id: string }>()
     if (!candidate) break
 
@@ -856,10 +1133,8 @@ async function handleClaimJob(ctx: PagesContext): Promise<Response> {
            lease_token = ?, lease_expires_at = ?, claimed_at = ?,
            updated_at = ?, last_error = NULL
        WHERE id = ? AND attempts < max_attempts
-         AND (
-           (status = 'queued' AND available_at <= ?) OR
-           (status = 'leased' AND lease_expires_at <= ?)
-         )`,
+         AND status = 'queued'
+         AND available_at <= ?`,
     )
       .bind(
         workerId,
@@ -868,7 +1143,6 @@ async function handleClaimJob(ctx: PagesContext): Promise<Response> {
         now,
         now,
         candidate.id,
-        now,
         now,
       )
       .run()
@@ -947,9 +1221,10 @@ async function handleRenewLease(
   const result = await ctx.env.WORKOUT_DB.prepare(
     `UPDATE codex_chat_jobs
      SET lease_expires_at = ?, updated_at = ?
-     WHERE id = ? AND status = 'leased' AND lease_token = ?`,
+     WHERE id = ? AND status = 'leased' AND lease_token = ?
+       AND lease_expires_at > ?`,
   )
-    .bind(leaseExpiresAt, now, jobId, leaseToken)
+    .bind(leaseExpiresAt, now, jobId, leaseToken, now)
     .run()
   if ((result.meta?.changes ?? 0) !== 1) {
     throw new ApiError(409, 'lease_lost')
@@ -1028,7 +1303,20 @@ async function handleCompleteJob(
     if (!isObject(body.actionPlan)) {
       throw new ApiError(400, 'invalid_action_plan', 'actionPlan must be an object')
     }
-    actionPlan = { ...body.actionPlan, sourceStateHash: context.state_hash }
+    if (!isActionScope(body.actionPlan.scope)) {
+      throw new ApiError(400, 'invalid_action_scope')
+    }
+    if (!validSha256Hex(context.state_hash)) {
+      throw new ApiError(409, 'state_hash_unavailable')
+    }
+    actionPlan = {
+      ...body.actionPlan,
+      sourceStateHash: context.state_hash,
+      sourceActionStateHash: trustedActionStateHash(
+        context.context_json,
+        body.actionPlan.scope,
+      ),
+    }
     if (jsonByteLength(actionPlan) > MAX_ACTION_PLAN_BYTES) {
       throw new ApiError(413, 'action_plan_too_large')
     }
@@ -1049,6 +1337,9 @@ async function handleCompleteJob(
   if (job.status !== 'leased' || job.lease_token !== leaseToken) {
     throw new ApiError(409, 'lease_lost')
   }
+  if (job.lease_expires_at === null || job.lease_expires_at <= Date.now()) {
+    throw new ApiError(409, 'lease_lost')
+  }
 
   const assistantMessageId = `msg_a_${job.id}`
   const proposalId = `proposal_${job.id}`
@@ -1062,6 +1353,7 @@ async function handleCompleteJob(
        WHERE EXISTS (
          SELECT 1 FROM codex_chat_jobs
          WHERE id = ? AND status = 'leased' AND lease_token = ?
+           AND lease_expires_at > ?
        )
        ON CONFLICT(id) DO NOTHING`,
     ).bind(
@@ -1073,6 +1365,7 @@ async function handleCompleteJob(
       now,
       job.id,
       leaseToken,
+      now,
     ),
   ]
   if (actionPlan) {
@@ -1085,6 +1378,7 @@ async function handleCompleteJob(
          WHERE EXISTS (
            SELECT 1 FROM codex_chat_jobs
            WHERE id = ? AND status = 'leased' AND lease_token = ?
+             AND lease_expires_at > ?
          )
          ON CONFLICT(job_id) DO NOTHING`,
       ).bind(
@@ -1097,6 +1391,7 @@ async function handleCompleteJob(
         now,
         job.id,
         leaseToken,
+        now,
       ),
     )
   }
@@ -1105,7 +1400,8 @@ async function handleCompleteJob(
       `UPDATE codex_chat_jobs
        SET status = 'completed', assistant_message_id = ?, completed_at = ?,
            updated_at = ?, completion_hash = ?
-       WHERE id = ? AND status = 'leased' AND lease_token = ?`,
+       WHERE id = ? AND status = 'leased' AND lease_token = ?
+         AND lease_expires_at > ?`,
     ).bind(
       assistantMessageId,
       now,
@@ -1113,6 +1409,7 @@ async function handleCompleteJob(
       completionHash,
       job.id,
       leaseToken,
+      now,
     ),
     ctx.env.WORKOUT_DB.prepare(
       `UPDATE codex_chat_conversations
@@ -1168,15 +1465,19 @@ async function handleFailJob(
     throw new ApiError(409, 'lease_lost')
   }
   const now = Date.now()
+  if (job.lease_expires_at === null || job.lease_expires_at <= now) {
+    throw new ApiError(409, 'lease_lost')
+  }
   const shouldRetry = retryable && job.attempts < job.max_attempts
   const nextStatus: JobStatus = shouldRetry ? 'queued' : 'failed'
   const availableAt = shouldRetry ? now + retryAfterMs : job.available_at
   const result = await ctx.env.WORKOUT_DB.prepare(
     `UPDATE codex_chat_jobs
      SET status = ?, available_at = ?, worker_id = NULL, lease_token = NULL,
-         lease_expires_at = NULL, completed_at = ?, last_error = ?,
-         updated_at = ?
-     WHERE id = ? AND status = 'leased' AND lease_token = ?`,
+         lease_expires_at = NULL, claimed_at = NULL, completed_at = ?,
+         last_error = ?, updated_at = ?
+     WHERE id = ? AND status = 'leased' AND lease_token = ?
+       AND lease_expires_at > ?`,
   )
     .bind(
       nextStatus,
@@ -1186,6 +1487,7 @@ async function handleFailJob(
       now,
       job.id,
       leaseToken,
+      now,
     )
     .run()
   if ((result.meta?.changes ?? 0) !== 1) {
@@ -1231,6 +1533,10 @@ export const onRequest = async (ctx: PagesContext): Promise<Response> => {
     if (proposalDismissMatch && method === 'POST') {
       return await handleDismissProposal(ctx, proposalDismissMatch[1])
     }
+    const cancelMatch = path.match(/^jobs\/([^/]+)\/cancel$/)
+    if (cancelMatch && method === 'POST') {
+      return await handleCancelJob(ctx, cancelMatch[1])
+    }
 
     if (path === 'automation/heartbeat' && method === 'POST') {
       return await handleHeartbeat(ctx)
@@ -1254,14 +1560,16 @@ export const onRequest = async (ctx: PagesContext): Promise<Response> => {
     return json(404, { error: 'not_found' })
   } catch (error) {
     if (error instanceof ApiError) {
+      if (error.status >= 500) {
+        console.error('chat api failure', error)
+        return json(500, { error: 'internal_error' })
+      }
       return json(error.status, {
         error: error.code,
         ...(error.detail ? { detail: error.detail } : {}),
       })
     }
-    return json(500, {
-      error: 'internal_error',
-      detail: error instanceof Error ? error.message : String(error),
-    })
+    console.error('chat api failure', error)
+    return json(500, { error: 'internal_error' })
   }
 }

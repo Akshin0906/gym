@@ -89,7 +89,7 @@ export function CoachComposer({
             aria-pressed={deepThink}
             onClick={() => setDeepThink((value) => !value)}
             disabled={disabled}
-            className="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1.5 text-xs font-semibold border"
+            className="min-h-11 inline-flex items-center gap-1.5 rounded-full px-3 py-2 text-xs font-semibold border"
             style={{
               color: deepThink ? 'var(--color-accent)' : 'var(--color-fg-dim)',
               background: deepThink ? 'var(--color-accent-soft)' : 'transparent',
@@ -107,7 +107,7 @@ export function CoachComposer({
             onClick={() => void submit()}
             disabled={disabled || !text.trim()}
             aria-label="Send message"
-            className="w-9 h-9 rounded-full flex items-center justify-center bg-[var(--color-accent)] text-black disabled:opacity-35"
+            className="w-11 h-11 rounded-full flex items-center justify-center bg-[var(--color-accent)] text-black disabled:opacity-35"
           >
             <ArrowUp size={18} strokeWidth={2.5} />
           </button>

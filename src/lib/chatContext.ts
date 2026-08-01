@@ -12,6 +12,7 @@ import type {
   TemplateExercise,
   WorkoutSession,
 } from '../db/types'
+import type { CoachActionStateHashes } from './chatTypes'
 
 interface CoachContextExercise {
   id: string
@@ -42,6 +43,7 @@ interface CoachContextPlannedExercise {
 
 export interface CoachLiveContext {
   generatedAt: number
+  actionStateHashes: CoachActionStateHashes
   activeWorkout: null | {
     id: string
     name: string
@@ -248,8 +250,60 @@ export async function buildLiveCoachContext(
     templateExercisesByTemplate.set(row.sessionTemplateId, list)
   }
 
+  const exerciseCatalogState = rows.exercises.slice().sort(byId).map((exercise) => ({
+    id: exercise.id,
+    name: exercise.name,
+    hiddenFromLibrary: exercise.hiddenFromLibrary,
+  }))
+  const activeWorkoutState = {
+    exerciseAvailability: exerciseCatalogState,
+    activeWorkout: active
+      ? {
+          id: active.id,
+          sessionTemplateId: active.sessionTemplateId,
+          programId: active.programId,
+          name: active.name,
+          programName: active.programName,
+          exerciseSnapshot: active.exerciseSnapshot
+            .slice()
+            .sort((a, b) => a.order - b.order),
+        }
+      : null,
+  }
+  const inProgressStructure = rows.inProgress.slice().sort(byId).map((session) => ({
+    id: session.id,
+    sessionTemplateId: session.sessionTemplateId,
+    programId: session.programId,
+    name: session.name,
+    programName: session.programName,
+    exerciseSnapshot: session.exerciseSnapshot
+      .slice()
+      .sort((a, b) => a.order - b.order),
+    hasLoggedWork: (setsBySession.get(session.id) ?? []).length > 0,
+  }))
+  const programStructure = {
+    exerciseCatalog: exerciseCatalogState,
+    programs: rows.programs.slice().sort(byId),
+    templates: rows.templates.slice().sort(byId),
+    templateExercises: rows.templateExercises.slice().sort(byId),
+  }
+  const [activeWorkoutHash, oneTimeWorkoutHash, programHash] = await Promise.all([
+    sha256(activeWorkoutState),
+    sha256({
+      exerciseCatalog: exerciseCatalogState,
+      inProgress: inProgressStructure,
+    }),
+    sha256(programStructure),
+  ])
+  const actionStateHashes: CoachActionStateHashes = {
+    active_workout: activeWorkoutHash,
+    one_time_workout: oneTimeWorkoutHash,
+    program: programHash,
+  }
+
   const context: CoachLiveContext = {
     generatedAt: Date.now(),
+    actionStateHashes,
     activeWorkout: active
       ? {
           id: active.id,
@@ -367,11 +421,7 @@ export async function buildLiveCoachContext(
   }
 
   const actionState = {
-    exercises: rows.exercises.slice().sort(byId).map((exercise) => ({
-      id: exercise.id,
-      name: exercise.name,
-      hiddenFromLibrary: exercise.hiddenFromLibrary,
-    })),
+    exercises: exerciseCatalogState,
     programs: rows.programs.slice().sort(byId),
     templates: rows.templates.slice().sort(byId),
     templateExercises: rows.templateExercises.slice().sort(byId),

@@ -9,6 +9,18 @@ import {
 } from './chatActions'
 
 const HASH = 'a'.repeat(64)
+const ACTION_HASH = 'c'.repeat(64)
+
+function actionStateHashes(
+  overrides: Partial<Record<'active_workout' | 'one_time_workout' | 'program', string>> = {},
+) {
+  return {
+    active_workout: ACTION_HASH,
+    one_time_workout: ACTION_HASH,
+    program: ACTION_HASH,
+    ...overrides,
+  }
+}
 
 function exercise(id: string, name = id): Exercise {
   return {
@@ -56,6 +68,7 @@ function plan(action: unknown, scope = 'active_workout') {
     summary: 'Preview this exact change.',
     scope,
     sourceStateHash: HASH,
+    sourceActionStateHash: ACTION_HASH,
     actions: [action],
   }
 }
@@ -107,12 +120,14 @@ describe('active workout Coach actions', () => {
     const first = await applyCoachActionPlan({
       proposalId: 'proposal-add',
       rawPlan,
-      currentStateHash: HASH,
+      currentStateHash: 'b'.repeat(64),
+      currentActionStateHashes: actionStateHashes(),
     })
     const replay = await applyCoachActionPlan({
       proposalId: 'proposal-add',
       rawPlan,
       currentStateHash: 'b'.repeat(64),
+      currentActionStateHashes: actionStateHashes(),
     })
 
     const session = await db.workoutSessions.get('session')
@@ -127,8 +142,13 @@ describe('active workout Coach actions', () => {
       expect.objectContaining({ exerciseId: 'b', order: 2 }),
     ])
     expect(first.replayed).toBe(false)
+    expect(first.sourceStateHash).toBe(HASH)
+    expect(first.sourceActionStateHash).toBe(ACTION_HASH)
     expect(replay.replayed).toBe(true)
     expect(await db.chatActionReceipts.count()).toBe(1)
+    expect(
+      (await db.chatActionReceipts.get('proposal-add'))?.sourceStateHash,
+    ).toBe(HASH)
   })
 
   it('replaces an unperformed exercise in place with new targets', async () => {
@@ -143,6 +163,7 @@ describe('active workout Coach actions', () => {
         repRange: '12-15',
       }),
       currentStateHash: HASH,
+      currentActionStateHashes: actionStateHashes(),
     })
 
     const session = await db.workoutSessions.get('session')
@@ -179,6 +200,7 @@ describe('active workout Coach actions', () => {
         repRange: '12-15',
       }),
       currentStateHash: HASH,
+      currentActionStateHashes: actionStateHashes(),
     })
 
     const session = await db.workoutSessions.get('session')
@@ -231,12 +253,13 @@ describe('active workout Coach actions', () => {
           repRange: '8-10',
         }),
         currentStateHash: HASH,
+        currentActionStateHashes: actionStateHashes(),
       }),
     ).rejects.toThrow('already has 2 logged sets')
     expect(await db.chatActionReceipts.get('proposal-low-target')).toBeUndefined()
   })
 
-  it('rejects a proposal when the phone state fingerprint changed', async () => {
+  it('rejects a proposal when its scoped action fingerprint changed', async () => {
     await expect(
       applyCoachActionPlan({
         proposalId: 'proposal-stale',
@@ -247,7 +270,10 @@ describe('active workout Coach actions', () => {
           targetSets: 2,
           repRange: '8-10',
         }),
-        currentStateHash: 'b'.repeat(64),
+        currentStateHash: HASH,
+        currentActionStateHashes: actionStateHashes({
+          active_workout: 'b'.repeat(64),
+        }),
       }),
     ).rejects.toBeInstanceOf(StaleCoachActionError)
   })
@@ -276,6 +302,7 @@ describe('workout and program creation', () => {
         'one_time_workout',
       ),
       currentStateHash: HASH,
+      currentActionStateHashes: actionStateHashes(),
     })
 
     const session = await db.workoutSessions.get(result.activeSessionId!)
@@ -288,11 +315,45 @@ describe('workout and program creation', () => {
     expect(session?.exerciseSnapshot).toHaveLength(2)
   })
 
-  it('refuses to replace an already active workout', async () => {
+  it('atomically replaces an incomplete workout that has no logged work', async () => {
     await db.workoutSessions.add(activeSession())
+    const result = await applyCoachActionPlan({
+      proposalId: 'proposal-replace-empty',
+      rawPlan: plan(
+        {
+          type: 'create_one_time_workout',
+          name: 'Another workout',
+          exercises: [{ exerciseId: 'a', targetSets: 3, repRange: '8-10' }],
+        },
+        'one_time_workout',
+      ),
+      currentStateHash: HASH,
+      currentActionStateHashes: actionStateHashes(),
+    })
+
+    expect(await db.workoutSessions.get('session')).toBeUndefined()
+    expect(await db.workoutSessions.count()).toBe(1)
+    expect((await db.workoutSessions.get(result.activeSessionId!))?.name).toBe(
+      'Another workout',
+    )
+  })
+
+  it('will not replace an incomplete workout that contains logged work', async () => {
+    await db.workoutSessions.add(activeSession())
+    await db.loggedSets.add({
+      id: 'worked-set',
+      workoutSessionId: 'session',
+      exerciseId: 'a',
+      setNumber: 1,
+      weightLbs: 100,
+      reps: 8,
+      rpe: null,
+      loggedAt: 2,
+    })
+
     await expect(
       applyCoachActionPlan({
-        proposalId: 'proposal-conflict',
+        proposalId: 'proposal-worked-conflict',
         rawPlan: plan(
           {
             type: 'create_one_time_workout',
@@ -302,8 +363,13 @@ describe('workout and program creation', () => {
           'one_time_workout',
         ),
         currentStateHash: HASH,
+        currentActionStateHashes: actionStateHashes(),
       }),
     ).rejects.toThrow('before starting another workout')
+
+    expect(await db.workoutSessions.get('session')).toBeDefined()
+    expect(await db.loggedSets.get('worked-set')).toBeDefined()
+    expect(await db.chatActionReceipts.get('proposal-worked-conflict')).toBeUndefined()
   })
 
   it('creates a whole inactive program graph in one transaction', async () => {
@@ -327,6 +393,7 @@ describe('workout and program creation', () => {
         'program',
       ),
       currentStateHash: HASH,
+      currentActionStateHashes: actionStateHashes(),
     })
 
     const program = await db.programs.get(result.programId!)

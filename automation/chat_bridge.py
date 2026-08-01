@@ -17,13 +17,16 @@ import fcntl
 import hashlib
 import json
 import logging
+import logging.handlers
 import os
+import re
 import selectors
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import urllib.error
@@ -42,6 +45,11 @@ MAX_HTTP_BYTES = 16 * 1024 * 1024
 MAX_CONTEXT_BYTES = 2 * 1024 * 1024
 MAX_TRANSCRIPT_BYTES = 512 * 1024
 MAX_PROTOCOL_LINE_BYTES = 16 * 1024 * 1024
+LOG_MAX_BYTES = 2 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
+QUARANTINE_MAX_FILES = 50
+QUARANTINE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
+SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 EXIT_OK = 0
 EXIT_TRANSIENT = 75
@@ -144,6 +152,7 @@ class Config:
     app_url: str
     codex_override: str | None
     poll_seconds: float
+    idle_max_poll_seconds: float
     heartbeat_seconds: float
     lease_duration_ms: int
     lease_renew_seconds: float
@@ -196,6 +205,9 @@ class Config:
             ).rstrip("/"),
             codex_override=os.environ.get("WORKOUT_CHAT_CODEX_BIN") or None,
             poll_seconds=env_float("WORKOUT_CHAT_POLL_SECONDS", 2.0, 0.25),
+            idle_max_poll_seconds=env_float(
+                "WORKOUT_CHAT_IDLE_MAX_POLL_SECONDS", 10.0, 1.0
+            ),
             heartbeat_seconds=env_float(
                 "WORKOUT_CHAT_HEARTBEAT_SECONDS", 20.0, 5.0
             ),
@@ -217,6 +229,11 @@ class Config:
         if config.lease_renew_seconds * 1000 >= config.lease_duration_ms:
             raise ConfigError(
                 "WORKOUT_CHAT_LEASE_RENEW_SECONDS must be shorter than the lease"
+            )
+        if config.idle_max_poll_seconds < config.poll_seconds:
+            raise ConfigError(
+                "WORKOUT_CHAT_IDLE_MAX_POLL_SECONDS must be at least "
+                "WORKOUT_CHAT_POLL_SECONDS"
             )
         return config
 
@@ -318,6 +335,12 @@ def require_integer(
     return value
 
 
+def require_sha256_hex(value: Any, label: str) -> str:
+    if not isinstance(value, str) or SHA256_HEX.fullmatch(value) is None:
+        raise ConfigError(f"{label} must be exactly 64 lowercase hexadecimal characters")
+    return value
+
+
 def exact_keys(value: dict[str, Any], expected: set[str], label: str) -> None:
     actual = set(value)
     if actual != expected:
@@ -352,6 +375,30 @@ class ClaimedJob:
     context_payload: dict[str, Any]
     transcript: tuple[TranscriptMessage, ...]
     codex_thread_id: str | None
+
+
+@dataclasses.dataclass
+class IdleClaimBackoff:
+    """Deterministic exponential backoff for consecutive empty claim responses."""
+
+    minimum_seconds: float
+    maximum_seconds: float
+    _next_seconds: float = dataclasses.field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.minimum_seconds <= 0:
+            raise ValueError("minimum_seconds must be positive")
+        if self.maximum_seconds < self.minimum_seconds:
+            raise ValueError("maximum_seconds must be at least minimum_seconds")
+        self._next_seconds = self.minimum_seconds
+
+    def record_empty_claim(self) -> float:
+        delay = self._next_seconds
+        self._next_seconds = min(self.maximum_seconds, delay * 2)
+        return delay
+
+    def record_activity(self) -> None:
+        self._next_seconds = self.minimum_seconds
 
 
 def validate_effort(value: Any) -> str:
@@ -627,6 +674,67 @@ def clean_codex_env() -> dict[str, str]:
     return result
 
 
+class BoundedRotatingByteLog:
+    """Small binary rotating sink suitable for draining a child stderr pipe."""
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        max_bytes: int = LOG_MAX_BYTES,
+        backup_count: int = LOG_BACKUP_COUNT,
+    ):
+        if max_bytes < 1 or backup_count < 1:
+            raise ValueError("Rotating log bounds must be positive")
+        self.path = path
+        self.max_bytes = max_bytes
+        self.backup_count = backup_count
+        self._lock = threading.Lock()
+        self._handle: Any = None
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if path.exists() and path.stat().st_size >= max_bytes:
+            self._rotate()
+        self._open()
+
+    def _open(self) -> None:
+        self._handle = self.path.open("ab", buffering=0)
+        os.chmod(self.path, 0o600)
+
+    def _rotate(self) -> None:
+        if self._handle is not None:
+            self._handle.close()
+            self._handle = None
+        oldest = self.path.with_name(f"{self.path.name}.{self.backup_count}")
+        with contextlib.suppress(FileNotFoundError):
+            oldest.unlink()
+        for index in range(self.backup_count - 1, 0, -1):
+            source = self.path.with_name(f"{self.path.name}.{index}")
+            target = self.path.with_name(f"{self.path.name}.{index + 1}")
+            with contextlib.suppress(FileNotFoundError):
+                os.replace(source, target)
+        with contextlib.suppress(FileNotFoundError):
+            os.replace(self.path, self.path.with_name(f"{self.path.name}.1"))
+
+    def write(self, value: bytes) -> None:
+        if not value:
+            return
+        with self._lock:
+            if len(value) > self.max_bytes:
+                value = value[-self.max_bytes :]
+            current_size = self.path.stat().st_size if self.path.exists() else 0
+            if current_size and current_size + len(value) > self.max_bytes:
+                self._rotate()
+                self._open()
+            assert self._handle is not None
+            self._handle.write(value)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._handle is not None:
+                self._handle.close()
+                self._handle = None
+
+
 class AppServerClient:
     """Minimal stable Codex App Server JSONL client."""
 
@@ -646,7 +754,30 @@ class AppServerClient:
         self._stdout_buffer = bytearray()
         self._notifications: list[dict[str, Any]] = []
         self._next_id = 1
-        self._stderr_handle: Any = None
+        self._stderr_thread: threading.Thread | None = None
+        self._stderr_sink: BoundedRotatingByteLog | None = None
+
+    def _drain_stderr(self, stream: Any, sink: BoundedRotatingByteLog) -> None:
+        sink_failed = False
+        try:
+            while True:
+                chunk = stream.read(64 * 1024)
+                if not chunk:
+                    break
+                if sink_failed:
+                    continue
+                try:
+                    sink.write(chunk)
+                except OSError as exc:
+                    # Keep draining so a logging failure can never deadlock the
+                    # App Server on a full stderr pipe.
+                    sink_failed = True
+                    with contextlib.suppress(Exception):
+                        self.logger.error("App Server stderr log failed: %s", exc)
+        except OSError:
+            pass
+        finally:
+            sink.close()
 
     def start(self) -> None:
         if self.process is not None and self.process.poll() is None:
@@ -656,7 +787,7 @@ class AppServerClient:
         os.chmod(self.config.isolated_cwd, 0o700)
         self.config.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         stderr_path = self.config.log_dir / "app-server.stderr.log"
-        self._stderr_handle = stderr_path.open("ab", buffering=0)
+        self._stderr_sink = BoundedRotatingByteLog(stderr_path)
         command = [
             str(self.codex),
             "app-server",
@@ -711,18 +842,35 @@ class AppServerClient:
             "analytics.enabled=false",
         ]
         self.logger.info("Starting Codex App Server %s", self.codex)
-        self.process = subprocess.Popen(
-            command,
-            cwd=self.config.isolated_cwd,
-            env=clean_codex_env(),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=self._stderr_handle,
-            bufsize=0,
-            start_new_session=True,
-        )
-        if self.process.stdin is None or self.process.stdout is None:
+        try:
+            self.process = subprocess.Popen(
+                command,
+                cwd=self.config.isolated_cwd,
+                env=clean_codex_env(),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+                start_new_session=True,
+            )
+        except BaseException:
+            self._stderr_sink.close()
+            self._stderr_sink = None
+            raise
+        if (
+            self.process.stdin is None
+            or self.process.stdout is None
+            or self.process.stderr is None
+        ):
+            self.close()
             raise AppServerExited("Codex App Server did not expose stdio")
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr,
+            args=(self.process.stderr, self._stderr_sink),
+            name="codex-app-server-stderr",
+            daemon=True,
+        )
+        self._stderr_thread.start()
         os.set_blocking(self.process.stdout.fileno(), False)
         self._selector = selectors.DefaultSelector()
         self._selector.register(self.process.stdout, selectors.EVENT_READ)
@@ -766,10 +914,18 @@ class AppServerClient:
                 if stream is not None:
                     with contextlib.suppress(Exception):
                         stream.close()
-        if self._stderr_handle is not None:
+        stderr_thread = self._stderr_thread
+        self._stderr_thread = None
+        if stderr_thread is not None:
+            stderr_thread.join(timeout=2)
+        if process is not None and process.stderr is not None:
             with contextlib.suppress(Exception):
-                self._stderr_handle.close()
-            self._stderr_handle = None
+                process.stderr.close()
+        if stderr_thread is not None and stderr_thread.is_alive():
+            stderr_thread.join(timeout=1)
+        if self._stderr_sink is not None:
+            self._stderr_sink.close()
+            self._stderr_sink = None
 
     def restart(self) -> None:
         self.close()
@@ -1282,15 +1438,27 @@ def parse_model_output(raw: str) -> dict[str, Any]:
 
 
 def bind_action_plan_to_state(
-    action_plan: dict[str, Any] | None, state_hash: str
+    action_plan: dict[str, Any] | None,
+    state_hash: str,
+    context_payload: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Attach the trusted snapshot hash after model output validation."""
+    """Attach trusted global and action-scope hashes after model validation."""
     if action_plan is None:
         return None
+    scope = require_string(action_plan.get("scope"), "actionPlan.scope", maximum=40)
+    action_hashes = require_object(
+        context_payload.get("actionStateHashes"),
+        "context.payload.actionStateHashes",
+    )
+    action_state_hash = require_sha256_hex(
+        action_hashes.get(scope),
+        f"context.payload.actionStateHashes.{scope}",
+    )
     result = dict(action_plan)
     result["sourceStateHash"] = require_string(
         state_hash, "sourceStateHash", maximum=256
     )
+    result["sourceActionStateHash"] = action_state_hash
     return result
 
 
@@ -1300,17 +1468,29 @@ def build_turn_prompt(job: ClaimedJob, *, recovery_seed: bool) -> str:
         for item in job.transcript
         if item.id == job.user_message_id and item.role == "user"
     )
-    prior = [
-        {
-            "id": item.id,
-            "sequence": item.sequence,
-            "role": item.role,
-            "text": item.text,
-            "createdAt": item.created_at,
-        }
-        for item in job.transcript
-        if item.id != current.id
-    ][-50:]
+    untrusted_data: dict[str, Any] = {
+        # This is intentionally sent on every turn. The resumed thread carries
+        # conversational history, but workout state can change between turns.
+        "workoutContext": job.context_payload,
+        "currentUserMessage": {
+            "id": current.id,
+            "sequence": current.sequence,
+            "text": current.text,
+            "createdAt": current.created_at,
+        },
+    }
+    if recovery_seed:
+        untrusted_data["priorTranscript"] = [
+            {
+                "id": item.id,
+                "sequence": item.sequence,
+                "role": item.role,
+                "text": item.text,
+                "createdAt": item.created_at,
+            }
+            for item in job.transcript
+            if item.id != current.id
+        ][-50:]
     envelope = {
         "protocolVersion": 1,
         "conversationId": job.conversation_id,
@@ -1318,16 +1498,7 @@ def build_turn_prompt(job: ClaimedJob, *, recovery_seed: bool) -> str:
         "sourceStateHash": job.state_hash,
         "reasoningMode": job.effort,
         "recoverySeed": recovery_seed,
-        "untrustedData": {
-            "workoutContext": job.context_payload,
-            "priorTranscript": prior,
-            "currentUserMessage": {
-                "id": current.id,
-                "sequence": current.sequence,
-                "text": current.text,
-                "createdAt": current.created_at,
-            },
-        },
+        "untrustedData": untrusted_data,
     }
     marker = f"WORKOUT_CHAT_DATA_{uuid.uuid4().hex}"
     payload = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
@@ -1399,6 +1570,33 @@ def quarantine_spool(config: Config, path: Path, category: str) -> None:
     target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     target = target_dir / f"{int(time.time())}-{path.name}"
     os.replace(path, target)
+    prune_completion_quarantine(config)
+
+
+def prune_completion_quarantine(
+    config: Config, *, now: float | None = None
+) -> int:
+    """Bound rejected diagnostics without touching publishable root spools."""
+    current_time = time.time() if now is None else now
+    removed = 0
+    for category in ("invalid", "stale"):
+        directory = config.state_dir / "spool" / category
+        if not directory.is_dir():
+            continue
+        files = sorted(
+            (path for path in directory.glob("*.json") if path.is_file()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for index, path in enumerate(files):
+            too_many = index >= QUARANTINE_MAX_FILES
+            too_old = current_time - path.stat().st_mtime > QUARANTINE_MAX_AGE_SECONDS
+            if not too_many and not too_old:
+                continue
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+                removed += 1
+    return removed
 
 
 def flush_spools(config: Config, cloud: CloudClient, logger: logging.Logger) -> None:
@@ -1553,7 +1751,7 @@ class ChatBridge:
         try:
             output, thread_id = self._generate(job)
             action_plan = bind_action_plan_to_state(
-                output["actionPlan"], job.state_hash
+                output["actionPlan"], job.state_hash, job.context_payload
             )
             completion: dict[str, Any] = {
                 "leaseToken": job.lease_token,
@@ -1639,12 +1837,35 @@ class ChatBridge:
         with contextlib.suppress(BridgeError):
             self.heartbeat("error", job.id)
 
+    def _idle_wait(self, delay_seconds: float) -> None:
+        """Wait for the next claim while maintaining the idle heartbeat."""
+        deadline = time.monotonic() + delay_seconds
+        while not self.stop_requested:
+            now = time.monotonic()
+            if now - self.last_heartbeat >= self.config.heartbeat_seconds:
+                self.heartbeat("idle")
+                now = time.monotonic()
+            remaining = deadline - now
+            if remaining <= 0:
+                return
+            until_heartbeat = self.config.heartbeat_seconds - (
+                now - self.last_heartbeat
+            )
+            time.sleep(min(remaining, max(0.05, until_heartbeat)))
+
     def run(self, *, once: bool) -> int:
         signal.signal(signal.SIGTERM, self.request_stop)
         signal.signal(signal.SIGINT, self.request_stop)
+        removed = prune_completion_quarantine(self.config)
+        if removed:
+            self.logger.info("Pruned %s old chat completion diagnostics", removed)
         flush_spools(self.config, self.cloud, self.logger)
         self.heartbeat("idle")
         update_status(self.config, stage="idle", outcome="running", workerId=self.worker_id)
+        idle_backoff = IdleClaimBackoff(
+            self.config.poll_seconds,
+            self.config.idle_max_poll_seconds,
+        )
         try:
             while not self.stop_requested:
                 try:
@@ -1661,12 +1882,16 @@ class ChatBridge:
                             self.logger.warning("%s", exc)
                         except BridgeError:
                             self.logger.exception("Job processing failed")
+                        idle_backoff.record_activity()
+                        if not self.stop_requested:
+                            self.heartbeat("idle")
                     if once:
                         break
-                    now = time.monotonic()
-                    if now - self.last_heartbeat >= self.config.heartbeat_seconds:
-                        self.heartbeat("idle")
-                    time.sleep(self.config.poll_seconds)
+                    if job is not None:
+                        # Drain bursts without an artificial delay. If the queue is
+                        # empty, the first wait still starts at the fast interval.
+                        continue
+                    self._idle_wait(idle_backoff.record_empty_claim())
                 except TransientError as exc:
                     self.logger.warning("Transient bridge error: %s", exc)
                     update_status(
@@ -1780,6 +2005,24 @@ def configure_logging() -> logging.Logger:
     return logging.getLogger("workout-chat-bridge")
 
 
+def enable_bounded_file_logging(logger: logging.Logger, log_dir: Path) -> None:
+    log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = log_dir / "bridge.log"
+    resolved = str(path.resolve())
+    for handler in logger.handlers:
+        if getattr(handler, "baseFilename", None) == resolved:
+            return
+    handler = logging.handlers.RotatingFileHandler(
+        path,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
+    os.chmod(path, 0o600)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1792,6 +2035,7 @@ def main(argv: list[str] | None = None) -> int:
     logger = configure_logging()
     try:
         config = Config.from_env()
+        enable_bounded_file_logging(logger, config.log_dir)
         if args.doctor:
             return doctor(config)
         os.umask(0o077)

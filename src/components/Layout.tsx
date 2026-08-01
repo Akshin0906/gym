@@ -55,7 +55,7 @@ export function Layout({ children }: { children: ReactNode }) {
       >
         {children}
       </main>
-      {!isCoach && <RestTimerBar tabBarHidden={hideTabs} />}
+      <RestTimerBar tabBarHidden={hideTabs} coachMode={isCoach} />
       {!hideTabs && (
         <nav
           aria-label="Primary"
