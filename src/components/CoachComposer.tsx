@@ -44,7 +44,7 @@ export function CoachComposer({
     <div
       className="shrink-0 px-3 pt-2"
       style={{
-        paddingBottom: 'max(0.75rem, env(safe-area-inset-bottom, 0px))',
+        paddingBottom: 'max(0.75rem, var(--app-safe-area-bottom))',
         background: 'linear-gradient(to top, var(--color-bg) 84%, transparent)',
       }}
     >

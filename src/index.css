@@ -19,7 +19,10 @@
 }
 
 :root {
-  --tab-bar-height: calc(4.25rem + env(safe-area-inset-bottom, 0px) / 2);
+  --app-viewport-height: 100dvh;
+  --app-viewport-top: 0px;
+  --app-safe-area-bottom: env(safe-area-inset-bottom, 0px);
+  --tab-bar-height: calc(4.25rem + var(--app-safe-area-bottom) / 2);
   color-scheme: dark;
 }
 
@@ -35,14 +38,11 @@ body {
   text-rendering: optimizeLegibility;
 }
 
-html {
-  height: 100dvh;
-  height: -webkit-fill-available;
-}
+html,
 body,
 #root {
-  min-height: 100dvh;
-  min-height: -webkit-fill-available;
+  height: 100%;
+  overflow: hidden;
 }
 
 /* Prevent iOS Safari from zooming on focused inputs (< 16px triggers zoom). */

@@ -104,7 +104,7 @@ export function ExercisePickerSheet({
         style={{
           background: 'var(--color-surface)',
           borderTop: '1px solid var(--color-border)',
-          paddingBottom: 'env(safe-area-inset-bottom, 0px)',
+          paddingBottom: 'var(--app-safe-area-bottom)',
           height: baseHeight,
           transform: `translateY(${translateY}px)`,
           transition: dragging.current

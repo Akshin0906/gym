@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useMemo } from 'react'
+import { type ReactNode, useEffect, useLayoutEffect, useMemo } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
 import {
   BarChart3,
@@ -9,6 +9,7 @@ import {
   type LucideIcon,
 } from 'lucide-react'
 import { primeAudio } from '../lib/audio'
+import { installAppViewportSizing } from '../lib/visualViewport'
 import { RestTimerBar } from './RestTimerBar'
 
 const TABS: { to: string; label: string; icon: LucideIcon; exact?: boolean }[] = [
@@ -44,8 +45,17 @@ export function Layout({ children }: { children: ReactNode }) {
     return () => document.removeEventListener('pointerdown', handler)
   }, [])
 
+  useLayoutEffect(() => installAppViewportSizing(), [])
+
   return (
-    <div className="h-dvh flex flex-col">
+    <div
+      data-app-shell
+      className="absolute inset-x-0 top-0 flex flex-col overflow-hidden"
+      style={{
+        height: 'var(--app-viewport-height)',
+        transform: 'translate3d(0, var(--app-viewport-top), 0)',
+      }}
+    >
       <main
         className={`flex-1 min-h-0 ${
           isCoach
@@ -62,7 +72,7 @@ export function Layout({ children }: { children: ReactNode }) {
           className="relative flex items-stretch z-40 backdrop-blur shrink-0"
           style={{
             height: 'var(--tab-bar-height)',
-            paddingBottom: 'calc(env(safe-area-inset-bottom, 0px) / 2)',
+            paddingBottom: 'calc(var(--app-safe-area-bottom) / 2)',
             background: 'oklch(0.16 0 0 / 0.92)',
             borderTop: '1px solid var(--color-border)',
           }}

@@ -213,7 +213,7 @@ export function RestTimerBar({
         bottom: coachMode
           ? `${coachComposerHeight}px`
           : tabBarHidden
-            ? 'env(safe-area-inset-bottom, 0px)'
+            ? 'var(--app-safe-area-bottom)'
             : 'var(--tab-bar-height)',
       }}
     >
