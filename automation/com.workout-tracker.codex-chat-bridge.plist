@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.workout-tracker.codex-chat-bridge</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/caffeinate</string>
+    <string>-s</string>
+    <string>/bin/bash</string>
+    <string>__RUNTIME_ROOT__/current/run_codex_chat_bridge.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__RUNTIME_ROOT__</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Applications/ChatGPT.app/Contents/Resources:/Applications/Codex.app/Contents/Resources</string>
+    <key>WORKOUT_CHAT_AUTOMATION_ROOT</key>
+    <string>__RUNTIME_ROOT__</string>
+    <key>WORKOUT_CHAT_RELEASE_ROOT</key>
+    <string>__RUNTIME_ROOT__/current</string>
+    <key>WORKOUT_CHAT_ENV_FILE</key>
+    <string>__RUNTIME_ROOT__/credentials.env</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>__RUNTIME_ROOT__/logs/launchd.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>__RUNTIME_ROOT__/logs/launchd.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,24 @@
+name = "workout-tracker"
+compatibility_date = "2025-01-01"
+pages_build_output_dir = "./dist"
+
+# KV namespace for cloud pairing rate limiters.
+# Created via: npx wrangler kv namespace create LLM_RATE
+[[kv_namespaces]]
+binding = "LLM_RATE"
+id = "7acc10ee5d244f3a86c51824e1c82030"
+
+# D1 database for the phone snapshot mirror, Codex daily briefings,
+# and Codex-owned memory.
+# Created with:
+#   npx wrangler d1 create workout-tracker
+# Apply migrations with:
+#   npx wrangler d1 migrations apply workout-tracker --remote
+[[d1_databases]]
+binding = "WORKOUT_DB"
+database_name = "workout-tracker"
+database_id = "7232da7b-58fa-4e11-9858-a2f824b978b4"
+
+# Runtime secrets (set via `wrangler pages secret put`, NOT here):
+#   CLOUD_PAIRING_SECRET    - private code used to pair a phone PWA session.
+#   CLOUD_AUTOMATION_SECRET - server-only secret for Codex/cloud automation.

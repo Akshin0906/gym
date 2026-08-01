@@ -1,0 +1,16 @@
+node_modules
+dist
+dev-dist
+.wrangler/
+.DS_Store
+*.local
+.env*
+*.log
+*.tsbuildinfo
+__pycache__/
+*.pyc
+
+# Codex automation working state: contains full plaintext training snapshots
+# (PII) and run logs. Never commit.
+automation/state/
+automation/logs/

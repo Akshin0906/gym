@@ -1,0 +1,258 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI',
+    Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', Menlo, Monaco, Consolas, monospace;
+
+  --color-bg: oklch(0.16 0 0);
+  --color-surface: oklch(0.205 0 0);
+  --color-surface-2: oklch(0.245 0 0);
+  --color-border: oklch(0.31 0 0);
+  --color-fg: oklch(0.985 0 0);
+  --color-fg-dim: oklch(0.72 0 0);
+  --color-fg-faint: oklch(0.55 0 0);
+
+  --color-accent: oklch(0.74 0.18 50);
+  --color-accent-strong: oklch(0.66 0.21 45);
+  --color-accent-soft: oklch(0.3 0.08 50);
+}
+
+:root {
+  --tab-bar-height: calc(4.25rem + env(safe-area-inset-bottom, 0px) / 2);
+  color-scheme: dark;
+}
+
+html,
+body {
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  -webkit-tap-highlight-color: transparent;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overscroll-behavior-y: none;
+  text-rendering: optimizeLegibility;
+}
+
+html {
+  height: 100dvh;
+  height: -webkit-fill-available;
+}
+body,
+#root {
+  min-height: 100dvh;
+  min-height: -webkit-fill-available;
+}
+
+/* Prevent iOS Safari from zooming on focused inputs (< 16px triggers zoom). */
+input,
+textarea,
+select,
+button {
+  font: inherit;
+}
+
+:where(a, button, input, textarea, select, [role='button']):focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 3px;
+}
+
+:where(button, [role='button']):disabled {
+  cursor: not-allowed;
+}
+input[type='text'],
+input[type='search'],
+input[type='number'],
+input[type='email'],
+input[type='tel'],
+textarea,
+select {
+  font-size: max(16px, 1rem);
+}
+
+/* Tabular numbers everywhere they appear inside .nums */
+.nums {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum';
+}
+
+/* Card primitive used across screens */
+.card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 14px;
+}
+.card-tight {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+}
+
+/* Button primitives */
+.btn-primary {
+  background: var(--color-accent);
+  color: oklch(0.2 0.04 50);
+  font-weight: 600;
+  border-radius: 12px;
+  padding: 0.75rem 1rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  transition: background 120ms ease, transform 80ms ease;
+}
+.btn-primary:hover {
+  background: var(--color-accent-strong);
+}
+.btn-primary:active {
+  transform: scale(0.985);
+}
+.btn-primary:disabled {
+  opacity: 0.5;
+}
+
+.btn-secondary {
+  background: var(--color-surface-2);
+  color: var(--color-fg);
+  font-weight: 500;
+  border-radius: 12px;
+  padding: 0.625rem 0.875rem;
+  border: 1px solid var(--color-border);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+}
+.btn-secondary:hover {
+  background: oklch(0.27 0 0);
+}
+
+.btn-ghost {
+  color: var(--color-fg-dim);
+  padding: 0.5rem 0.75rem;
+  border-radius: 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.btn-ghost:hover {
+  color: var(--color-fg);
+  background: var(--color-surface-2);
+}
+
+/* Field primitive */
+.field {
+  background: oklch(0.14 0 0);
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  padding: 0.625rem 0.75rem;
+  width: 100%;
+  color: var(--color-fg);
+  outline: none;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+.field:focus {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px oklch(0.74 0.18 50 / 0.18);
+}
+
+/* Subtle inset shadow for prominent inputs (set logger weight/reps) */
+.field-inset {
+  background: oklch(0.12 0 0);
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  color: var(--color-fg);
+  outline: none;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.field-inset:focus {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px oklch(0.74 0.18 50 / 0.18);
+}
+
+/* Skeleton shimmer */
+@keyframes skeleton-shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.skeleton-shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--color-surface) 0%,
+    var(--color-surface-2) 50%,
+    var(--color-surface) 100%
+  );
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.4s linear infinite;
+}
+
+/* Resume card pulse — subtle right-edge accent */
+@keyframes resume-pulse {
+  0%, 60%, 100% { opacity: 1; transform: scaleY(1); }
+  30% { opacity: 0.55; transform: scaleY(0.85); }
+}
+.resume-pulse-bar {
+  animation: resume-pulse 2.4s ease-in-out infinite;
+  transform-origin: center;
+}
+
+/* PR celebration — short gold-tinted highlight on a logged set */
+@keyframes pr-flash {
+  0% {
+    background: oklch(0.7 0.18 90 / 0.25);
+    border-color: oklch(0.78 0.18 90);
+    box-shadow: 0 0 0 3px oklch(0.78 0.18 90 / 0.25);
+  }
+  100% {
+    background: var(--color-surface);
+    border-color: var(--color-border);
+    box-shadow: none;
+  }
+}
+.pr-flash {
+  animation: pr-flash 1.6s ease-out forwards;
+}
+
+.pr-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.125rem 0.5rem;
+  border-radius: 9999px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: oklch(0.2 0.06 90);
+  background: oklch(0.82 0.16 90);
+}
+
+/* Sliding tab-bar indicator */
+.tab-indicator {
+  position: absolute;
+  top: 0;
+  height: 2.5px;
+  border-radius: 0 0 999px 999px;
+  background: var(--color-accent);
+  transition: transform 220ms cubic-bezier(0.3, 0.9, 0.4, 1.1),
+              width 220ms cubic-bezier(0.3, 0.9, 0.4, 1.1);
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.001ms !important;
+  }
+
+  .skeleton-shimmer {
+    animation: none;
+    background: var(--color-surface-2);
+  }
+}

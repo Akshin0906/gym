@@ -1,0 +1,341 @@
+import 'fake-indexeddb/auto'
+import { beforeEach, describe, expect, it } from 'vitest'
+import { db } from '../schema'
+import type { Exercise, WorkoutSession } from '../types'
+import {
+  applyCoachActionPlan,
+  parseCoachActionPlan,
+  StaleCoachActionError,
+} from './chatActions'
+
+const HASH = 'a'.repeat(64)
+
+function exercise(id: string, name = id): Exercise {
+  return {
+    id,
+    name,
+    primaryMuscle: 'chest',
+    secondaryMuscles: [],
+    notes: '',
+    defaultRestSeconds: 90,
+    isCustom: false,
+    hiddenFromLibrary: false,
+    createdAt: 1,
+  }
+}
+
+function activeSession(): WorkoutSession {
+  return {
+    id: 'session',
+    sessionTemplateId: null,
+    programId: null,
+    name: 'Today',
+    programName: null,
+    exerciseSnapshot: [
+      {
+        exerciseId: 'a',
+        order: 0,
+        targetSets: 3,
+        targetRepRange: '8-10',
+      },
+      {
+        exerciseId: 'b',
+        order: 1,
+        targetSets: 3,
+        targetRepRange: '10-12',
+      },
+    ],
+    startedAt: 1,
+    completedAt: null,
+  }
+}
+
+function plan(action: unknown, scope = 'active_workout') {
+  return {
+    title: 'Safe change',
+    summary: 'Preview this exact change.',
+    scope,
+    sourceStateHash: HASH,
+    actions: [action],
+  }
+}
+
+beforeEach(async () => {
+  await Promise.all(db.tables.map((table) => table.clear()))
+})
+
+describe('Coach action plan validation', () => {
+  it('requires replacement targets for a swap', () => {
+    expect(() =>
+      parseCoachActionPlan(
+        plan({
+          type: 'swap_active_exercise',
+          sessionId: 'session',
+          fromExerciseId: 'a',
+          toExerciseId: 'c',
+        }),
+      ),
+    ).toThrow('targetSets')
+  })
+
+  it('rejects unknown model-authored operations', () => {
+    expect(() =>
+      parseCoachActionPlan(plan({ type: 'delete_everything' })),
+    ).toThrow('Unsupported Coach action')
+  })
+})
+
+describe('active workout Coach actions', () => {
+  beforeEach(async () => {
+    await db.exercises.bulkAdd([
+      exercise('a', 'Bench Press'),
+      exercise('b', 'Cable Fly'),
+      exercise('c', 'Machine Press'),
+    ])
+    await db.workoutSessions.add(activeSession())
+  })
+
+  it('adds an exercise at the requested position and is idempotent by proposal', async () => {
+    const rawPlan = plan({
+      type: 'add_active_exercise',
+      sessionId: 'session',
+      exerciseId: 'c',
+      position: 1,
+      targetSets: 4,
+      repRange: '6-8',
+    })
+    const first = await applyCoachActionPlan({
+      proposalId: 'proposal-add',
+      rawPlan,
+      currentStateHash: HASH,
+    })
+    const replay = await applyCoachActionPlan({
+      proposalId: 'proposal-add',
+      rawPlan,
+      currentStateHash: 'b'.repeat(64),
+    })
+
+    const session = await db.workoutSessions.get('session')
+    expect(session?.exerciseSnapshot).toEqual([
+      expect.objectContaining({ exerciseId: 'a', order: 0 }),
+      expect.objectContaining({
+        exerciseId: 'c',
+        order: 1,
+        targetSets: 4,
+        targetRepRange: '6-8',
+      }),
+      expect.objectContaining({ exerciseId: 'b', order: 2 }),
+    ])
+    expect(first.replayed).toBe(false)
+    expect(replay.replayed).toBe(true)
+    expect(await db.chatActionReceipts.count()).toBe(1)
+  })
+
+  it('replaces an unperformed exercise in place with new targets', async () => {
+    await applyCoachActionPlan({
+      proposalId: 'proposal-swap-empty',
+      rawPlan: plan({
+        type: 'swap_active_exercise',
+        sessionId: 'session',
+        fromExerciseId: 'a',
+        toExerciseId: 'c',
+        targetSets: 2,
+        repRange: '12-15',
+      }),
+      currentStateHash: HASH,
+    })
+
+    const session = await db.workoutSessions.get('session')
+    expect(session?.exerciseSnapshot).toEqual([
+      {
+        exerciseId: 'c',
+        order: 0,
+        targetSets: 2,
+        targetRepRange: '12-15',
+      },
+      expect.objectContaining({ exerciseId: 'b', order: 1 }),
+    ])
+  })
+
+  it('preserves performed work, caps its target, and inserts the replacement next', async () => {
+    await db.loggedSets.add({
+      id: 'set-a-1',
+      workoutSessionId: 'session',
+      exerciseId: 'a',
+      setNumber: 1,
+      weightLbs: 100,
+      reps: 8,
+      rpe: 7,
+      loggedAt: 2,
+    })
+    await applyCoachActionPlan({
+      proposalId: 'proposal-swap-logged',
+      rawPlan: plan({
+        type: 'swap_active_exercise',
+        sessionId: 'session',
+        fromExerciseId: 'a',
+        toExerciseId: 'c',
+        targetSets: 2,
+        repRange: '12-15',
+      }),
+      currentStateHash: HASH,
+    })
+
+    const session = await db.workoutSessions.get('session')
+    expect(session?.exerciseSnapshot).toEqual([
+      expect.objectContaining({ exerciseId: 'a', order: 0, targetSets: 1 }),
+      expect.objectContaining({
+        exerciseId: 'c',
+        order: 1,
+        targetSets: 2,
+        targetRepRange: '12-15',
+      }),
+      expect.objectContaining({ exerciseId: 'b', order: 2 }),
+    ])
+    expect(session?.doneExerciseIds).toContain('a')
+    expect(await db.loggedSets.get('set-a-1')).toBeDefined()
+  })
+
+  it('will not reduce a target below the number of logged sets', async () => {
+    await db.loggedSets.bulkAdd([
+      {
+        id: 'set-1',
+        workoutSessionId: 'session',
+        exerciseId: 'a',
+        setNumber: 1,
+        weightLbs: 100,
+        reps: 8,
+        rpe: null,
+        loggedAt: 2,
+      },
+      {
+        id: 'set-2',
+        workoutSessionId: 'session',
+        exerciseId: 'a',
+        setNumber: 2,
+        weightLbs: 100,
+        reps: 8,
+        rpe: null,
+        loggedAt: 3,
+      },
+    ])
+
+    await expect(
+      applyCoachActionPlan({
+        proposalId: 'proposal-low-target',
+        rawPlan: plan({
+          type: 'update_active_exercise_targets',
+          sessionId: 'session',
+          exerciseId: 'a',
+          targetSets: 1,
+          repRange: '8-10',
+        }),
+        currentStateHash: HASH,
+      }),
+    ).rejects.toThrow('already has 2 logged sets')
+    expect(await db.chatActionReceipts.get('proposal-low-target')).toBeUndefined()
+  })
+
+  it('rejects a proposal when the phone state fingerprint changed', async () => {
+    await expect(
+      applyCoachActionPlan({
+        proposalId: 'proposal-stale',
+        rawPlan: plan({
+          type: 'update_active_exercise_targets',
+          sessionId: 'session',
+          exerciseId: 'a',
+          targetSets: 2,
+          repRange: '8-10',
+        }),
+        currentStateHash: 'b'.repeat(64),
+      }),
+    ).rejects.toBeInstanceOf(StaleCoachActionError)
+  })
+})
+
+describe('workout and program creation', () => {
+  beforeEach(async () => {
+    await db.exercises.bulkAdd([
+      exercise('a', 'Bench Press'),
+      exercise('b', 'Cable Fly'),
+    ])
+  })
+
+  it('creates a complete one-time workout atomically', async () => {
+    const result = await applyCoachActionPlan({
+      proposalId: 'proposal-one-time',
+      rawPlan: plan(
+        {
+          type: 'create_one_time_workout',
+          name: 'Quick chest',
+          exercises: [
+            { exerciseId: 'a', targetSets: 3, repRange: '6-8' },
+            { exerciseId: 'b', targetSets: 2, repRange: '12-15' },
+          ],
+        },
+        'one_time_workout',
+      ),
+      currentStateHash: HASH,
+    })
+
+    const session = await db.workoutSessions.get(result.activeSessionId!)
+    expect(session).toMatchObject({
+      name: 'Quick chest',
+      sessionTemplateId: null,
+      programId: null,
+      completedAt: null,
+    })
+    expect(session?.exerciseSnapshot).toHaveLength(2)
+  })
+
+  it('refuses to replace an already active workout', async () => {
+    await db.workoutSessions.add(activeSession())
+    await expect(
+      applyCoachActionPlan({
+        proposalId: 'proposal-conflict',
+        rawPlan: plan(
+          {
+            type: 'create_one_time_workout',
+            name: 'Another workout',
+            exercises: [{ exerciseId: 'a', targetSets: 3, repRange: '8-10' }],
+          },
+          'one_time_workout',
+        ),
+        currentStateHash: HASH,
+      }),
+    ).rejects.toThrow('before starting another workout')
+  })
+
+  it('creates a whole inactive program graph in one transaction', async () => {
+    const result = await applyCoachActionPlan({
+      proposalId: 'proposal-program',
+      rawPlan: plan(
+        {
+          type: 'create_program',
+          name: 'Two day split',
+          sessions: [
+            {
+              name: 'Day A',
+              exercises: [{ exerciseId: 'a', targetSets: 3, repRange: '6-8' }],
+            },
+            {
+              name: 'Day B',
+              exercises: [{ exerciseId: 'b', targetSets: 3, repRange: '10-12' }],
+            },
+          ],
+        },
+        'program',
+      ),
+      currentStateHash: HASH,
+    })
+
+    const program = await db.programs.get(result.programId!)
+    const sessions = await db.sessionTemplates
+      .where('programId')
+      .equals(result.programId!)
+      .toArray()
+    expect(program?.isActive).toBe(0)
+    expect(sessions.map((session) => session.order).sort()).toEqual([0, 1])
+    expect(await db.templateExercises.count()).toBe(2)
+  })
+})

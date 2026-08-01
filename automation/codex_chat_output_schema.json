@@ -1,0 +1,179 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Workout Coach Chat Response",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["assistantText", "actionPlan"],
+  "properties": {
+    "assistantText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8000
+    },
+    "actionPlan": {
+      "anyOf": [
+        { "type": "null" },
+        { "$ref": "#/definitions/actionPlan" }
+      ]
+    }
+  },
+  "definitions": {
+    "exerciseSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exerciseId", "targetSets", "repRange"],
+      "properties": {
+        "exerciseId": { "type": "string", "minLength": 1 },
+        "targetSets": { "type": "integer", "minimum": 1, "maximum": 20 },
+        "repRange": { "type": "string", "minLength": 1, "maxLength": 50 }
+      }
+    },
+    "sessionSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "exercises"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "exercises": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 30,
+          "items": { "$ref": "#/definitions/exerciseSpec" }
+        }
+      }
+    },
+    "swapActiveExercise": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "sessionId",
+        "fromExerciseId",
+        "toExerciseId",
+        "targetSets",
+        "repRange"
+      ],
+      "properties": {
+        "type": { "type": "string", "const": "swap_active_exercise" },
+        "sessionId": { "type": "string", "minLength": 1 },
+        "fromExerciseId": { "type": "string", "minLength": 1 },
+        "toExerciseId": { "type": "string", "minLength": 1 },
+        "targetSets": { "type": "integer", "minimum": 1, "maximum": 20 },
+        "repRange": { "type": "string", "minLength": 1, "maxLength": 50 }
+      }
+    },
+    "addActiveExercise": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "sessionId",
+        "exerciseId",
+        "position",
+        "targetSets",
+        "repRange"
+      ],
+      "properties": {
+        "type": { "type": "string", "const": "add_active_exercise" },
+        "sessionId": { "type": "string", "minLength": 1 },
+        "exerciseId": { "type": "string", "minLength": 1 },
+        "position": { "type": "integer", "minimum": 0 },
+        "targetSets": { "type": "integer", "minimum": 1, "maximum": 20 },
+        "repRange": { "type": "string", "minLength": 1, "maxLength": 50 }
+      }
+    },
+    "updateActiveExerciseTargets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "sessionId",
+        "exerciseId",
+        "targetSets",
+        "repRange"
+      ],
+      "properties": {
+        "type": { "type": "string", "const": "update_active_exercise_targets" },
+        "sessionId": { "type": "string", "minLength": 1 },
+        "exerciseId": { "type": "string", "minLength": 1 },
+        "targetSets": { "type": "integer", "minimum": 1, "maximum": 20 },
+        "repRange": { "type": "string", "minLength": 1, "maxLength": 50 }
+      }
+    },
+    "createOneTimeWorkout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "name", "exercises"],
+      "properties": {
+        "type": { "type": "string", "const": "create_one_time_workout" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "exercises": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 30,
+          "items": { "$ref": "#/definitions/exerciseSpec" }
+        }
+      }
+    },
+    "createSessionTemplate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "programId", "name", "exercises"],
+      "properties": {
+        "type": { "type": "string", "const": "create_session_template" },
+        "programId": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "exercises": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 30,
+          "items": { "$ref": "#/definitions/exerciseSpec" }
+        }
+      }
+    },
+    "createProgram": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "name", "sessions"],
+      "properties": {
+        "type": { "type": "string", "const": "create_program" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "sessions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "items": { "$ref": "#/definitions/sessionSpec" }
+        }
+      }
+    },
+    "action": {
+      "anyOf": [
+        { "$ref": "#/definitions/swapActiveExercise" },
+        { "$ref": "#/definitions/addActiveExercise" },
+        { "$ref": "#/definitions/updateActiveExerciseTargets" },
+        { "$ref": "#/definitions/createOneTimeWorkout" },
+        { "$ref": "#/definitions/createSessionTemplate" },
+        { "$ref": "#/definitions/createProgram" }
+      ]
+    },
+    "actionPlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "summary", "scope", "actions"],
+      "properties": {
+        "title": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "summary": { "type": "string", "minLength": 1, "maxLength": 1000 },
+        "scope": {
+          "type": "string",
+          "enum": ["active_workout", "one_time_workout", "program"]
+        },
+        "actions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 12,
+          "items": { "$ref": "#/definitions/action" }
+        }
+      }
+    }
+  }
+}
