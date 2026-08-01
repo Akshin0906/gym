@@ -287,18 +287,23 @@ export async function buildLiveCoachContext(
     templates: rows.templates.slice().sort(byId),
     templateExercises: rows.templateExercises.slice().sort(byId),
   }
-  const [activeWorkoutHash, oneTimeWorkoutHash, programHash] = await Promise.all([
-    sha256(activeWorkoutState),
-    sha256({
-      exerciseCatalog: exerciseCatalogState,
-      inProgress: inProgressStructure,
-    }),
-    sha256(programStructure),
-  ])
+  const [activeWorkoutHash, oneTimeWorkoutHash, programHash, aiMemoryHash] =
+    await Promise.all([
+      sha256(activeWorkoutState),
+      sha256({
+        exerciseCatalog: exerciseCatalogState,
+        inProgress: inProgressStructure,
+      }),
+      sha256(programStructure),
+      // Saving a note is append-only. Only availability should invalidate a
+      // pending proposal; unrelated notes or summaries can safely change.
+      sha256({ paused: rows.memorySettings?.paused ?? false }),
+    ])
   const actionStateHashes: CoachActionStateHashes = {
     active_workout: activeWorkoutHash,
     one_time_workout: oneTimeWorkoutHash,
     program: programHash,
+    ai_memory: aiMemoryHash,
   }
 
   const context: CoachLiveContext = {

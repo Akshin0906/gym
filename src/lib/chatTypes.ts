@@ -121,11 +121,16 @@ export type CoachAction =
         exercises: PlannedExercise[]
       }>
     }
+  | {
+      type: 'save_ai_note'
+      body: string
+    }
 
 export type CoachActionScope =
   | 'active_workout'
   | 'one_time_workout'
   | 'program'
+  | 'ai_memory'
 
 export type CoachActionStateHashes = {
   [Scope in CoachActionScope]: string
@@ -152,6 +157,7 @@ export interface CoachActionResult {
   sourceStateHash: string
   sourceActionStateHash: string
   replayed: boolean
+  syncPending?: boolean
   changes: CoachActionChange[]
   activeSessionId?: string
   programId?: string

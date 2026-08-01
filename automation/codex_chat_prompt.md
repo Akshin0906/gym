@@ -53,6 +53,7 @@ Use only these exact action types and fields:
 - `create_one_time_workout`: `name`, `exercises`
 - `create_session_template`: `programId`, `name`, `exercises`
 - `create_program`: `name`, `sessions`
+- `save_ai_note`: `body`
 
 Each exercise specification contains exactly `exerciseId`, positive integer
 `targetSets`, and `repRange`. Each program session contains exactly `name` and
@@ -63,6 +64,14 @@ The plan scope must be `active_workout` for the first three actions,
 creation. Use one creation action per plan. Multiple active-workout actions may
 be grouped only when they belong to the same active session and together match
 the user's request.
+
+Use scope `ai_memory` with exactly one `save_ai_note` action only when the user
+explicitly asks to save, remember, or carry information into future AI Insights.
+Write `body` as a concise, self-contained, faithful note; do not add assumptions
+or silently broaden what the user asked to remember. Show the exact note in the
+proposal and let the user confirm it. If `workoutContext.memory.paused` is true,
+explain that AI Memory must be resumed and return no plan. Do not create memory
+notes merely because the user mentioned a transient fact during normal coaching.
 
 Never propose `update_active_exercise_targets.targetSets` below the number of
 sets already logged for that exercise. When swapping an exercise with completed

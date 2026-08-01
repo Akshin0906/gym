@@ -53,6 +53,7 @@ describe('buildLiveCoachContext', () => {
         active_workout: expect.stringMatching(/^[a-f0-9]{64}$/),
         one_time_workout: expect.stringMatching(/^[a-f0-9]{64}$/),
         program: expect.stringMatching(/^[a-f0-9]{64}$/),
+        ai_memory: expect.stringMatching(/^[a-f0-9]{64}$/),
       }),
     )
     expect(second.context.actionStateHashes).toEqual(
@@ -207,5 +208,33 @@ describe('buildLiveCoachContext', () => {
       recentNotes: [],
       recentSummaries: [],
     })
+  })
+
+  it('only invalidates memory proposals when memory availability changes', async () => {
+    const before = await buildLiveCoachContext('session')
+    await db.aiNotes.add({
+      id: 'another-note',
+      body: 'Prefer short sessions.',
+      createdAt: 2,
+      updatedAt: 2,
+    })
+    const afterNote = await buildLiveCoachContext('session')
+    expect(afterNote.context.actionStateHashes.ai_memory).toBe(
+      before.context.actionStateHashes.ai_memory,
+    )
+
+    await db.aiMemorySettings.add({
+      id: 'default',
+      currentContext: '',
+      paused: true,
+      windowStartedAt: 1,
+      fourMonthStartedAt: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    const afterPause = await buildLiveCoachContext('session')
+    expect(afterPause.context.actionStateHashes.ai_memory).not.toBe(
+      afterNote.context.actionStateHashes.ai_memory,
+    )
   })
 })

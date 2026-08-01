@@ -146,6 +146,15 @@
         }
       }
     },
+    "saveAiNote": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "body"],
+      "properties": {
+        "type": { "type": "string", "const": "save_ai_note" },
+        "body": { "type": "string", "minLength": 1, "maxLength": 1000 }
+      }
+    },
     "action": {
       "anyOf": [
         { "$ref": "#/definitions/swapActiveExercise" },
@@ -153,7 +162,8 @@
         { "$ref": "#/definitions/updateActiveExerciseTargets" },
         { "$ref": "#/definitions/createOneTimeWorkout" },
         { "$ref": "#/definitions/createSessionTemplate" },
-        { "$ref": "#/definitions/createProgram" }
+        { "$ref": "#/definitions/createProgram" },
+        { "$ref": "#/definitions/saveAiNote" }
       ]
     },
     "actionPlan": {
@@ -165,7 +175,7 @@
         "summary": { "type": "string", "minLength": 1, "maxLength": 1000 },
         "scope": {
           "type": "string",
-          "enum": ["active_workout", "one_time_workout", "program"]
+          "enum": ["active_workout", "one_time_workout", "program", "ai_memory"]
         },
         "actions": {
           "type": "array",

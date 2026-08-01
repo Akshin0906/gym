@@ -30,14 +30,22 @@ function describeAction(
       return `Add “${action.name}” to ${programNames.get(action.programId) ?? 'the program'}`
     case 'create_program':
       return `Create “${action.name}” with ${action.sessions.length} sessions`
+    case 'save_ai_note':
+      return `Save to AI Memory: “${action.body}”`
   }
 }
 
-function ResultBadge({ status }: { status: CoachProposal['status'] }) {
+function ResultBadge({
+  status,
+  savedToMemory,
+}: {
+  status: CoachProposal['status']
+  savedToMemory: boolean
+}) {
   if (status === 'applied') {
     return (
       <span className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-300">
-        <CheckCircle2 size={14} /> Applied
+        <CheckCircle2 size={14} /> {savedToMemory ? 'Saved' : 'Applied'}
       </span>
     )
   }
@@ -95,6 +103,14 @@ export function CoachActionCard({
     typeof proposal.result.error === 'string'
       ? proposal.result.error
       : null
+  const syncWarning =
+    proposal.status === 'applied' &&
+    proposal.result !== null &&
+    typeof proposal.result === 'object' &&
+    (('syncPending' in proposal.result &&
+      proposal.result.syncPending === true) ||
+      ('syncWarning' in proposal.result &&
+        typeof proposal.result.syncWarning === 'string'))
   const exerciseNames = new Map(
     (context?.exerciseCatalog ?? []).map((exercise) => [exercise.id, exercise.name]),
   )
@@ -109,7 +125,10 @@ export function CoachActionCard({
         ? 'Start workout'
         : plan.actions[0]?.type === 'create_session_template'
           ? 'Save workout'
-          : 'Create program'
+          : plan.scope === 'ai_memory'
+            ? 'Save to AI Memory'
+            : 'Create program'
+  const savedToMemory = plan?.scope === 'ai_memory'
 
   return (
     <section
@@ -133,7 +152,10 @@ export function CoachActionCard({
               </p>
             )}
           </div>
-          <ResultBadge status={proposal.status} />
+          <ResultBadge
+            status={proposal.status}
+            savedToMemory={savedToMemory}
+          />
         </div>
 
         {plan && (
@@ -147,7 +169,9 @@ export function CoachActionCard({
                   size={14}
                   className="mt-0.5 shrink-0 text-[var(--color-accent)]"
                 />
-                {describeAction(action, exerciseNames, programNames)}
+                <span className="min-w-0 whitespace-pre-wrap break-words">
+                  {describeAction(action, exerciseNames, programNames)}
+                </span>
               </li>
             ))}
           </ul>
@@ -161,6 +185,16 @@ export function CoachActionCard({
                 error ??
                 remoteError ??
                 'The data this plan would change has been updated. Ask Coach for an updated plan.'}
+            </span>
+          </div>
+        )}
+
+        {syncWarning && (
+          <div className="mt-3 flex gap-2 rounded-xl px-3 py-2 text-xs leading-5 bg-amber-950/35 text-amber-100 border border-amber-800/50">
+            <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+            <span>
+              Saved on this device, but cloud sync failed. Future AI Insights
+              cannot use it yet; retry Sync now in Settings.
             </span>
           </div>
         )}

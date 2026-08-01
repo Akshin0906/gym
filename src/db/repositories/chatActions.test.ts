@@ -4,6 +4,9 @@ import { db } from '../schema'
 import type { Exercise, WorkoutSession } from '../types'
 import {
   applyCoachActionPlan,
+  getAppliedCoachActionResult,
+  listPendingCoachActionResults,
+  markCoachActionSynced,
   parseCoachActionPlan,
   StaleCoachActionError,
 } from './chatActions'
@@ -12,12 +15,15 @@ const HASH = 'a'.repeat(64)
 const ACTION_HASH = 'c'.repeat(64)
 
 function actionStateHashes(
-  overrides: Partial<Record<'active_workout' | 'one_time_workout' | 'program', string>> = {},
+  overrides: Partial<
+    Record<'active_workout' | 'one_time_workout' | 'program' | 'ai_memory', string>
+  > = {},
 ) {
   return {
     active_workout: ACTION_HASH,
     one_time_workout: ACTION_HASH,
     program: ACTION_HASH,
+    ai_memory: ACTION_HASH,
     ...overrides,
   }
 }
@@ -95,6 +101,49 @@ describe('Coach action plan validation', () => {
     expect(() =>
       parseCoachActionPlan(plan({ type: 'delete_everything' })),
     ).toThrow('Unsupported Coach action')
+  })
+
+  it('accepts one bounded AI-memory note in its dedicated scope', () => {
+    expect(
+      parseCoachActionPlan(
+        plan(
+          {
+            type: 'save_ai_note',
+            body: 'Avoid overhead pressing while my right shoulder is irritated.',
+          },
+          'ai_memory',
+        ),
+      ),
+    ).toMatchObject({
+      scope: 'ai_memory',
+      actions: [
+        {
+          type: 'save_ai_note',
+          body: 'Avoid overhead pressing while my right shoulder is irritated.',
+        },
+      ],
+    })
+  })
+
+  it('does not allow a memory action under a workout scope', () => {
+    expect(() =>
+      parseCoachActionPlan(
+        plan({ type: 'save_ai_note', body: 'Prefer dumbbells.' }),
+      ),
+    ).toThrow('active-workout plan')
+  })
+
+  it('rejects blank and oversized AI-memory notes', () => {
+    expect(() =>
+      parseCoachActionPlan(
+        plan({ type: 'save_ai_note', body: '   ' }, 'ai_memory'),
+      ),
+    ).toThrow('body is required')
+    expect(() =>
+      parseCoachActionPlan(
+        plan({ type: 'save_ai_note', body: 'x'.repeat(1001) }, 'ai_memory'),
+      ),
+    ).toThrow('body is too long')
   })
 })
 
@@ -404,5 +453,97 @@ describe('workout and program creation', () => {
     expect(program?.isActive).toBe(0)
     expect(sessions.map((session) => session.order).sort()).toEqual([0, 1])
     expect(await db.templateExercises.count()).toBe(2)
+  })
+})
+
+describe('AI-memory Coach actions', () => {
+  it('saves a note atomically and replays without creating a duplicate', async () => {
+    const rawPlan = plan(
+      {
+        type: 'save_ai_note',
+        body: '  I train at lunch on weekdays and usually have 45 minutes.  ',
+      },
+      'ai_memory',
+    )
+    const first = await applyCoachActionPlan({
+      proposalId: 'proposal-memory',
+      rawPlan,
+      currentStateHash: HASH,
+      currentActionStateHashes: actionStateHashes(),
+    })
+    const replay = await applyCoachActionPlan({
+      proposalId: 'proposal-memory',
+      rawPlan,
+      currentStateHash: HASH,
+      currentActionStateHashes: actionStateHashes(),
+    })
+
+    expect(await db.aiNotes.count()).toBe(1)
+    expect((await db.aiNotes.toArray())[0]?.body).toBe(
+      'I train at lunch on weekdays and usually have 45 minutes.',
+    )
+    expect(first.changes[0]).toMatchObject({
+      type: 'save_ai_note',
+      label: 'Saved a note for AI Insights',
+    })
+    expect(first.syncPending).toBe(true)
+    expect(replay.replayed).toBe(true)
+    expect(replay.syncPending).toBe(true)
+    expect(await db.chatActionReceipts.count()).toBe(1)
+    expect(await listPendingCoachActionResults()).toEqual([
+      expect.objectContaining({ proposalId: 'proposal-memory' }),
+    ])
+
+    const synced = await markCoachActionSynced('proposal-memory')
+    expect(synced.syncPending).toBe(false)
+    expect(
+      (await getAppliedCoachActionResult('proposal-memory'))?.syncPending,
+    ).toBe(false)
+    expect(await listPendingCoachActionResults()).toEqual([])
+  })
+
+  it('refuses to save while AI Memory is paused', async () => {
+    await db.aiMemorySettings.add({
+      id: 'default',
+      currentContext: '',
+      paused: true,
+      windowStartedAt: 1,
+      fourMonthStartedAt: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    })
+
+    await expect(
+      applyCoachActionPlan({
+        proposalId: 'proposal-paused-memory',
+        rawPlan: plan(
+          { type: 'save_ai_note', body: 'Remember this.' },
+          'ai_memory',
+        ),
+        currentStateHash: HASH,
+        currentActionStateHashes: actionStateHashes(),
+      }),
+    ).rejects.toThrow('Resume AI memory')
+    expect(await db.aiNotes.count()).toBe(0)
+    expect(
+      await db.chatActionReceipts.get('proposal-paused-memory'),
+    ).toBeUndefined()
+  })
+
+  it('rejects a memory proposal when memory availability changed', async () => {
+    await expect(
+      applyCoachActionPlan({
+        proposalId: 'proposal-stale-memory',
+        rawPlan: plan(
+          { type: 'save_ai_note', body: 'Remember this.' },
+          'ai_memory',
+        ),
+        currentStateHash: HASH,
+        currentActionStateHashes: actionStateHashes({
+          ai_memory: 'b'.repeat(64),
+        }),
+      }),
+    ).rejects.toBeInstanceOf(StaleCoachActionError)
+    expect(await db.aiNotes.count()).toBe(0)
   })
 })

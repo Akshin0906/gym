@@ -8,6 +8,8 @@ import { Header } from '../components/Header'
 import {
   applyCoachActionPlan,
   getAppliedCoachActionResult,
+  listPendingCoachActionResults,
+  markCoachActionSynced,
   parseCoachActionPlan,
 } from '../db/repositories/chatActions'
 import {
@@ -102,6 +104,7 @@ export function CoachScreen() {
   const remoteRefreshInFlight = useRef(false)
   const transcriptCursor = useRef(0)
   const remoteRef = useRef<CoachConversationState | null>(null)
+  const proposalsRef = useRef<CoachProposal[]>([])
   const endRef = useRef<HTMLDivElement>(null)
 
   const refreshLocalContext = useCallback(async () => {
@@ -111,16 +114,40 @@ export function CoachScreen() {
   }, [preferredSessionId])
 
   const reconcileReceipts = useCallback(async (incoming: CoachProposal[]) => {
-    if (incoming.length === 0) return
-    const receiptPairs = await Promise.all(
-      incoming.map(async (proposal) => [
-        proposal.id,
-        await getAppliedCoachActionResult(proposal.id),
-      ] as const),
-    )
+    const [receiptPairs, pendingResults] = await Promise.all([
+      Promise.all(
+        incoming.map(async (proposal) => [
+          proposal.id,
+          await getAppliedCoachActionResult(proposal.id),
+        ] as const),
+      ),
+      listPendingCoachActionResults(),
+    ])
     const receipts = new Map<string, CoachActionResult>()
+    const newlySyncedIds = new Set<string>()
     for (const [id, result] of receiptPairs) {
       if (result) receipts.set(id, result)
+    }
+    if (pendingResults.length > 0) {
+      try {
+        await uploadCloudSnapshot('chat_action_applied')
+        const synced = await Promise.all(
+          pendingResults.map(async (result) => [
+            result.proposalId,
+            await markCoachActionSynced(result.proposalId),
+          ] as const),
+        )
+        for (const [id, result] of synced) {
+          receipts.set(id, result)
+          newlySyncedIds.add(id)
+          void reportCoachProposalResult(id, 'applied', { result }).catch(() => {
+            // A cleared conversation has no remote proposal; the snapshot is
+            // still synced and the durable local receipt is now complete.
+          })
+        }
+      } catch {
+        // Keep durable pending receipts visible and retry on a later refresh.
+      }
     }
     setLocalApplied((current) => {
       const next = new Map(current)
@@ -129,7 +156,12 @@ export function CoachScreen() {
     })
     for (const proposal of incoming) {
       const receipt = receipts.get(proposal.id)
-      if (receipt && proposal.status === 'proposed') {
+      if (
+        receipt &&
+        receipt.syncPending !== true &&
+        !newlySyncedIds.has(proposal.id) &&
+        proposal.status === 'proposed'
+      ) {
         void reportCoachProposalResult(proposal.id, 'applied', {
           result: receipt,
         }).catch(() => {
@@ -156,11 +188,13 @@ export function CoachScreen() {
           ? sortedMessages
           : mergeById(current, sortedMessages).sort((a, b) => a.sequence - b.sequence),
       )
-      setProposals((current) =>
-        replace
-          ? sortedProposals
-          : mergeById(current, sortedProposals).sort((a, b) => a.createdAt - b.createdAt),
-      )
+      const nextProposals = replace
+        ? sortedProposals
+        : mergeById(proposalsRef.current, sortedProposals).sort(
+            (a, b) => a.createdAt - b.createdAt,
+          )
+      proposalsRef.current = nextProposals
+      setProposals(nextProposals)
       await reconcileReceipts(sortedProposals)
     },
     [reconcileReceipts],
@@ -202,16 +236,22 @@ export function CoachScreen() {
           previousRemote !== null &&
           previousRemote.latestProposalUpdatedAt !==
             nextRemote.latestProposalUpdatedAt
+        let transcriptRefreshed = false
         if (
           nextRemote.latestMessageSequence < transcriptCursor.current ||
           proposalStateChanged
         ) {
           await ingestTranscript(await fetchFullCoachTranscript(), true)
+          transcriptRefreshed = true
         } else if (nextRemote.latestMessageSequence > transcriptCursor.current) {
           await ingestTranscript(
             await fetchIncrementalTranscript(transcriptCursor.current),
             false,
           )
+          transcriptRefreshed = true
+        }
+        if (!transcriptRefreshed) {
+          await reconcileReceipts(proposalsRef.current)
         }
         setPageError(null)
       } catch (caught) {
@@ -222,7 +262,7 @@ export function CoachScreen() {
         remoteRefreshInFlight.current = false
       }
     },
-    [fetchIncrementalTranscript, ingestTranscript],
+    [fetchIncrementalTranscript, ingestTranscript, reconcileReceipts],
   )
 
   const loadInitial = useCallback(async () => {
@@ -351,7 +391,7 @@ export function CoachScreen() {
     try {
       const live = await buildLiveCoachContext(preferredSessionId)
       const plan = parseCoachActionPlan(proposal.actionPlan)
-      const result = await applyCoachActionPlan({
+      let result = await applyCoachActionPlan({
         proposalId: proposal.id,
         rawPlan: proposal.actionPlan,
         currentStateHash: live.stateHash,
@@ -363,14 +403,16 @@ export function CoachScreen() {
         navigate('/workout')
       }
 
-      let syncWarning: string | undefined
       try {
         await uploadCloudSnapshot('chat_action_applied')
-      } catch (caught) {
-        syncWarning = caught instanceof Error ? caught.message : String(caught)
+        result = await markCoachActionSynced(proposal.id)
+        setLocalApplied((current) => new Map(current).set(proposal.id, result))
+      } catch {
+        await refreshLocalContext()
+        return
       }
       await reportCoachProposalResult(proposal.id, 'applied', {
-        result: syncWarning ? { ...result, syncWarning } : result,
+        result,
       })
       await refreshLocalContext()
       await refreshRemote(true)
@@ -396,7 +438,9 @@ export function CoachScreen() {
     try {
       const updated = await dismissCoachProposal(proposal.id)
       if (updated) {
-        setProposals((current) => mergeById(current, [updated]))
+        const next = mergeById(proposalsRef.current, [updated])
+        proposalsRef.current = next
+        setProposals(next)
       }
     } catch (caught) {
       setProposalErrors((current) =>
@@ -430,8 +474,24 @@ export function CoachScreen() {
       return
     }
     try {
+      const pendingResults = await listPendingCoachActionResults()
+      if (pendingResults.length > 0) {
+        try {
+          await uploadCloudSnapshot('chat_action_applied')
+          await Promise.all(
+            pendingResults.map((result) =>
+              markCoachActionSynced(result.proposalId),
+            ),
+          )
+        } catch {
+          throw new Error(
+            'Coach has changes waiting to sync. The conversation was not cleared; retry when cloud sync is available.',
+          )
+        }
+      }
       await clearCoachConversation()
       setMessages([])
+      proposalsRef.current = []
       setProposals([])
       setLocalApplied(new Map())
       setProposalErrors(new Map())
@@ -444,10 +504,17 @@ export function CoachScreen() {
   }
 
   function proposalCard(proposal: CoachProposal) {
-    const locallyApplied = localApplied.has(proposal.id)
-    const shown = locallyApplied && proposal.status === 'proposed'
-      ? { ...proposal, status: 'applied' as const }
-      : proposal
+    const localResult = localApplied.get(proposal.id)
+    const shown =
+      localResult && proposal.status === 'proposed'
+        ? {
+            ...proposal,
+            status: 'applied' as const,
+            result: localResult,
+          }
+        : localResult && proposal.status === 'applied'
+          ? { ...proposal, result: localResult }
+          : proposal
     return (
       <CoachActionCard
         key={proposal.id}

@@ -28,6 +28,10 @@ signals that change or support that action.
 - `trainingTrend`: exactly one concise sentence about the recent lifting pattern.
 - `watchOuts`: 0-2 actionable guardrails only.
 - Do not mention prompts, schemas, automation, exports, internal policy names, rejected modes, or generic encouragement.
+- When snapshot AI Memory is not paused, treat `data.aiNotes` as explicit
+  user-authored context for future Insights. Use recent relevant notes when they
+  affect the call, but do not let an old note override newer workout feedback or
+  recovery evidence. Do not use AI notes while memory is paused.
 
 If the workout snapshot's source date is more than 48 hours old but still within
 the supervisor's accepted window, mention it once in `watchOuts` as:
@@ -72,7 +76,7 @@ append them to the exact existing items.
 4. If neither source has state, initialize both windows to Pacific start-of-day for the earliest completed workout, or for `today` if none exists.
 5. If memory is paused, return no new items.
 6. For every completed workout without an existing `workout` item whose `sourceWorkoutSessionId` matches, create one item with id `workout:<workoutSession.id>`.
-7. A workout item has 1-3 factual bullets covering session/date, completed sets or top sets, session feedback, and notable user context when present.
+7. A workout item has 1-3 factual bullets covering session/date, completed sets or top sets, session feedback, and notable user context when present. Include the IDs of any AI notes used in `sourceNoteIds`.
 8. If a complete 14-day window is due, add one `two_week` item unless the exact period already exists. Its id is `two_week:<periodStartAt>:<periodEndAt>` and it has exactly one dense factual bullet.
 9. If a complete 4-month window is due, add one `four_month` item unless the exact period already exists. Its id is `four_month:<periodStartAt>:<periodEndAt>` and it has exactly two dense factual bullets.
 10. Use America/Los_Angeles calendar boundaries. Advance a window only when its summary is newly created or the exact summary already exists.

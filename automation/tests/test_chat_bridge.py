@@ -43,6 +43,7 @@ def claim_envelope(effort: str | None = "medium") -> dict:
                     "active_workout": "a" * 64,
                     "one_time_workout": "b" * 64,
                     "program": "c" * 64,
+                    "ai_memory": "d" * 64,
                 },
                 "exercises": [
                     {"id": "bench", "name": "Bench Press"},
@@ -90,6 +91,23 @@ def swap_output() -> dict:
                     "toExerciseId": "machine",
                     "targetSets": 2,
                     "repRange": "8-12",
+                }
+            ],
+        },
+    }
+
+
+def memory_output() -> dict:
+    return {
+        "assistantText": "I prepared that as an AI Memory note for your review.",
+        "actionPlan": {
+            "title": "Save to AI Memory",
+            "summary": "Keep this context available for future AI Insights.",
+            "scope": "ai_memory",
+            "actions": [
+                {
+                    "type": "save_ai_note",
+                    "body": "Weekday workouts are limited to 45 minutes.",
                 }
             ],
         },
@@ -162,6 +180,44 @@ class ModelOutputValidationTests(unittest.TestCase):
         with self.assertRaises(bridge.ModelOutputError):
             bridge.validate_model_output(value)
 
+    def test_valid_ai_memory_note_is_normalized(self) -> None:
+        value = bridge.validate_model_output(memory_output())
+        self.assertEqual(value["actionPlan"]["scope"], "ai_memory")
+        self.assertEqual(
+            value["actionPlan"]["actions"],
+            [
+                {
+                    "type": "save_ai_note",
+                    "body": "Weekday workouts are limited to 45 minutes.",
+                }
+            ],
+        )
+
+    def test_ai_memory_scope_only_accepts_one_save_action(self) -> None:
+        value = memory_output()
+        value["actionPlan"]["actions"].append(
+            {"type": "save_ai_note", "body": "Prefer dumbbells."}
+        )
+        with self.assertRaises(bridge.ModelOutputError):
+            bridge.validate_model_output(value)
+
+    def test_ai_memory_note_rejects_extra_fields(self) -> None:
+        value = memory_output()
+        value["actionPlan"]["actions"][0]["expiresAt"] = 123
+        with self.assertRaises(bridge.ModelOutputError):
+            bridge.validate_model_output(value)
+
+    def test_ai_memory_note_rejects_blank_and_oversized_body(self) -> None:
+        blank = memory_output()
+        blank["actionPlan"]["actions"][0]["body"] = "   "
+        with self.assertRaises(bridge.ConfigError):
+            bridge.validate_model_output(blank)
+
+        oversized = memory_output()
+        oversized["actionPlan"]["actions"][0]["body"] = "x" * 1001
+        with self.assertRaises(bridge.ConfigError):
+            bridge.validate_model_output(oversized)
+
     def test_source_hash_is_added_by_trusted_code(self) -> None:
         validated = bridge.validate_model_output(swap_output())
         context_payload = claim_envelope()["context"]["payload"]
@@ -190,6 +246,14 @@ class ModelOutputValidationTests(unittest.TestCase):
             bridge.bind_action_plan_to_state(
                 validated["actionPlan"], "trusted-hash", payload
             )
+
+    def test_ai_memory_plan_binds_the_trusted_memory_hash(self) -> None:
+        validated = bridge.validate_model_output(memory_output())
+        context_payload = claim_envelope()["context"]["payload"]
+        plan = bridge.bind_action_plan_to_state(
+            validated["actionPlan"], "trusted-hash", context_payload
+        )
+        self.assertEqual(plan["sourceActionStateHash"], "d" * 64)
 
 
 class TrustBoundaryTests(unittest.TestCase):
@@ -243,6 +307,18 @@ class SchemaTests(unittest.TestCase):
         required = set(schema["definitions"]["swapActiveExercise"]["required"])
         self.assertIn("targetSets", required)
         self.assertIn("repRange", required)
+
+    def test_checked_in_schema_exposes_ai_memory_action(self) -> None:
+        schema_path = Path(__file__).resolve().parents[1] / "codex_chat_output_schema.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            schema["definitions"]["saveAiNote"]["properties"]["type"]["const"],
+            "save_ai_note",
+        )
+        self.assertIn(
+            "ai_memory",
+            schema["definitions"]["actionPlan"]["properties"]["scope"]["enum"],
+        )
 
 
 class IdleBackoffTests(unittest.TestCase):

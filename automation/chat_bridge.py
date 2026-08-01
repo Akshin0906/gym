@@ -1370,6 +1370,12 @@ def validate_action(value: Any, label: str) -> dict[str, Any]:
             "name": require_string(action.get("name"), f"{label}.name", maximum=120),
             "sessions": sessions,
         }
+    if action_type == "save_ai_note":
+        exact_keys(action, {"type", "body"}, label)
+        return {
+            "type": action_type,
+            "body": require_string(action.get("body"), f"{label}.body", maximum=1000),
+        }
     raise ModelOutputError(f"Unsupported action type: {action_type}")
 
 
@@ -1385,7 +1391,12 @@ def validate_model_output(value: Any) -> dict[str, Any]:
     plan = require_object(raw_plan, "actionPlan")
     exact_keys(plan, {"title", "summary", "scope", "actions"}, "actionPlan")
     scope = require_string(plan.get("scope"), "actionPlan.scope", maximum=40)
-    if scope not in {"active_workout", "one_time_workout", "program"}:
+    if scope not in {
+        "active_workout",
+        "one_time_workout",
+        "program",
+        "ai_memory",
+    }:
         raise ModelOutputError("actionPlan.scope is unsupported")
     raw_actions = require_list(plan.get("actions"), "actionPlan.actions")
     if not 1 <= len(raw_actions) <= 12:
@@ -1409,11 +1420,14 @@ def validate_model_output(value: Any) -> dict[str, Any]:
     elif scope == "one_time_workout":
         if len(actions) != 1 or action_types != {"create_one_time_workout"}:
             raise ModelOutputError("one_time_workout requires one matching action")
-    else:
+    elif scope == "program":
         if len(actions) != 1 or not action_types.issubset(
             {"create_session_template", "create_program"}
         ):
             raise ModelOutputError("program scope requires one program creation action")
+    else:
+        if len(actions) != 1 or action_types != {"save_ai_note"}:
+            raise ModelOutputError("ai_memory requires one save_ai_note action")
     return {
         "assistantText": assistant_text,
         "actionPlan": {

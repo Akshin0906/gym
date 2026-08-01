@@ -1,4 +1,5 @@
 import { db } from '../schema'
+import { addAiNote } from './aiMemory'
 import type { Exercise, SessionExerciseSnapshot, WorkoutSession } from '../types'
 import type {
   CoachAction,
@@ -173,6 +174,11 @@ function parseAction(raw: unknown, index: number): CoachAction {
         sessions,
       }
     }
+    case 'save_ai_note':
+      return {
+        type,
+        body: requiredString(raw.body, `${prefix}.body`, 1000),
+      }
     default:
       throw new CoachActionValidationError(`Unsupported Coach action: ${type}`)
   }
@@ -182,7 +188,8 @@ function isScope(value: unknown): value is CoachActionScope {
   return (
     value === 'active_workout' ||
     value === 'one_time_workout' ||
-    value === 'program'
+    value === 'program' ||
+    value === 'ai_memory'
   )
 }
 
@@ -206,6 +213,14 @@ function validateScope(plan: CoachActionPlan): void {
     if (sessionIds.size !== 1) {
       throw new CoachActionValidationError(
         'All active-workout actions must target the same session',
+      )
+    }
+    return
+  }
+  if (plan.scope === 'ai_memory') {
+    if (plan.actions.length !== 1 || plan.actions[0]?.type !== 'save_ai_note') {
+      throw new CoachActionValidationError(
+        'An AI-memory plan must save exactly one note',
       )
     }
     return
@@ -313,6 +328,35 @@ export async function getAppliedCoachActionResult(
   return receipt ? parseStoredResult(receipt.resultJson) : null
 }
 
+export async function listPendingCoachActionResults(): Promise<
+  CoachActionResult[]
+> {
+  const receipts = await db.chatActionReceipts.toArray()
+  return receipts
+    .map((receipt) => parseStoredResult(receipt.resultJson))
+    .filter((result) => result.syncPending === true)
+}
+
+export async function markCoachActionSynced(
+  proposalId: string,
+): Promise<CoachActionResult> {
+  const id = requiredString(proposalId, 'proposalId')
+  return db.transaction('rw', db.chatActionReceipts, async () => {
+    const receipt = await db.chatActionReceipts.get(id)
+    if (!receipt) {
+      throw new CoachActionValidationError('Saved Coach action receipt is missing')
+    }
+    const result = { ...parseStoredResult(receipt.resultJson), syncPending: false }
+    const updated = await db.chatActionReceipts.update(id, {
+      resultJson: JSON.stringify(result),
+    })
+    if (updated !== 1) {
+      throw new CoachActionValidationError('Saved Coach action receipt changed')
+    }
+    return result
+  })
+}
+
 export async function applyCoachActionPlan(args: {
   proposalId: string
   rawPlan: unknown
@@ -359,6 +403,8 @@ export async function applyCoachActionPlan(args: {
       db.templateExercises,
       db.workoutSessions,
       db.loggedSets,
+      db.aiMemorySettings,
+      db.aiNotes,
       db.chatActionReceipts,
     ],
     async () => {
@@ -393,6 +439,7 @@ export async function applyCoachActionPlan(args: {
         sourceStateHash: plan.sourceStateHash,
         sourceActionStateHash: plan.sourceActionStateHash,
         replayed: false,
+        syncPending: true,
         changes: [],
       }
 
@@ -672,6 +719,15 @@ export async function applyCoachActionPlan(args: {
               entityId: programId,
             })
             result.programId = programId
+            break
+          }
+          case 'save_ai_note': {
+            const noteId = await addAiNote(action.body)
+            result.changes.push({
+              type: action.type,
+              label: 'Saved a note for AI Insights',
+              entityId: noteId,
+            })
             break
           }
         }

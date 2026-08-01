@@ -127,6 +127,10 @@ an OpenAI API key.
 - Healthy resumed threads receive the fresh full workout context and current
   message without resending transcript history that the thread already owns.
   New and recovery threads receive the bounded D1 transcript seed as well.
+- An explicit request to remember something for future AI Insights can produce
+  a confirmation-gated `save_ai_note` proposal. Applying it writes an AI note
+  on the phone and uploads a fresh snapshot; the Coach never writes memory
+  silently or while AI Memory is paused.
 - The bridge has no inbound listener. It polls over HTTPS, renews an exclusive
   job lease, and sends a heartbeat. Empty claims back off from 2 seconds to a
   10-second cap, reset immediately after activity or restart, and continue
