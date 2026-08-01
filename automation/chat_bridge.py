@@ -36,10 +36,24 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-BRIDGE_VERSION = "1.0"
+BRIDGE_VERSION = "1.1"
 MODEL = "gpt-5.6-sol"
 ALLOWED_EFFORTS = {"medium", "xhigh"}
 DEFAULT_EFFORT = "medium"
+MUSCLE_GROUPS = {
+    "chest",
+    "back",
+    "shoulders",
+    "biceps",
+    "triceps",
+    "forearms",
+    "quads",
+    "hamstrings",
+    "glutes",
+    "calves",
+    "abs",
+    "traps",
+}
 API_ROOT = "/api/chat/automation"
 MAX_HTTP_BYTES = 16 * 1024 * 1024
 MAX_CONTEXT_BYTES = 2 * 1024 * 1024
@@ -317,6 +331,16 @@ def require_string(
         raise ConfigError(f"{label} must be a string")
     normalized = value.strip()
     if len(normalized) < minimum or len(normalized) > maximum:
+        raise ConfigError(f"{label} has an invalid length")
+    return normalized
+
+
+def require_text(value: Any, label: str, *, maximum: int = 10000) -> str:
+    """Validate bounded user-facing text while allowing an empty string."""
+    if not isinstance(value, str):
+        raise ConfigError(f"{label} must be a string")
+    normalized = value.strip()
+    if len(normalized) > maximum:
         raise ConfigError(f"{label} has an invalid length")
     return normalized
 
@@ -1238,6 +1262,77 @@ def validate_exercise_specs(value: Any, label: str) -> list[dict[str, Any]]:
     return result
 
 
+def validate_replacement_sessions(value: Any, label: str) -> list[dict[str, Any]]:
+    raw_sessions = require_list(value, label)
+    if not 1 <= len(raw_sessions) <= 20:
+        raise ModelOutputError(f"{label} must contain 1 to 20 sessions")
+    sessions: list[dict[str, Any]] = []
+    existing_ids: list[str] = []
+    normalized_names: list[str] = []
+    for index, raw in enumerate(raw_sessions):
+        session_label = f"{label}[{index}]"
+        session = require_object(raw, session_label)
+        exact_keys(
+            session,
+            {"sessionTemplateId", "name", "exercises"},
+            session_label,
+        )
+        raw_template_id = session.get("sessionTemplateId")
+        template_id = (
+            None
+            if raw_template_id is None
+            else require_string(
+                raw_template_id,
+                f"{session_label}.sessionTemplateId",
+                maximum=200,
+            )
+        )
+        name = require_string(
+            session.get("name"), f"{session_label}.name", maximum=120
+        )
+        sessions.append(
+            {
+                "sessionTemplateId": template_id,
+                "name": name,
+                "exercises": validate_exercise_specs(
+                    session.get("exercises"), f"{session_label}.exercises"
+                ),
+            }
+        )
+        if template_id is not None:
+            existing_ids.append(template_id)
+        normalized_names.append(name.casefold())
+    if len(existing_ids) != len(set(existing_ids)):
+        raise ModelOutputError(f"{label} contains a duplicate sessionTemplateId")
+    if len(normalized_names) != len(set(normalized_names)):
+        raise ModelOutputError(f"{label} contains a duplicate session name")
+    return sessions
+
+
+def validate_muscle(value: Any, label: str) -> str:
+    muscle = require_string(value, label, maximum=20)
+    if muscle not in MUSCLE_GROUPS:
+        raise ModelOutputError(f"{label} is not a supported muscle group")
+    return muscle
+
+
+def validate_secondary_muscles(
+    value: Any, label: str, primary_muscle: str
+) -> list[str]:
+    raw = require_list(value, label)
+    if len(raw) > len(MUSCLE_GROUPS) - 1:
+        raise ModelOutputError(f"{label} contains too many muscle groups")
+    muscles = [
+        validate_muscle(item, f"{label}[{index}]")
+        for index, item in enumerate(raw)
+    ]
+    if len(muscles) != len(set(muscles)):
+        raise ModelOutputError(f"{label} contains a duplicate muscle group")
+    if primary_muscle in muscles:
+        raise ModelOutputError(f"{label} must not contain primaryMuscle")
+    return muscles
+
+
 def validate_action(value: Any, label: str) -> dict[str, Any]:
     action = require_object(value, label)
     action_type = require_string(action.get("type"), f"{label}.type", maximum=80)
@@ -1370,6 +1465,98 @@ def validate_action(value: Any, label: str) -> dict[str, Any]:
             "name": require_string(action.get("name"), f"{label}.name", maximum=120),
             "sessions": sessions,
         }
+    if action_type == "rename_program":
+        exact_keys(action, {"type", "programId", "name"}, label)
+        return {
+            "type": action_type,
+            "programId": require_string(
+                action.get("programId"), f"{label}.programId", maximum=200
+            ),
+            "name": require_string(action.get("name"), f"{label}.name", maximum=120),
+        }
+    if action_type == "replace_program":
+        exact_keys(action, {"type", "programId", "name", "sessions"}, label)
+        return {
+            "type": action_type,
+            "programId": require_string(
+                action.get("programId"), f"{label}.programId", maximum=200
+            ),
+            "name": require_string(action.get("name"), f"{label}.name", maximum=120),
+            "sessions": validate_replacement_sessions(
+                action.get("sessions"), f"{label}.sessions"
+            ),
+        }
+    if action_type == "archive_program":
+        exact_keys(action, {"type", "programId"}, label)
+        return {
+            "type": action_type,
+            "programId": require_string(
+                action.get("programId"), f"{label}.programId", maximum=200
+            ),
+        }
+    if action_type == "replace_session_template":
+        exact_keys(
+            action,
+            {"type", "sessionTemplateId", "name", "exercises"},
+            label,
+        )
+        return {
+            "type": action_type,
+            "sessionTemplateId": require_string(
+                action.get("sessionTemplateId"),
+                f"{label}.sessionTemplateId",
+                maximum=200,
+            ),
+            "name": require_string(action.get("name"), f"{label}.name", maximum=120),
+            "exercises": validate_exercise_specs(
+                action.get("exercises"), f"{label}.exercises"
+            ),
+        }
+    if action_type == "delete_session_template":
+        exact_keys(action, {"type", "sessionTemplateId"}, label)
+        return {
+            "type": action_type,
+            "sessionTemplateId": require_string(
+                action.get("sessionTemplateId"),
+                f"{label}.sessionTemplateId",
+                maximum=200,
+            ),
+        }
+    if action_type == "create_custom_exercise":
+        exact_keys(
+            action,
+            {
+                "type",
+                "name",
+                "primaryMuscle",
+                "secondaryMuscles",
+                "notes",
+                "defaultRestSeconds",
+            },
+            label,
+        )
+        primary_muscle = validate_muscle(
+            action.get("primaryMuscle"), f"{label}.primaryMuscle"
+        )
+        return {
+            "type": action_type,
+            "name": require_string(action.get("name"), f"{label}.name", maximum=120),
+            "primaryMuscle": primary_muscle,
+            "secondaryMuscles": validate_secondary_muscles(
+                action.get("secondaryMuscles"),
+                f"{label}.secondaryMuscles",
+                primary_muscle,
+            ),
+            "notes": require_text(
+                action.get("notes"), f"{label}.notes", maximum=2000
+            ),
+            "defaultRestSeconds": require_integer(
+                action.get("defaultRestSeconds"),
+                f"{label}.defaultRestSeconds",
+                minimum=1,
+                maximum=3600,
+            ),
+        }
     if action_type == "save_ai_note":
         exact_keys(action, {"type", "body"}, label)
         return {
@@ -1395,6 +1582,7 @@ def validate_model_output(value: Any) -> dict[str, Any]:
         "active_workout",
         "one_time_workout",
         "program",
+        "exercise_library",
         "ai_memory",
     }:
         raise ModelOutputError("actionPlan.scope is unsupported")
@@ -1422,9 +1610,22 @@ def validate_model_output(value: Any) -> dict[str, Any]:
             raise ModelOutputError("one_time_workout requires one matching action")
     elif scope == "program":
         if len(actions) != 1 or not action_types.issubset(
-            {"create_session_template", "create_program"}
+            {
+                "create_session_template",
+                "create_program",
+                "rename_program",
+                "replace_program",
+                "archive_program",
+                "replace_session_template",
+                "delete_session_template",
+            }
         ):
-            raise ModelOutputError("program scope requires one program creation action")
+            raise ModelOutputError("program scope requires one matching program action")
+    elif scope == "exercise_library":
+        if len(actions) != 1 or action_types != {"create_custom_exercise"}:
+            raise ModelOutputError(
+                "exercise_library requires one create_custom_exercise action"
+            )
     else:
         if len(actions) != 1 or action_types != {"save_ai_note"}:
             raise ModelOutputError("ai_memory requires one save_ai_note action")

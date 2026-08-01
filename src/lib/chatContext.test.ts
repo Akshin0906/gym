@@ -53,6 +53,7 @@ describe('buildLiveCoachContext', () => {
         active_workout: expect.stringMatching(/^[a-f0-9]{64}$/),
         one_time_workout: expect.stringMatching(/^[a-f0-9]{64}$/),
         program: expect.stringMatching(/^[a-f0-9]{64}$/),
+        exercise_library: expect.stringMatching(/^[a-f0-9]{64}$/),
         ai_memory: expect.stringMatching(/^[a-f0-9]{64}$/),
       }),
     )
@@ -235,6 +236,33 @@ describe('buildLiveCoachContext', () => {
     const afterPause = await buildLiveCoachContext('session')
     expect(afterPause.context.actionStateHashes.ai_memory).not.toBe(
       afterNote.context.actionStateHashes.ai_memory,
+    )
+  })
+
+  it('invalidates exercise-library plans only when exercise data changes', async () => {
+    const before = await buildLiveCoachContext('session')
+
+    await db.loggedSets.add({
+      id: 'set-for-library-hash',
+      workoutSessionId: 'session',
+      exerciseId: 'exercise',
+      setNumber: 1,
+      weightLbs: 100,
+      reps: 8,
+      rpe: null,
+      loggedAt: 2,
+    })
+    const afterSet = await buildLiveCoachContext('session')
+    expect(afterSet.context.actionStateHashes.exercise_library).toBe(
+      before.context.actionStateHashes.exercise_library,
+    )
+
+    await db.exercises.update('exercise', {
+      notes: 'Use the neutral handles.',
+    })
+    const afterExerciseEdit = await buildLiveCoachContext('session')
+    expect(afterExerciseEdit.context.actionStateHashes.exercise_library).not.toBe(
+      afterSet.context.actionStateHashes.exercise_library,
     )
   })
 })

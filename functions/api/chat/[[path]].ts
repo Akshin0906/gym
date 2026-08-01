@@ -120,6 +120,7 @@ const ACTION_SCOPES = [
   'active_workout',
   'one_time_workout',
   'program',
+  'exercise_library',
   'ai_memory',
 ] as const
 type ActionScope = (typeof ACTION_SCOPES)[number]

@@ -42,6 +42,26 @@
         }
       }
     },
+    "replacementSessionSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sessionTemplateId", "name", "exercises"],
+      "properties": {
+        "sessionTemplateId": {
+          "anyOf": [
+            { "type": "null" },
+            { "type": "string", "minLength": 1 }
+          ]
+        },
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "exercises": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 30,
+          "items": { "$ref": "#/definitions/exerciseSpec" }
+        }
+      }
+    },
     "swapActiveExercise": {
       "type": "object",
       "additionalProperties": false,
@@ -146,6 +166,127 @@
         }
       }
     },
+    "renameProgram": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "programId", "name"],
+      "properties": {
+        "type": { "type": "string", "const": "rename_program" },
+        "programId": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 }
+      }
+    },
+    "replaceProgram": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "programId", "name", "sessions"],
+      "properties": {
+        "type": { "type": "string", "const": "replace_program" },
+        "programId": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "sessions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "items": { "$ref": "#/definitions/replacementSessionSpec" }
+        }
+      }
+    },
+    "archiveProgram": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "programId"],
+      "properties": {
+        "type": { "type": "string", "const": "archive_program" },
+        "programId": { "type": "string", "minLength": 1 }
+      }
+    },
+    "replaceSessionTemplate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "sessionTemplateId", "name", "exercises"],
+      "properties": {
+        "type": { "type": "string", "const": "replace_session_template" },
+        "sessionTemplateId": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "exercises": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 30,
+          "items": { "$ref": "#/definitions/exerciseSpec" }
+        }
+      }
+    },
+    "deleteSessionTemplate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "sessionTemplateId"],
+      "properties": {
+        "type": { "type": "string", "const": "delete_session_template" },
+        "sessionTemplateId": { "type": "string", "minLength": 1 }
+      }
+    },
+    "createCustomExercise": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "name",
+        "primaryMuscle",
+        "secondaryMuscles",
+        "notes",
+        "defaultRestSeconds"
+      ],
+      "properties": {
+        "type": { "type": "string", "const": "create_custom_exercise" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "primaryMuscle": {
+          "type": "string",
+          "enum": [
+            "chest",
+            "back",
+            "shoulders",
+            "biceps",
+            "triceps",
+            "forearms",
+            "quads",
+            "hamstrings",
+            "glutes",
+            "calves",
+            "abs",
+            "traps"
+          ]
+        },
+        "secondaryMuscles": {
+          "type": "array",
+          "maxItems": 11,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "chest",
+              "back",
+              "shoulders",
+              "biceps",
+              "triceps",
+              "forearms",
+              "quads",
+              "hamstrings",
+              "glutes",
+              "calves",
+              "abs",
+              "traps"
+            ]
+          }
+        },
+        "notes": { "type": "string", "maxLength": 2000 },
+        "defaultRestSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3600
+        }
+      }
+    },
     "saveAiNote": {
       "type": "object",
       "additionalProperties": false,
@@ -163,6 +304,12 @@
         { "$ref": "#/definitions/createOneTimeWorkout" },
         { "$ref": "#/definitions/createSessionTemplate" },
         { "$ref": "#/definitions/createProgram" },
+        { "$ref": "#/definitions/renameProgram" },
+        { "$ref": "#/definitions/replaceProgram" },
+        { "$ref": "#/definitions/archiveProgram" },
+        { "$ref": "#/definitions/replaceSessionTemplate" },
+        { "$ref": "#/definitions/deleteSessionTemplate" },
+        { "$ref": "#/definitions/createCustomExercise" },
         { "$ref": "#/definitions/saveAiNote" }
       ]
     },
@@ -175,7 +322,13 @@
         "summary": { "type": "string", "minLength": 1, "maxLength": 1000 },
         "scope": {
           "type": "string",
-          "enum": ["active_workout", "one_time_workout", "program", "ai_memory"]
+          "enum": [
+            "active_workout",
+            "one_time_workout",
+            "program",
+            "exercise_library",
+            "ai_memory"
+          ]
         },
         "actions": {
           "type": "array",

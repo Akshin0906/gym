@@ -567,8 +567,9 @@ export function CoachScreen() {
               </div>
               <h2 className="mt-4 text-xl font-bold">What are we working on?</h2>
               <p className="mt-2 text-sm leading-6 text-[var(--color-fg-dim)]">
-                Talk through today’s training, swap movements, or ask me to build a
-                workout. I’ll always show changes before applying them.
+                Talk through today’s training, edit programs or saved workouts, or
+                create a custom exercise. I’ll always show changes before applying
+                them.
               </p>
             </div>
           ) : (

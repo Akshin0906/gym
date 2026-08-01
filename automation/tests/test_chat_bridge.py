@@ -43,6 +43,7 @@ def claim_envelope(effort: str | None = "medium") -> dict:
                     "active_workout": "a" * 64,
                     "one_time_workout": "b" * 64,
                     "program": "c" * 64,
+                    "exercise_library": "e" * 64,
                     "ai_memory": "d" * 64,
                 },
                 "exercises": [
@@ -114,6 +115,69 @@ def memory_output() -> dict:
     }
 
 
+def replace_program_output() -> dict:
+    return {
+        "assistantText": "I prepared a full replacement for your review.",
+        "actionPlan": {
+            "title": "Replace the program",
+            "summary": "Keep Upper and replace Lower with a newly saved workout.",
+            "scope": "program",
+            "actions": [
+                {
+                    "type": "replace_program",
+                    "programId": "program-1",
+                    "name": "Four day split",
+                    "sessions": [
+                        {
+                            "sessionTemplateId": "template-upper",
+                            "name": "Upper",
+                            "exercises": [
+                                {
+                                    "exerciseId": "bench",
+                                    "targetSets": 3,
+                                    "repRange": "6-8",
+                                }
+                            ],
+                        },
+                        {
+                            "sessionTemplateId": None,
+                            "name": "Lower",
+                            "exercises": [
+                                {
+                                    "exerciseId": "squat",
+                                    "targetSets": 3,
+                                    "repRange": "8-10",
+                                }
+                            ],
+                        },
+                    ],
+                }
+            ],
+        },
+    }
+
+
+def create_custom_exercise_output() -> dict:
+    return {
+        "assistantText": "I prepared that custom exercise for your review.",
+        "actionPlan": {
+            "title": "Create Nordic curl",
+            "summary": "Add Nordic curl to the exercise library.",
+            "scope": "exercise_library",
+            "actions": [
+                {
+                    "type": "create_custom_exercise",
+                    "name": "Nordic Curl",
+                    "primaryMuscle": "hamstrings",
+                    "secondaryMuscles": ["glutes", "calves"],
+                    "notes": "Control the eccentric.",
+                    "defaultRestSeconds": 120,
+                }
+            ],
+        },
+    }
+
+
 class ClaimValidationTests(unittest.TestCase):
     def test_missing_effort_defaults_to_medium(self) -> None:
         claim = bridge.validate_claim(claim_envelope(None))
@@ -177,6 +241,126 @@ class ModelOutputValidationTests(unittest.TestCase):
                 ],
             },
         }
+        with self.assertRaises(bridge.ModelOutputError):
+            bridge.validate_model_output(value)
+
+    def test_program_management_actions_are_normalized_in_program_scope(self) -> None:
+        actions = [
+            {
+                "type": "rename_program",
+                "programId": "program-1",
+                "name": "Upper Lower",
+            },
+            {"type": "archive_program", "programId": "program-1"},
+            {
+                "type": "replace_session_template",
+                "sessionTemplateId": "template-1",
+                "name": "Upper A",
+                "exercises": [
+                    {"exerciseId": "bench", "targetSets": 3, "repRange": "6-8"}
+                ],
+            },
+            {"type": "delete_session_template", "sessionTemplateId": "template-1"},
+        ]
+        for action in actions:
+            with self.subTest(action=action["type"]):
+                value = {
+                    "assistantText": "Review this program change.",
+                    "actionPlan": {
+                        "title": "Program change",
+                        "summary": "Apply the requested program change.",
+                        "scope": "program",
+                        "actions": [action],
+                    },
+                }
+                normalized = bridge.validate_model_output(value)
+                self.assertEqual(normalized["actionPlan"]["actions"], [action])
+
+    def test_replace_program_supports_retained_and_app_generated_template_ids(self) -> None:
+        normalized = bridge.validate_model_output(replace_program_output())
+        sessions = normalized["actionPlan"]["actions"][0]["sessions"]
+        self.assertEqual(sessions[0]["sessionTemplateId"], "template-upper")
+        self.assertIsNone(sessions[1]["sessionTemplateId"])
+
+    def test_replace_program_rejects_duplicate_existing_template_ids(self) -> None:
+        value = replace_program_output()
+        sessions = value["actionPlan"]["actions"][0]["sessions"]
+        sessions[1]["sessionTemplateId"] = "template-upper"
+        with self.assertRaises(bridge.ModelOutputError):
+            bridge.validate_model_output(value)
+
+    def test_replace_program_rejects_duplicate_session_names(self) -> None:
+        value = replace_program_output()
+        sessions = value["actionPlan"]["actions"][0]["sessions"]
+        sessions[1]["name"] = " upper "
+        with self.assertRaises(bridge.ModelOutputError):
+            bridge.validate_model_output(value)
+
+    def test_program_management_action_cannot_use_an_unrelated_scope(self) -> None:
+        value = replace_program_output()
+        value["actionPlan"]["scope"] = "exercise_library"
+        with self.assertRaises(bridge.ModelOutputError):
+            bridge.validate_model_output(value)
+
+    def test_custom_exercise_is_normalized(self) -> None:
+        normalized = bridge.validate_model_output(create_custom_exercise_output())
+        action = normalized["actionPlan"]["actions"][0]
+        self.assertEqual(action["primaryMuscle"], "hamstrings")
+        self.assertEqual(action["secondaryMuscles"], ["glutes", "calves"])
+        self.assertEqual(action["defaultRestSeconds"], 120)
+
+    def test_custom_exercise_allows_empty_notes(self) -> None:
+        value = create_custom_exercise_output()
+        value["actionPlan"]["actions"][0]["notes"] = "   "
+        normalized = bridge.validate_model_output(value)
+        self.assertEqual(normalized["actionPlan"]["actions"][0]["notes"], "")
+
+    def test_custom_exercise_rejects_invalid_muscle_metadata(self) -> None:
+        invalid_primary = create_custom_exercise_output()
+        invalid_primary["actionPlan"]["actions"][0]["primaryMuscle"] = "legs"
+        with self.assertRaises(bridge.ModelOutputError):
+            bridge.validate_model_output(invalid_primary)
+
+        duplicate_secondary = create_custom_exercise_output()
+        duplicate_secondary["actionPlan"]["actions"][0]["secondaryMuscles"] = [
+            "glutes",
+            "glutes",
+        ]
+        with self.assertRaises(bridge.ModelOutputError):
+            bridge.validate_model_output(duplicate_secondary)
+
+        primary_as_secondary = create_custom_exercise_output()
+        primary_as_secondary["actionPlan"]["actions"][0]["secondaryMuscles"] = [
+            "hamstrings"
+        ]
+        with self.assertRaises(bridge.ModelOutputError):
+            bridge.validate_model_output(primary_as_secondary)
+
+    def test_custom_exercise_rejects_invalid_rest_and_oversized_notes(self) -> None:
+        for rest in (0, 3601, 120.5):
+            with self.subTest(rest=rest):
+                value = create_custom_exercise_output()
+                value["actionPlan"]["actions"][0]["defaultRestSeconds"] = rest
+                with self.assertRaises(bridge.ConfigError):
+                    bridge.validate_model_output(value)
+
+        oversized = create_custom_exercise_output()
+        oversized["actionPlan"]["actions"][0]["notes"] = "x" * 2001
+        with self.assertRaises(bridge.ConfigError):
+            bridge.validate_model_output(oversized)
+
+    def test_exercise_library_scope_only_accepts_one_create_action(self) -> None:
+        value = create_custom_exercise_output()
+        value["actionPlan"]["actions"].append(
+            {
+                "type": "create_custom_exercise",
+                "name": "Reverse Nordic Curl",
+                "primaryMuscle": "quads",
+                "secondaryMuscles": [],
+                "notes": "",
+                "defaultRestSeconds": 120,
+            }
+        )
         with self.assertRaises(bridge.ModelOutputError):
             bridge.validate_model_output(value)
 
@@ -255,6 +439,14 @@ class ModelOutputValidationTests(unittest.TestCase):
         )
         self.assertEqual(plan["sourceActionStateHash"], "d" * 64)
 
+    def test_custom_exercise_plan_binds_the_trusted_library_hash(self) -> None:
+        validated = bridge.validate_model_output(create_custom_exercise_output())
+        context_payload = claim_envelope()["context"]["payload"]
+        plan = bridge.bind_action_plan_to_state(
+            validated["actionPlan"], "trusted-hash", context_payload
+        )
+        self.assertEqual(plan["sourceActionStateHash"], "e" * 64)
+
 
 class TrustBoundaryTests(unittest.TestCase):
     def test_prompt_labels_context_and_transcript_as_untrusted(self) -> None:
@@ -319,6 +511,102 @@ class SchemaTests(unittest.TestCase):
             "ai_memory",
             schema["definitions"]["actionPlan"]["properties"]["scope"]["enum"],
         )
+
+    def test_checked_in_schema_exposes_program_management_actions(self) -> None:
+        schema_path = Path(__file__).resolve().parents[1] / "codex_chat_output_schema.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        expected = {
+            "renameProgram": "rename_program",
+            "replaceProgram": "replace_program",
+            "archiveProgram": "archive_program",
+            "replaceSessionTemplate": "replace_session_template",
+            "deleteSessionTemplate": "delete_session_template",
+        }
+        for definition, action_type in expected.items():
+            with self.subTest(action_type=action_type):
+                self.assertEqual(
+                    schema["definitions"][definition]["properties"]["type"]["const"],
+                    action_type,
+                )
+        template_id_schema = schema["definitions"]["replacementSessionSpec"][
+            "properties"
+        ]["sessionTemplateId"]
+        self.assertIn({"type": "null"}, template_id_schema["anyOf"])
+
+    def test_checked_in_schema_exposes_custom_exercise_contract(self) -> None:
+        schema_path = Path(__file__).resolve().parents[1] / "codex_chat_output_schema.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        definition = schema["definitions"]["createCustomExercise"]
+        self.assertEqual(
+            definition["properties"]["type"]["const"],
+            "create_custom_exercise",
+        )
+        self.assertEqual(definition["properties"]["notes"]["maxLength"], 2000)
+        self.assertTrue(definition["properties"]["secondaryMuscles"]["uniqueItems"])
+        self.assertIn(
+            "exercise_library",
+            schema["definitions"]["actionPlan"]["properties"]["scope"]["enum"],
+        )
+
+
+class PromptContractTests(unittest.TestCase):
+    def test_prompt_disambiguates_workouts_and_preserves_history(self) -> None:
+        prompt_path = Path(__file__).resolve().parents[1] / "codex_chat_prompt.md"
+        prompt = prompt_path.read_text(encoding="utf-8")
+        self.assertIn('The word "workout" is ambiguous', prompt)
+        self.assertIn("active workout and a past workout", prompt)
+        self.assertIn("frozen snapshot", prompt)
+        self.assertIn("Programs are archived rather than permanently deleted", prompt)
+
+    def test_prompt_requires_explicit_full_replace_and_two_step_exercise_use(self) -> None:
+        prompt_path = Path(__file__).resolve().parents[1] / "codex_chat_prompt.md"
+        prompt = prompt_path.read_text(encoding="utf-8")
+        self.assertIn("explicitly asks to overwrite or", prompt)
+        self.assertIn("do not infer deletion from an incomplete description", prompt)
+        self.assertIn("first confirmed step", prompt)
+        self.assertIn("app-generated ID", prompt)
+
+    def test_prompt_protects_active_program_and_final_saved_workout(self) -> None:
+        prompt_path = Path(__file__).resolve().parents[1] / "codex_chat_prompt.md"
+        prompt = prompt_path.read_text(encoding="utf-8")
+        self.assertIn("Never delete a program's final", prompt)
+        self.assertIn("propose `delete_session_template` only when", prompt)
+        self.assertIn("another saved workout must be", prompt)
+        self.assertIn("Never propose `archive_program`", prompt)
+        self.assertIn("tell the user to activate", prompt)
+        self.assertIn("another program first", prompt)
+
+    def test_prompt_restricts_unavailable_exercises_to_same_template(self) -> None:
+        prompt_path = Path(__file__).resolve().parents[1] / "codex_chat_prompt.md"
+        prompt = prompt_path.read_text(encoding="utf-8")
+        self.assertIn("`available: false` may remain only", prompt)
+        self.assertIn("same non-null `sessionTemplateId`", prompt)
+        self.assertIn("Never newly add an unavailable", prompt)
+        self.assertIn("move it to another retained template", prompt)
+
+    def test_prompt_requires_matching_action_hash_and_old_client_refresh(self) -> None:
+        prompt_path = Path(__file__).resolve().parents[1] / "codex_chat_prompt.md"
+        prompt = prompt_path.read_text(encoding="utf-8")
+        self.assertIn("`workoutContext.actionStateHashes`", prompt)
+        self.assertIn("hash for that scope", prompt)
+        self.assertIn("tell the user to refresh the app", prompt)
+        self.assertIn("if the `exercise_library` hash is", prompt)
+        self.assertIn("return `actionPlan: null`", prompt)
+
+
+class CloudContractTests(unittest.TestCase):
+    def test_cloud_completion_accepts_the_exercise_library_scope(self) -> None:
+        backend_path = (
+            Path(__file__).resolve().parents[2]
+            / "functions"
+            / "api"
+            / "chat"
+            / "[[path]].ts"
+        )
+        backend = backend_path.read_text(encoding="utf-8")
+        action_scopes = backend[backend.index("const ACTION_SCOPES") :]
+        action_scopes = action_scopes[: action_scopes.index("] as const")]
+        self.assertIn("'exercise_library'", action_scopes)
 
 
 class IdleBackoffTests(unittest.TestCase):

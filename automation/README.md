@@ -131,6 +131,11 @@ an OpenAI API key.
   a confirmation-gated `save_ai_note` proposal. Applying it writes an AI note
   on the phone and uploads a fresh snapshot; the Coach never writes memory
   silently or while AI Memory is paused.
+- Coach can also propose confirmation-gated program renames and full
+  replacements, program archival, saved-workout replacement or removal, and
+  custom-exercise creation. Program archival and saved-workout removal preserve
+  workout history and logged sets; a new exercise is created in its own step so
+  the phone can generate its trusted ID.
 - The bridge has no inbound listener. It polls over HTTPS, renews an exclusive
   job lease, and sends a heartbeat. Empty claims back off from 2 seconds to a
   10-second cap, reset immediately after activity or restart, and continue

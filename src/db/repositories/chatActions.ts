@@ -1,6 +1,15 @@
+import Dexie from 'dexie'
 import { db } from '../schema'
 import { addAiNote } from './aiMemory'
-import type { Exercise, SessionExerciseSnapshot, WorkoutSession } from '../types'
+import { createCustomExercise } from './exercises'
+import { hashProgramActionState } from '../../lib/chatContext'
+import type {
+  Exercise,
+  MuscleGroup,
+  SessionExerciseSnapshot,
+  SessionTemplate,
+  WorkoutSession,
+} from '../types'
 import type {
   CoachAction,
   CoachActionPlan,
@@ -8,7 +17,66 @@ import type {
   CoachActionScope,
   CoachActionStateHashes,
   PlannedExercise,
+  PlannedProgramSession,
 } from '../../lib/chatTypes'
+
+const MUSCLE_GROUPS: readonly MuscleGroup[] = [
+  'chest',
+  'back',
+  'shoulders',
+  'biceps',
+  'triceps',
+  'forearms',
+  'quads',
+  'hamstrings',
+  'glutes',
+  'calves',
+  'abs',
+  'traps',
+]
+
+const ACTION_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  swap_active_exercise: [
+    'type',
+    'sessionId',
+    'fromExerciseId',
+    'toExerciseId',
+    'targetSets',
+    'repRange',
+  ],
+  add_active_exercise: [
+    'type',
+    'sessionId',
+    'exerciseId',
+    'position',
+    'targetSets',
+    'repRange',
+  ],
+  update_active_exercise_targets: [
+    'type',
+    'sessionId',
+    'exerciseId',
+    'targetSets',
+    'repRange',
+  ],
+  create_one_time_workout: ['type', 'name', 'exercises'],
+  create_session_template: ['type', 'programId', 'name', 'exercises'],
+  create_program: ['type', 'name', 'sessions'],
+  rename_program: ['type', 'programId', 'name'],
+  replace_program: ['type', 'programId', 'name', 'sessions'],
+  archive_program: ['type', 'programId'],
+  replace_session_template: ['type', 'sessionTemplateId', 'name', 'exercises'],
+  delete_session_template: ['type', 'sessionTemplateId'],
+  create_custom_exercise: [
+    'type',
+    'name',
+    'primaryMuscle',
+    'secondaryMuscles',
+    'notes',
+    'defaultRestSeconds',
+  ],
+  save_ai_note: ['type', 'body'],
+}
 
 export class CoachActionValidationError extends Error {
   constructor(message: string) {
@@ -26,6 +94,25 @@ export class StaleCoachActionError extends Error {
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function exactKeys(
+  value: Record<string, unknown>,
+  expected: readonly string[],
+  label: string,
+): void {
+  const expectedSet = new Set(expected)
+  const actual = Object.keys(value)
+  const missing = expected.filter((key) => !(key in value))
+  const extra = actual.filter((key) => !expectedSet.has(key))
+  if (missing.length === 0 && extra.length === 0) return
+  const details = [
+    missing.length ? `missing=${missing.join(',')}` : null,
+    extra.length ? `extra=${extra.join(',')}` : null,
+  ].filter((detail): detail is string => detail !== null)
+  throw new CoachActionValidationError(
+    `${label} has incorrect fields; ${details.join('; ')}`,
+  )
 }
 
 function requiredString(
@@ -51,6 +138,72 @@ function positiveInteger(value: unknown, label: string): number {
   return value as number
 }
 
+function boundedInteger(
+  value: unknown,
+  label: string,
+  minimum: number,
+  maximum: number,
+): number {
+  if (
+    !Number.isInteger(value) ||
+    (value as number) < minimum ||
+    (value as number) > maximum
+  ) {
+    throw new CoachActionValidationError(
+      `${label} must be a whole number from ${minimum} to ${maximum}`,
+    )
+  }
+  return value as number
+}
+
+function boundedText(value: unknown, label: string, maxLength: number): string {
+  if (typeof value !== 'string') {
+    throw new CoachActionValidationError(`${label} must be text`)
+  }
+  const trimmed = value.trim()
+  if (trimmed.length > maxLength) {
+    throw new CoachActionValidationError(`${label} is too long`)
+  }
+  return trimmed
+}
+
+function nullableId(value: unknown, label: string): string | null {
+  if (value === null) return null
+  return requiredString(value, label, 200)
+}
+
+function muscleGroup(value: unknown, label: string): MuscleGroup {
+  if (
+    typeof value !== 'string' ||
+    !MUSCLE_GROUPS.includes(value as MuscleGroup)
+  ) {
+    throw new CoachActionValidationError(`${label} is not a supported muscle group`)
+  }
+  return value as MuscleGroup
+}
+
+function secondaryMuscles(
+  value: unknown,
+  label: string,
+  primary: MuscleGroup,
+): MuscleGroup[] {
+  if (!Array.isArray(value) || value.length > MUSCLE_GROUPS.length - 1) {
+    throw new CoachActionValidationError(`${label} must be a list of muscle groups`)
+  }
+  const parsed = value.map((item, index) =>
+    muscleGroup(item, `${label}[${index}]`),
+  )
+  if (new Set(parsed).size !== parsed.length) {
+    throw new CoachActionValidationError(`${label} contains a duplicate muscle group`)
+  }
+  if (parsed.includes(primary)) {
+    throw new CoachActionValidationError(
+      `${label} cannot include the primary muscle group`,
+    )
+  }
+  return parsed
+}
+
 function nonNegativeInteger(value: unknown, label: string): number {
   if (!Number.isInteger(value) || (value as number) < 0 || (value as number) > 1000) {
     throw new CoachActionValidationError(`${label} must be a whole number from 0 to 1000`)
@@ -74,6 +227,11 @@ function parsePlannedExercises(value: unknown, label: string): PlannedExercise[]
     if (!isObject(raw)) {
       throw new CoachActionValidationError(`${label}[${index}] must be an object`)
     }
+    exactKeys(
+      raw,
+      ['exerciseId', 'targetSets', 'repRange'],
+      `${label}[${index}]`,
+    )
     return {
       exerciseId: requiredString(
         raw.exerciseId,
@@ -91,12 +249,58 @@ function parsePlannedExercises(value: unknown, label: string): PlannedExercise[]
   return exercises
 }
 
+function parseReplacementSessions(
+  value: unknown,
+  label: string,
+): PlannedProgramSession[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 20) {
+    throw new CoachActionValidationError(`${label} must contain 1 to 20 sessions`)
+  }
+  const sessions = value.map((raw, index) => {
+    if (!isObject(raw)) {
+      throw new CoachActionValidationError(`${label}[${index}] must be an object`)
+    }
+    exactKeys(
+      raw,
+      ['sessionTemplateId', 'name', 'exercises'],
+      `${label}[${index}]`,
+    )
+    return {
+      sessionTemplateId: nullableId(
+        raw.sessionTemplateId,
+        `${label}[${index}].sessionTemplateId`,
+      ),
+      name: requiredString(raw.name, `${label}[${index}].name`),
+      exercises: parsePlannedExercises(
+        raw.exercises,
+        `${label}[${index}].exercises`,
+      ),
+    }
+  })
+  const names = sessions.map((session) => session.name.toLocaleLowerCase())
+  if (new Set(names).size !== names.length) {
+    throw new CoachActionValidationError(`${label} has duplicate names`)
+  }
+  const retainedIds = sessions
+    .map((session) => session.sessionTemplateId)
+    .filter((id): id is string => id !== null)
+  if (new Set(retainedIds).size !== retainedIds.length) {
+    throw new CoachActionValidationError(`${label} has duplicate session template IDs`)
+  }
+  return sessions
+}
+
 function parseAction(raw: unknown, index: number): CoachAction {
   if (!isObject(raw)) {
     throw new CoachActionValidationError(`actions[${index}] must be an object`)
   }
   const type = requiredString(raw.type, `actions[${index}].type`)
   const prefix = `actions[${index}]`
+  const expectedFields = ACTION_FIELDS[type]
+  if (!expectedFields) {
+    throw new CoachActionValidationError(`Unsupported Coach action: ${type}`)
+  }
+  exactKeys(raw, expectedFields, prefix)
   switch (type) {
     case 'swap_active_exercise':
       return {
@@ -153,6 +357,11 @@ function parseAction(raw: unknown, index: number): CoachAction {
             `${prefix}.sessions[${sessionIndex}] must be an object`,
           )
         }
+        exactKeys(
+          session,
+          ['name', 'exercises'],
+          `${prefix}.sessions[${sessionIndex}]`,
+        )
         return {
           name: requiredString(
             session.name,
@@ -174,6 +383,67 @@ function parseAction(raw: unknown, index: number): CoachAction {
         sessions,
       }
     }
+    case 'rename_program':
+      return {
+        type,
+        programId: requiredString(raw.programId, `${prefix}.programId`, 200),
+        name: requiredString(raw.name, `${prefix}.name`),
+      }
+    case 'replace_program':
+      return {
+        type,
+        programId: requiredString(raw.programId, `${prefix}.programId`, 200),
+        name: requiredString(raw.name, `${prefix}.name`),
+        sessions: parseReplacementSessions(raw.sessions, `${prefix}.sessions`),
+      }
+    case 'archive_program':
+      return {
+        type,
+        programId: requiredString(raw.programId, `${prefix}.programId`, 200),
+      }
+    case 'replace_session_template':
+      return {
+        type,
+        sessionTemplateId: requiredString(
+          raw.sessionTemplateId,
+          `${prefix}.sessionTemplateId`,
+          200,
+        ),
+        name: requiredString(raw.name, `${prefix}.name`),
+        exercises: parsePlannedExercises(raw.exercises, `${prefix}.exercises`),
+      }
+    case 'delete_session_template':
+      return {
+        type,
+        sessionTemplateId: requiredString(
+          raw.sessionTemplateId,
+          `${prefix}.sessionTemplateId`,
+          200,
+        ),
+      }
+    case 'create_custom_exercise': {
+      const primaryMuscle = muscleGroup(
+        raw.primaryMuscle,
+        `${prefix}.primaryMuscle`,
+      )
+      return {
+        type,
+        name: requiredString(raw.name, `${prefix}.name`),
+        primaryMuscle,
+        secondaryMuscles: secondaryMuscles(
+          raw.secondaryMuscles,
+          `${prefix}.secondaryMuscles`,
+          primaryMuscle,
+        ),
+        notes: boundedText(raw.notes, `${prefix}.notes`, 2000),
+        defaultRestSeconds: boundedInteger(
+          raw.defaultRestSeconds,
+          `${prefix}.defaultRestSeconds`,
+          1,
+          3600,
+        ),
+      }
+    }
     case 'save_ai_note':
       return {
         type,
@@ -189,6 +459,7 @@ function isScope(value: unknown): value is CoachActionScope {
     value === 'active_workout' ||
     value === 'one_time_workout' ||
     value === 'program' ||
+    value === 'exercise_library' ||
     value === 'ai_memory'
   )
 }
@@ -225,9 +496,20 @@ function validateScope(plan: CoachActionPlan): void {
     }
     return
   }
+  if (plan.scope === 'exercise_library') {
+    if (
+      plan.actions.length !== 1 ||
+      plan.actions[0]?.type !== 'create_custom_exercise'
+    ) {
+      throw new CoachActionValidationError(
+        'An exercise-library plan must create exactly one custom exercise',
+      )
+    }
+    return
+  }
   if (plan.actions.length !== 1) {
     throw new CoachActionValidationError(
-      'Workout and program creation plans must contain exactly one action',
+      'Workout and program plans must contain exactly one action',
     )
   }
   const only = plan.actions[0]
@@ -236,19 +518,36 @@ function validateScope(plan: CoachActionPlan): void {
       'A one-time workout plan must create one one-time workout',
     )
   }
-  if (
-    plan.scope === 'program' &&
-    only.type !== 'create_session_template' &&
-    only.type !== 'create_program'
-  ) {
+  const programTypes = new Set<CoachAction['type']>([
+    'create_session_template',
+    'create_program',
+    'rename_program',
+    'replace_program',
+    'archive_program',
+    'replace_session_template',
+    'delete_session_template',
+  ])
+  if (plan.scope === 'program' && !programTypes.has(only.type)) {
     throw new CoachActionValidationError(
-      'A program plan must create a session template or program',
+      'A program plan may only create, rename, replace, archive, or delete a saved program workout',
     )
   }
 }
 
 export function parseCoachActionPlan(raw: unknown): CoachActionPlan {
   if (!isObject(raw)) throw new CoachActionValidationError('Action plan is missing')
+  exactKeys(
+    raw,
+    [
+      'title',
+      'summary',
+      'scope',
+      'sourceStateHash',
+      'sourceActionStateHash',
+      'actions',
+    ],
+    'Action plan',
+  )
   if (!isScope(raw.scope)) {
     throw new CoachActionValidationError('Action plan has an invalid scope')
   }
@@ -302,6 +601,111 @@ async function validatePlannedExerciseIds(
     result.set(planned.exerciseId, await requireAvailableExercise(planned.exerciseId))
   }
   return result
+}
+
+async function requireEditableProgram(programId: string) {
+  const program = await db.programs.get(programId)
+  if (!program) throw new CoachActionValidationError('Program no longer exists')
+  if (program.archivedAt !== null) {
+    throw new CoachActionValidationError('Restore that program before editing it')
+  }
+  return program
+}
+
+async function requireSessionTemplate(
+  sessionTemplateId: string,
+): Promise<SessionTemplate> {
+  const template = await db.sessionTemplates.get(sessionTemplateId)
+  if (!template) {
+    throw new CoachActionValidationError('Saved workout no longer exists')
+  }
+  return template
+}
+
+async function validateReplacementExerciseIds(
+  exercises: PlannedExercise[],
+  retainedExerciseIds: ReadonlySet<string>,
+): Promise<void> {
+  for (const planned of exercises) {
+    const exercise = await db.exercises.get(planned.exerciseId)
+    if (!exercise) {
+      throw new CoachActionValidationError('Exercise no longer exists')
+    }
+    if (
+      exercise.hiddenFromLibrary &&
+      !retainedExerciseIds.has(planned.exerciseId)
+    ) {
+      throw new CoachActionValidationError(
+        `${exercise.name} is hidden from the library`,
+      )
+    }
+  }
+}
+
+async function replaceTemplateExercises(
+  sessionTemplateId: string,
+  exercises: PlannedExercise[],
+): Promise<void> {
+  await db.templateExercises
+    .where('sessionTemplateId')
+    .equals(sessionTemplateId)
+    .delete()
+  await db.templateExercises.bulkAdd(
+    exercises.map((exercise, order) => ({
+      id: crypto.randomUUID(),
+      sessionTemplateId,
+      exerciseId: exercise.exerciseId,
+      order,
+      targetSets: exercise.targetSets,
+      targetRepRange: exercise.repRange,
+    })),
+  )
+}
+
+async function detachAndDeleteSessionTemplate(
+  sessionTemplateId: string,
+): Promise<void> {
+  await db.templateExercises
+    .where('sessionTemplateId')
+    .equals(sessionTemplateId)
+    .delete()
+  const references = await db.workoutSessions
+    .where('sessionTemplateId')
+    .equals(sessionTemplateId)
+    .toArray()
+  for (const workout of references) {
+    await db.workoutSessions.update(workout.id, { sessionTemplateId: null })
+  }
+  await db.sessionTemplates.delete(sessionTemplateId)
+}
+
+async function compactProgramSessionOrder(programId: string): Promise<void> {
+  const siblings = await db.sessionTemplates
+    .where('programId')
+    .equals(programId)
+    .sortBy('order')
+  for (let order = 0; order < siblings.length; order++) {
+    if (siblings[order].order !== order) {
+      await db.sessionTemplates.update(siblings[order].id, { order })
+    }
+  }
+}
+
+async function programActionStateHashInTransaction(): Promise<string> {
+  const [exercises, programs, templates, templateExercises] = await Promise.all([
+    db.exercises.toArray(),
+    db.programs.toArray(),
+    db.sessionTemplates.toArray(),
+    db.templateExercises.toArray(),
+  ])
+  return Dexie.waitFor(
+    hashProgramActionState({
+      exercises,
+      programs,
+      templates,
+      templateExercises,
+    }),
+  )
 }
 
 function snapshotFromPlan(exercises: PlannedExercise[]): SessionExerciseSnapshot[] {
@@ -429,6 +833,14 @@ export async function applyCoachActionPlan(args: {
           sourceActionStateHash:
             stored.sourceActionStateHash ?? plan.sourceActionStateHash,
           replayed: true,
+        }
+      }
+
+      if (plan.scope === 'program') {
+        const transactionActionStateHash =
+          await programActionStateHashInTransaction()
+        if (transactionActionStateHash !== plan.sourceActionStateHash) {
+          throw new StaleCoachActionError()
         }
       }
 
@@ -719,6 +1131,217 @@ export async function applyCoachActionPlan(args: {
               entityId: programId,
             })
             result.programId = programId
+            break
+          }
+          case 'rename_program': {
+            const program = await requireEditableProgram(action.programId)
+            const updated = await db.programs.update(program.id, {
+              name: action.name,
+            })
+            if (updated !== 1) {
+              throw new CoachActionValidationError('Program changed')
+            }
+            result.changes.push({
+              type: action.type,
+              label: `Renamed ${program.name} to ${action.name}`,
+              entityId: program.id,
+            })
+            result.programId = program.id
+            break
+          }
+          case 'replace_program': {
+            const program = await requireEditableProgram(action.programId)
+            const existingTemplates = await db.sessionTemplates
+              .where('programId')
+              .equals(program.id)
+              .toArray()
+            const existingById = new Map(
+              existingTemplates.map((template) => [template.id, template]),
+            )
+
+            // Validate the complete target graph before deleting or replacing
+            // any rows. A hidden exercise may stay only in the same retained
+            // template where the user was already using it.
+            for (const replacement of action.sessions) {
+              let retainedExerciseIds = new Set<string>()
+              if (replacement.sessionTemplateId !== null) {
+                const template = await requireSessionTemplate(
+                  replacement.sessionTemplateId,
+                )
+                if (template.programId !== program.id) {
+                  throw new CoachActionValidationError(
+                    'A saved workout does not belong to that program',
+                  )
+                }
+                const existingExercises = await db.templateExercises
+                  .where('sessionTemplateId')
+                  .equals(template.id)
+                  .toArray()
+                retainedExerciseIds = new Set(
+                  existingExercises.map((row) => row.exerciseId),
+                )
+              }
+              await validateReplacementExerciseIds(
+                replacement.exercises,
+                retainedExerciseIds,
+              )
+            }
+
+            const updated = await db.programs.update(program.id, {
+              name: action.name,
+            })
+            if (updated !== 1) {
+              throw new CoachActionValidationError('Program changed')
+            }
+
+            const retainedTemplateIds = new Set(
+              action.sessions
+                .map((session) => session.sessionTemplateId)
+                .filter((id): id is string => id !== null),
+            )
+            for (const template of existingTemplates) {
+              if (!retainedTemplateIds.has(template.id)) {
+                await detachAndDeleteSessionTemplate(template.id)
+              }
+            }
+
+            for (let order = 0; order < action.sessions.length; order++) {
+              const replacement = action.sessions[order]
+              const sessionTemplateId =
+                replacement.sessionTemplateId ?? crypto.randomUUID()
+              if (replacement.sessionTemplateId === null) {
+                await db.sessionTemplates.add({
+                  id: sessionTemplateId,
+                  programId: program.id,
+                  name: replacement.name,
+                  order,
+                })
+              } else {
+                const template = existingById.get(sessionTemplateId)
+                if (!template) {
+                  throw new CoachActionValidationError(
+                    'Saved workout changed while replacing the program',
+                  )
+                }
+                const templateUpdated = await db.sessionTemplates.update(
+                  sessionTemplateId,
+                  { name: replacement.name, order },
+                )
+                if (templateUpdated !== 1) {
+                  throw new CoachActionValidationError('Saved workout changed')
+                }
+              }
+              await replaceTemplateExercises(
+                sessionTemplateId,
+                replacement.exercises,
+              )
+            }
+
+            result.changes.push({
+              type: action.type,
+              label: `Replaced ${program.name} with ${action.name}`,
+              entityId: program.id,
+            })
+            result.programId = program.id
+            break
+          }
+          case 'archive_program': {
+            const program = await db.programs.get(action.programId)
+            if (!program) {
+              throw new CoachActionValidationError('Program no longer exists')
+            }
+            if (program.archivedAt !== null) {
+              throw new CoachActionValidationError('That program is already archived')
+            }
+            if (program.isActive === 1) {
+              throw new CoachActionValidationError(
+                'Activate another program before archiving this one',
+              )
+            }
+            const updated = await db.programs.update(program.id, {
+              isActive: 0,
+              archivedAt: now,
+            })
+            if (updated !== 1) {
+              throw new CoachActionValidationError('Program changed')
+            }
+            result.changes.push({
+              type: action.type,
+              label: `Archived ${program.name}`,
+              entityId: program.id,
+            })
+            result.programId = program.id
+            break
+          }
+          case 'replace_session_template': {
+            const template = await requireSessionTemplate(
+              action.sessionTemplateId,
+            )
+            const program = await requireEditableProgram(template.programId)
+            const existingExercises = await db.templateExercises
+              .where('sessionTemplateId')
+              .equals(template.id)
+              .toArray()
+            await validateReplacementExerciseIds(
+              action.exercises,
+              new Set(existingExercises.map((row) => row.exerciseId)),
+            )
+            const updated = await db.sessionTemplates.update(template.id, {
+              name: action.name,
+            })
+            if (updated !== 1) {
+              throw new CoachActionValidationError('Saved workout changed')
+            }
+            await replaceTemplateExercises(template.id, action.exercises)
+            result.changes.push({
+              type: action.type,
+              label: `Replaced ${template.name} in ${program.name}`,
+              entityId: template.id,
+            })
+            result.programId = program.id
+            result.sessionTemplateId = template.id
+            break
+          }
+          case 'delete_session_template': {
+            const template = await requireSessionTemplate(
+              action.sessionTemplateId,
+            )
+            const program = await requireEditableProgram(template.programId)
+            const savedWorkoutCount = await db.sessionTemplates
+              .where('programId')
+              .equals(program.id)
+              .count()
+            if (savedWorkoutCount <= 1) {
+              throw new CoachActionValidationError(
+                'Add another saved workout before removing the final one',
+              )
+            }
+            await detachAndDeleteSessionTemplate(template.id)
+            await compactProgramSessionOrder(program.id)
+            result.changes.push({
+              type: action.type,
+              label: `Removed saved workout ${template.name} from ${program.name}`,
+              entityId: template.id,
+            })
+            result.programId = program.id
+            result.sessionTemplateId = template.id
+            break
+          }
+          case 'create_custom_exercise': {
+            const exerciseId = await createCustomExercise({
+              name: action.name,
+              primaryMuscle: action.primaryMuscle,
+              secondaryMuscles: action.secondaryMuscles,
+              notes: action.notes,
+              defaultRestSeconds: action.defaultRestSeconds,
+              hiddenFromLibrary: false,
+            })
+            result.changes.push({
+              type: action.type,
+              label: `Created ${action.name}`,
+              entityId: exerciseId,
+            })
+            result.exerciseId = exerciseId
             break
           }
           case 'save_ai_note': {

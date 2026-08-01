@@ -1,7 +1,8 @@
 import 'fake-indexeddb/auto'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { db } from '../schema'
 import type { Exercise, WorkoutSession } from '../types'
+import { buildLiveCoachContext } from '../../lib/chatContext'
 import {
   applyCoachActionPlan,
   getAppliedCoachActionResult,
@@ -16,13 +17,21 @@ const ACTION_HASH = 'c'.repeat(64)
 
 function actionStateHashes(
   overrides: Partial<
-    Record<'active_workout' | 'one_time_workout' | 'program' | 'ai_memory', string>
+    Record<
+      | 'active_workout'
+      | 'one_time_workout'
+      | 'program'
+      | 'exercise_library'
+      | 'ai_memory',
+      string
+    >
   > = {},
 ) {
   return {
     active_workout: ACTION_HASH,
     one_time_workout: ACTION_HASH,
     program: ACTION_HASH,
+    exercise_library: ACTION_HASH,
     ai_memory: ACTION_HASH,
     ...overrides,
   }
@@ -68,14 +77,27 @@ function activeSession(): WorkoutSession {
   }
 }
 
-function plan(action: unknown, scope = 'active_workout') {
+function plan(
+  action: unknown,
+  scope = 'active_workout',
+  sourceActionStateHash = ACTION_HASH,
+) {
   return {
     title: 'Safe change',
     summary: 'Preview this exact change.',
     scope,
     sourceStateHash: HASH,
-    sourceActionStateHash: ACTION_HASH,
+    sourceActionStateHash,
     actions: [action],
+  }
+}
+
+async function programApplyInput(action: unknown) {
+  const programHash = (await buildLiveCoachContext()).context.actionStateHashes
+    .program
+  return {
+    rawPlan: plan(action, 'program', programHash),
+    currentActionStateHashes: actionStateHashes({ program: programHash }),
   }
 }
 
@@ -101,6 +123,88 @@ describe('Coach action plan validation', () => {
     expect(() =>
       parseCoachActionPlan(plan({ type: 'delete_everything' })),
     ).toThrow('Unsupported Coach action')
+  })
+
+  it('rejects extra action fields', () => {
+    expect(() =>
+      parseCoachActionPlan(
+        plan({
+          type: 'add_active_exercise',
+          sessionId: 'session',
+          exerciseId: 'a',
+          position: 0,
+          targetSets: 3,
+          repRange: '8-10',
+          unexpected: true,
+        }),
+      ),
+    ).toThrow('extra=unexpected')
+  })
+
+  it('rejects extra action-plan fields', () => {
+    expect(() =>
+      parseCoachActionPlan({
+        ...plan({
+          type: 'add_active_exercise',
+          sessionId: 'session',
+          exerciseId: 'a',
+          position: 0,
+          targetSets: 3,
+          repRange: '8-10',
+        }),
+        unexpected: true,
+      }),
+    ).toThrow('extra=unexpected')
+  })
+
+  it('rejects extra fields in nested exercise and session specifications', () => {
+    expect(() =>
+      parseCoachActionPlan(
+        plan(
+          {
+            type: 'create_program',
+            name: 'Split',
+            sessions: [
+              {
+                name: 'Day A',
+                exercises: [
+                  {
+                    exerciseId: 'a',
+                    targetSets: 3,
+                    repRange: '8-10',
+                    notes: 'not part of the contract',
+                  },
+                ],
+              },
+            ],
+          },
+          'program',
+        ),
+      ),
+    ).toThrow('extra=notes')
+
+    expect(() =>
+      parseCoachActionPlan(
+        plan(
+          {
+            type: 'replace_program',
+            programId: 'program',
+            name: 'Split',
+            sessions: [
+              {
+                sessionTemplateId: null,
+                name: 'Day A',
+                exercises: [
+                  { exerciseId: 'a', targetSets: 3, repRange: '8-10' },
+                ],
+                order: 0,
+              },
+            ],
+          },
+          'program',
+        ),
+      ),
+    ).toThrow('extra=order')
   })
 
   it('accepts one bounded AI-memory note in its dedicated scope', () => {
@@ -144,6 +248,64 @@ describe('Coach action plan validation', () => {
         plan({ type: 'save_ai_note', body: 'x'.repeat(1001) }, 'ai_memory'),
       ),
     ).toThrow('body is too long')
+  })
+
+  it('rejects duplicate names and retained IDs in a program replacement', () => {
+    const base = {
+      type: 'replace_program',
+      programId: 'program',
+      name: 'Replacement',
+      sessions: [
+        {
+          sessionTemplateId: 'template',
+          name: 'Day A',
+          exercises: [
+            { exerciseId: 'a', targetSets: 3, repRange: '8-10' },
+          ],
+        },
+        {
+          sessionTemplateId: 'template',
+          name: 'day a',
+          exercises: [
+            { exerciseId: 'b', targetSets: 3, repRange: '8-10' },
+          ],
+        },
+      ],
+    }
+    expect(() => parseCoachActionPlan(plan(base, 'program'))).toThrow(
+      'duplicate names',
+    )
+
+    base.sessions[1].name = 'Day B'
+    expect(() => parseCoachActionPlan(plan(base, 'program'))).toThrow(
+      'duplicate session template IDs',
+    )
+  })
+
+  it('validates custom-exercise muscles, notes, and rest', () => {
+    const action = {
+      type: 'create_custom_exercise',
+      name: 'Cable Y Raise',
+      primaryMuscle: 'shoulders',
+      secondaryMuscles: ['shoulders'],
+      notes: '',
+      defaultRestSeconds: 90,
+    }
+    expect(() =>
+      parseCoachActionPlan(plan(action, 'exercise_library')),
+    ).toThrow('cannot include the primary muscle group')
+
+    action.secondaryMuscles = []
+    action.defaultRestSeconds = 3601
+    expect(() =>
+      parseCoachActionPlan(plan(action, 'exercise_library')),
+    ).toThrow('whole number from 1 to 3600')
+
+    action.defaultRestSeconds = 90
+    action.notes = 'x'.repeat(2001)
+    expect(() =>
+      parseCoachActionPlan(plan(action, 'exercise_library')),
+    ).toThrow('notes is too long')
   })
 })
 
@@ -422,27 +584,24 @@ describe('workout and program creation', () => {
   })
 
   it('creates a whole inactive program graph in one transaction', async () => {
+    const input = await programApplyInput({
+      type: 'create_program',
+      name: 'Two day split',
+      sessions: [
+        {
+          name: 'Day A',
+          exercises: [{ exerciseId: 'a', targetSets: 3, repRange: '6-8' }],
+        },
+        {
+          name: 'Day B',
+          exercises: [{ exerciseId: 'b', targetSets: 3, repRange: '10-12' }],
+        },
+      ],
+    })
     const result = await applyCoachActionPlan({
       proposalId: 'proposal-program',
-      rawPlan: plan(
-        {
-          type: 'create_program',
-          name: 'Two day split',
-          sessions: [
-            {
-              name: 'Day A',
-              exercises: [{ exerciseId: 'a', targetSets: 3, repRange: '6-8' }],
-            },
-            {
-              name: 'Day B',
-              exercises: [{ exerciseId: 'b', targetSets: 3, repRange: '10-12' }],
-            },
-          ],
-        },
-        'program',
-      ),
+      ...input,
       currentStateHash: HASH,
-      currentActionStateHashes: actionStateHashes(),
     })
 
     const program = await db.programs.get(result.programId!)
@@ -453,6 +612,682 @@ describe('workout and program creation', () => {
     expect(program?.isActive).toBe(0)
     expect(sessions.map((session) => session.order).sort()).toEqual([0, 1])
     expect(await db.templateExercises.count()).toBe(2)
+  })
+})
+
+describe('program and saved-workout Coach actions', () => {
+  beforeEach(async () => {
+    await db.exercises.bulkAdd([
+      exercise('a', 'Bench Press'),
+      exercise('b', 'Cable Fly'),
+      {
+        ...exercise('hidden', 'Legacy Machine Press'),
+        hiddenFromLibrary: true,
+      },
+    ])
+    await db.programs.add({
+      id: 'program',
+      name: 'Original Split',
+      isActive: 1,
+      createdAt: 1,
+      archivedAt: null,
+    })
+    await db.sessionTemplates.bulkAdd([
+      { id: 'template-a', programId: 'program', name: 'Day A', order: 0 },
+      { id: 'template-b', programId: 'program', name: 'Day B', order: 1 },
+    ])
+    await db.templateExercises.bulkAdd([
+      {
+        id: 'te-a',
+        sessionTemplateId: 'template-a',
+        exerciseId: 'a',
+        order: 0,
+        targetSets: 3,
+        targetRepRange: '8-10',
+      },
+      {
+        id: 'te-hidden',
+        sessionTemplateId: 'template-a',
+        exerciseId: 'hidden',
+        order: 1,
+        targetSets: 2,
+        targetRepRange: '10-12',
+      },
+      {
+        id: 'te-b',
+        sessionTemplateId: 'template-b',
+        exerciseId: 'b',
+        order: 0,
+        targetSets: 3,
+        targetRepRange: '12-15',
+      },
+    ])
+  })
+
+  it('renames a program without rewriting historical snapshots', async () => {
+    await db.workoutSessions.add({
+      id: 'history',
+      sessionTemplateId: 'template-a',
+      programId: 'program',
+      name: 'Day A',
+      programName: 'Original Split',
+      exerciseSnapshot: [
+        {
+          exerciseId: 'a',
+          order: 0,
+          targetSets: 3,
+          targetRepRange: '8-10',
+        },
+      ],
+      startedAt: 2,
+      completedAt: 3,
+    })
+
+    const input = await programApplyInput({
+      type: 'rename_program',
+      programId: 'program',
+      name: 'Updated Split',
+    })
+    await applyCoachActionPlan({
+      proposalId: 'proposal-rename-program',
+      ...input,
+      currentStateHash: HASH,
+    })
+
+    expect((await db.programs.get('program'))?.name).toBe('Updated Split')
+    expect(await db.workoutSessions.get('history')).toMatchObject({
+      name: 'Day A',
+      programName: 'Original Split',
+    })
+  })
+
+  it('revalidates the program hash inside the write transaction', async () => {
+    const input = await programApplyInput({
+      type: 'replace_program',
+      programId: 'program',
+      name: 'Stale replacement',
+      sessions: [
+        {
+          sessionTemplateId: 'template-a',
+          name: 'Day A',
+          exercises: [
+            { exerciseId: 'a', targetSets: 3, repRange: '8-10' },
+            { exerciseId: 'hidden', targetSets: 2, repRange: '10-12' },
+          ],
+        },
+      ],
+    })
+    await db.sessionTemplates.add({
+      id: 'template-concurrent',
+      programId: 'program',
+      name: 'Concurrent Day',
+      order: 2,
+    })
+    await db.templateExercises.add({
+      id: 'te-concurrent',
+      sessionTemplateId: 'template-concurrent',
+      exerciseId: 'a',
+      order: 0,
+      targetSets: 2,
+      targetRepRange: '12-15',
+    })
+
+    await expect(
+      applyCoachActionPlan({
+        proposalId: 'proposal-stale-inside-transaction',
+        ...input,
+        currentStateHash: HASH,
+      }),
+    ).rejects.toBeInstanceOf(StaleCoachActionError)
+
+    expect((await db.programs.get('program'))?.name).toBe('Original Split')
+    expect(await db.sessionTemplates.get('template-a')).toBeDefined()
+    expect(await db.sessionTemplates.get('template-b')).toBeDefined()
+    expect(await db.sessionTemplates.get('template-concurrent')).toBeDefined()
+    expect(await db.templateExercises.get('te-concurrent')).toBeDefined()
+    expect(
+      await db.chatActionReceipts.get('proposal-stale-inside-transaction'),
+    ).toBeUndefined()
+  })
+
+  it('archives and deactivates a program without deleting its graph or history', async () => {
+    await db.programs.update('program', { isActive: 0 })
+    await db.workoutSessions.add({
+      id: 'history',
+      sessionTemplateId: 'template-a',
+      programId: 'program',
+      name: 'Day A',
+      programName: 'Original Split',
+      exerciseSnapshot: [],
+      startedAt: 2,
+      completedAt: 3,
+    })
+    await db.loggedSets.add({
+      id: 'history-set',
+      workoutSessionId: 'history',
+      exerciseId: 'a',
+      setNumber: 1,
+      weightLbs: 100,
+      reps: 8,
+      rpe: null,
+      loggedAt: 2,
+    })
+
+    const input = await programApplyInput({
+      type: 'archive_program',
+      programId: 'program',
+    })
+    await applyCoachActionPlan({
+      proposalId: 'proposal-archive-program',
+      ...input,
+      currentStateHash: HASH,
+    })
+
+    expect(await db.programs.get('program')).toMatchObject({ isActive: 0 })
+    expect((await db.programs.get('program'))?.archivedAt).toEqual(
+      expect.any(Number),
+    )
+    expect(await db.sessionTemplates.count()).toBe(2)
+    expect(await db.templateExercises.count()).toBe(3)
+    expect(await db.workoutSessions.get('history')).toBeDefined()
+    expect(await db.loggedSets.get('history-set')).toBeDefined()
+  })
+
+  it('requires another program to be activated before archiving the active one', async () => {
+    const input = await programApplyInput({
+      type: 'archive_program',
+      programId: 'program',
+    })
+
+    await expect(
+      applyCoachActionPlan({
+        proposalId: 'proposal-archive-active-program',
+        ...input,
+        currentStateHash: HASH,
+      }),
+    ).rejects.toThrow('Activate another program before archiving this one')
+
+    expect(await db.programs.get('program')).toMatchObject({
+      isActive: 1,
+      archivedAt: null,
+    })
+    expect(
+      await db.chatActionReceipts.get('proposal-archive-active-program'),
+    ).toBeUndefined()
+  })
+
+  it('replaces one saved workout while retaining its ID and frozen history', async () => {
+    const oldSnapshot = [
+      {
+        exerciseId: 'a',
+        order: 0,
+        targetSets: 3,
+        targetRepRange: '8-10',
+      },
+      {
+        exerciseId: 'hidden',
+        order: 1,
+        targetSets: 2,
+        targetRepRange: '10-12',
+      },
+    ]
+    await db.workoutSessions.add({
+      id: 'history',
+      sessionTemplateId: 'template-a',
+      programId: 'program',
+      name: 'Day A',
+      programName: 'Original Split',
+      exerciseSnapshot: oldSnapshot,
+      startedAt: 2,
+      completedAt: 3,
+    })
+    await db.loggedSets.add({
+      id: 'history-set',
+      workoutSessionId: 'history',
+      exerciseId: 'a',
+      setNumber: 1,
+      weightLbs: 100,
+      reps: 8,
+      rpe: null,
+      loggedAt: 2,
+    })
+
+    const input = await programApplyInput({
+      type: 'replace_session_template',
+      sessionTemplateId: 'template-a',
+      name: 'Upper A',
+      exercises: [
+        { exerciseId: 'hidden', targetSets: 2, repRange: '10-12' },
+        { exerciseId: 'b', targetSets: 4, repRange: '12-15' },
+      ],
+    })
+    await applyCoachActionPlan({
+      proposalId: 'proposal-replace-template',
+      ...input,
+      currentStateHash: HASH,
+    })
+
+    expect(await db.sessionTemplates.get('template-a')).toMatchObject({
+      name: 'Upper A',
+      order: 0,
+    })
+    expect(
+      await db.templateExercises
+        .where('sessionTemplateId')
+        .equals('template-a')
+        .sortBy('order'),
+    ).toEqual([
+      expect.objectContaining({ exerciseId: 'hidden', order: 0, targetSets: 2 }),
+      expect.objectContaining({ exerciseId: 'b', order: 1, targetSets: 4 }),
+    ])
+    expect(await db.workoutSessions.get('history')).toMatchObject({
+      sessionTemplateId: 'template-a',
+      name: 'Day A',
+      exerciseSnapshot: oldSnapshot,
+    })
+    expect(await db.loggedSets.get('history-set')).toBeDefined()
+  })
+
+  it('deletes a saved workout but preserves and detaches logged history', async () => {
+    const snapshot = [
+      {
+        exerciseId: 'a',
+        order: 0,
+        targetSets: 3,
+        targetRepRange: '8-10',
+      },
+    ]
+    await db.workoutSessions.add({
+      id: 'history',
+      sessionTemplateId: 'template-a',
+      programId: 'program',
+      name: 'Day A',
+      programName: 'Original Split',
+      exerciseSnapshot: snapshot,
+      startedAt: 2,
+      completedAt: 3,
+    })
+    await db.loggedSets.add({
+      id: 'history-set',
+      workoutSessionId: 'history',
+      exerciseId: 'a',
+      setNumber: 1,
+      weightLbs: 100,
+      reps: 8,
+      rpe: null,
+      loggedAt: 2,
+    })
+
+    const input = await programApplyInput({
+      type: 'delete_session_template',
+      sessionTemplateId: 'template-a',
+    })
+    await applyCoachActionPlan({
+      proposalId: 'proposal-delete-template',
+      ...input,
+      currentStateHash: HASH,
+    })
+
+    expect(await db.sessionTemplates.get('template-a')).toBeUndefined()
+    expect(await db.templateExercises.get('te-a')).toBeUndefined()
+    expect(await db.templateExercises.get('te-hidden')).toBeUndefined()
+    expect(await db.sessionTemplates.get('template-b')).toMatchObject({ order: 0 })
+    expect(await db.workoutSessions.get('history')).toMatchObject({
+      sessionTemplateId: null,
+      name: 'Day A',
+      programName: 'Original Split',
+      exerciseSnapshot: snapshot,
+    })
+    expect(await db.loggedSets.get('history-set')).toBeDefined()
+  })
+
+  it('does not remove the final saved workout from a program', async () => {
+    await db.templateExercises.where('sessionTemplateId').equals('template-b').delete()
+    await db.sessionTemplates.delete('template-b')
+    const input = await programApplyInput({
+      type: 'delete_session_template',
+      sessionTemplateId: 'template-a',
+    })
+
+    await expect(
+      applyCoachActionPlan({
+        proposalId: 'proposal-delete-final-template',
+        ...input,
+        currentStateHash: HASH,
+      }),
+    ).rejects.toThrow('Add another saved workout before removing the final one')
+
+    expect(await db.sessionTemplates.get('template-a')).toBeDefined()
+    expect(await db.templateExercises.get('te-a')).toBeDefined()
+    expect(
+      await db.chatActionReceipts.get('proposal-delete-final-template'),
+    ).toBeUndefined()
+  })
+
+  it('replaces a program graph while retaining selected IDs and detaching omitted history', async () => {
+    const oldSnapshot = [
+      {
+        exerciseId: 'b',
+        order: 0,
+        targetSets: 3,
+        targetRepRange: '12-15',
+      },
+    ]
+    await db.workoutSessions.bulkAdd([
+      {
+        id: 'history-a',
+        sessionTemplateId: 'template-a',
+        programId: 'program',
+        name: 'Day A',
+        programName: 'Original Split',
+        exerciseSnapshot: [],
+        startedAt: 2,
+        completedAt: 3,
+      },
+      {
+        id: 'history-b',
+        sessionTemplateId: 'template-b',
+        programId: 'program',
+        name: 'Day B',
+        programName: 'Original Split',
+        exerciseSnapshot: oldSnapshot,
+        startedAt: 4,
+        completedAt: 5,
+      },
+    ])
+    await db.loggedSets.add({
+      id: 'history-set',
+      workoutSessionId: 'history-b',
+      exerciseId: 'b',
+      setNumber: 1,
+      weightLbs: 50,
+      reps: 12,
+      rpe: null,
+      loggedAt: 5,
+    })
+
+    const input = await programApplyInput({
+      type: 'replace_program',
+      programId: 'program',
+      name: 'Rebuilt Split',
+      sessions: [
+        {
+          sessionTemplateId: 'template-a',
+          name: 'Upper',
+          exercises: [
+            { exerciseId: 'hidden', targetSets: 2, repRange: '10-12' },
+            { exerciseId: 'b', targetSets: 3, repRange: '12-15' },
+          ],
+        },
+        {
+          sessionTemplateId: null,
+          name: 'Lower',
+          exercises: [
+            { exerciseId: 'a', targetSets: 3, repRange: '8-10' },
+          ],
+        },
+      ],
+    })
+    const result = await applyCoachActionPlan({
+      proposalId: 'proposal-replace-program',
+      ...input,
+      currentStateHash: HASH,
+    })
+
+    expect(result.programId).toBe('program')
+    expect(await db.programs.get('program')).toMatchObject({
+      id: 'program',
+      name: 'Rebuilt Split',
+      isActive: 1,
+      createdAt: 1,
+      archivedAt: null,
+    })
+    const templates = await db.sessionTemplates
+      .where('programId')
+      .equals('program')
+      .sortBy('order')
+    expect(templates).toHaveLength(2)
+    expect(templates[0]).toMatchObject({
+      id: 'template-a',
+      name: 'Upper',
+      order: 0,
+    })
+    expect(templates[1]).toMatchObject({ name: 'Lower', order: 1 })
+    expect(templates[1].id).not.toBe('template-b')
+    expect(await db.sessionTemplates.get('template-b')).toBeUndefined()
+    expect(await db.workoutSessions.get('history-a')).toMatchObject({
+      sessionTemplateId: 'template-a',
+      name: 'Day A',
+      programName: 'Original Split',
+    })
+    expect(await db.workoutSessions.get('history-b')).toMatchObject({
+      sessionTemplateId: null,
+      name: 'Day B',
+      programName: 'Original Split',
+      exerciseSnapshot: oldSnapshot,
+    })
+    expect(await db.loggedSets.get('history-set')).toBeDefined()
+  })
+
+  it('rolls back prior program and history writes when a later add fails', async () => {
+    await db.workoutSessions.add({
+      id: 'history-b',
+      sessionTemplateId: 'template-b',
+      programId: 'program',
+      name: 'Day B',
+      programName: 'Original Split',
+      exerciseSnapshot: [],
+      startedAt: 2,
+      completedAt: 3,
+    })
+    const input = await programApplyInput({
+      type: 'replace_program',
+      programId: 'program',
+      name: 'Must roll back',
+      sessions: [
+        {
+          sessionTemplateId: 'template-a',
+          name: 'Retained Day',
+          exercises: [
+            { exerciseId: 'a', targetSets: 4, repRange: '6-8' },
+          ],
+        },
+        {
+          sessionTemplateId: null,
+          name: 'New Day',
+          exercises: [
+            { exerciseId: 'b', targetSets: 3, repRange: '12-15' },
+          ],
+        },
+      ],
+    })
+    const uuidSpy = vi
+      .spyOn(crypto, 'randomUUID')
+      .mockReturnValue('template-a' as ReturnType<typeof crypto.randomUUID>)
+
+    try {
+      await expect(
+        applyCoachActionPlan({
+          proposalId: 'proposal-late-add-failure',
+          ...input,
+          currentStateHash: HASH,
+        }),
+      ).rejects.toThrow()
+    } finally {
+      uuidSpy.mockRestore()
+    }
+
+    expect((await db.programs.get('program'))?.name).toBe('Original Split')
+    expect(await db.sessionTemplates.get('template-a')).toMatchObject({
+      name: 'Day A',
+      order: 0,
+    })
+    expect(await db.sessionTemplates.get('template-b')).toMatchObject({
+      name: 'Day B',
+      order: 1,
+    })
+    expect(await db.templateExercises.count()).toBe(3)
+    expect(await db.templateExercises.get('te-a')).toBeDefined()
+    expect(await db.templateExercises.get('te-hidden')).toBeDefined()
+    expect(await db.templateExercises.get('te-b')).toBeDefined()
+    expect(await db.workoutSessions.get('history-b')).toMatchObject({
+      sessionTemplateId: 'template-b',
+    })
+    expect(
+      await db.chatActionReceipts.get('proposal-late-add-failure'),
+    ).toBeUndefined()
+  })
+
+  it('rejects moving a hidden exercise to a new template and rolls back', async () => {
+    const input = await programApplyInput({
+      type: 'replace_program',
+      programId: 'program',
+      name: 'Should not save',
+      sessions: [
+        {
+          sessionTemplateId: 'template-a',
+          name: 'Day A',
+          exercises: [
+            { exerciseId: 'a', targetSets: 3, repRange: '8-10' },
+          ],
+        },
+        {
+          sessionTemplateId: null,
+          name: 'New Day',
+          exercises: [
+            { exerciseId: 'hidden', targetSets: 2, repRange: '10-12' },
+          ],
+        },
+      ],
+    })
+    await expect(
+      applyCoachActionPlan({
+        proposalId: 'proposal-hidden-move',
+        ...input,
+        currentStateHash: HASH,
+      }),
+    ).rejects.toThrow('hidden from the library')
+
+    expect((await db.programs.get('program'))?.name).toBe('Original Split')
+    expect(await db.sessionTemplates.count()).toBe(2)
+    expect(await db.templateExercises.count()).toBe(3)
+    expect(await db.chatActionReceipts.get('proposal-hidden-move')).toBeUndefined()
+  })
+
+  it('rejects edits to an archived program', async () => {
+    await db.programs.update('program', { archivedAt: 10, isActive: 0 })
+    const input = await programApplyInput({
+      type: 'replace_session_template',
+      sessionTemplateId: 'template-a',
+      name: 'No change',
+      exercises: [
+        { exerciseId: 'a', targetSets: 2, repRange: '8-10' },
+      ],
+    })
+    await expect(
+      applyCoachActionPlan({
+        proposalId: 'proposal-edit-archived',
+        ...input,
+        currentStateHash: HASH,
+      }),
+    ).rejects.toThrow('Restore that program')
+    expect((await db.sessionTemplates.get('template-a'))?.name).toBe('Day A')
+  })
+})
+
+describe('custom exercise Coach actions', () => {
+  it('creates one visible custom exercise and replays idempotently', async () => {
+    const rawPlan = plan(
+      {
+        type: 'create_custom_exercise',
+        name: '  Cable Y Raise  ',
+        primaryMuscle: 'shoulders',
+        secondaryMuscles: ['traps'],
+        notes: '  Keep the load light.  ',
+        defaultRestSeconds: 75,
+      },
+      'exercise_library',
+    )
+    const first = await applyCoachActionPlan({
+      proposalId: 'proposal-create-exercise',
+      rawPlan,
+      currentStateHash: HASH,
+      currentActionStateHashes: actionStateHashes(),
+    })
+    const replay = await applyCoachActionPlan({
+      proposalId: 'proposal-create-exercise',
+      rawPlan,
+      currentStateHash: HASH,
+      currentActionStateHashes: actionStateHashes(),
+    })
+
+    expect(first.exerciseId).toEqual(expect.any(String))
+    expect(replay.exerciseId).toBe(first.exerciseId)
+    expect(replay.replayed).toBe(true)
+    expect(await db.exercises.count()).toBe(1)
+    expect(await db.exercises.get(first.exerciseId!)).toMatchObject({
+      name: 'Cable Y Raise',
+      primaryMuscle: 'shoulders',
+      secondaryMuscles: ['traps'],
+      notes: 'Keep the load light.',
+      defaultRestSeconds: 75,
+      isCustom: true,
+      hiddenFromLibrary: false,
+    })
+  })
+
+  it('rejects a case-insensitive duplicate even when the existing exercise is hidden', async () => {
+    await db.exercises.add({
+      ...exercise('existing', 'Cable Y Raise'),
+      hiddenFromLibrary: true,
+    })
+
+    await expect(
+      applyCoachActionPlan({
+        proposalId: 'proposal-duplicate-exercise',
+        rawPlan: plan(
+          {
+            type: 'create_custom_exercise',
+            name: ' cable y raise ',
+            primaryMuscle: 'shoulders',
+            secondaryMuscles: [],
+            notes: '',
+            defaultRestSeconds: 90,
+          },
+          'exercise_library',
+        ),
+        currentStateHash: HASH,
+        currentActionStateHashes: actionStateHashes(),
+      }),
+    ).rejects.toThrow('already exists')
+    expect(await db.exercises.count()).toBe(1)
+    expect(
+      await db.chatActionReceipts.get('proposal-duplicate-exercise'),
+    ).toBeUndefined()
+  })
+
+  it('rejects a stale exercise-library proposal', async () => {
+    await expect(
+      applyCoachActionPlan({
+        proposalId: 'proposal-stale-exercise',
+        rawPlan: plan(
+          {
+            type: 'create_custom_exercise',
+            name: 'Cable Y Raise',
+            primaryMuscle: 'shoulders',
+            secondaryMuscles: [],
+            notes: '',
+            defaultRestSeconds: 90,
+          },
+          'exercise_library',
+        ),
+        currentStateHash: HASH,
+        currentActionStateHashes: actionStateHashes({
+          exercise_library: 'b'.repeat(64),
+        }),
+      }),
+    ).rejects.toBeInstanceOf(StaleCoachActionError)
+    expect(await db.exercises.count()).toBe(0)
   })
 })
 

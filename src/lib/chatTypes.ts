@@ -1,3 +1,5 @@
+import type { MuscleGroup } from '../db/types'
+
 export type CoachReasoningEffort = 'medium' | 'xhigh'
 
 export type CoachMessageRole = 'user' | 'assistant'
@@ -78,6 +80,12 @@ export interface PlannedExercise {
   repRange: string
 }
 
+export interface PlannedProgramSession {
+  sessionTemplateId: string | null
+  name: string
+  exercises: PlannedExercise[]
+}
+
 export type CoachAction =
   | {
       type: 'swap_active_exercise'
@@ -122,6 +130,39 @@ export type CoachAction =
       }>
     }
   | {
+      type: 'rename_program'
+      programId: string
+      name: string
+    }
+  | {
+      type: 'replace_program'
+      programId: string
+      name: string
+      sessions: PlannedProgramSession[]
+    }
+  | {
+      type: 'archive_program'
+      programId: string
+    }
+  | {
+      type: 'replace_session_template'
+      sessionTemplateId: string
+      name: string
+      exercises: PlannedExercise[]
+    }
+  | {
+      type: 'delete_session_template'
+      sessionTemplateId: string
+    }
+  | {
+      type: 'create_custom_exercise'
+      name: string
+      primaryMuscle: MuscleGroup
+      secondaryMuscles: MuscleGroup[]
+      notes: string
+      defaultRestSeconds: number
+    }
+  | {
       type: 'save_ai_note'
       body: string
     }
@@ -130,6 +171,7 @@ export type CoachActionScope =
   | 'active_workout'
   | 'one_time_workout'
   | 'program'
+  | 'exercise_library'
   | 'ai_memory'
 
 export type CoachActionStateHashes = {
@@ -162,4 +204,5 @@ export interface CoachActionResult {
   activeSessionId?: string
   programId?: string
   sessionTemplateId?: string
+  exerciseId?: string
 }

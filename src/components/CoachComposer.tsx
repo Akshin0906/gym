@@ -11,6 +11,8 @@ const ACTIVE_PROMPTS = [
 const GENERAL_PROMPTS = [
   'Build me a workout for today',
   'Create a new training program',
+  'Edit one of my saved workouts',
+  'Create a custom exercise',
   'How has my training been trending?',
 ]
 

@@ -115,6 +115,13 @@ interface ContextRows {
   summaries: AiMemorySummary[]
 }
 
+export interface ProgramActionStateRows {
+  exercises: Exercise[]
+  programs: ProgramRow[]
+  templates: SessionTemplate[]
+  templateExercises: TemplateExercise[]
+}
+
 function byId<T extends { id: string }>(a: T, b: T): number {
   return a.id.localeCompare(b.id)
 }
@@ -162,6 +169,22 @@ async function sha256(value: unknown): Promise<string> {
   return Array.from(new Uint8Array(digest), (byte) =>
     byte.toString(16).padStart(2, '0'),
   ).join('')
+}
+
+export async function hashProgramActionState(
+  rows: ProgramActionStateRows,
+): Promise<string> {
+  const exerciseCatalog = rows.exercises.slice().sort(byId).map((exercise) => ({
+    id: exercise.id,
+    name: exercise.name,
+    hiddenFromLibrary: exercise.hiddenFromLibrary,
+  }))
+  return sha256({
+    exerciseCatalog,
+    programs: rows.programs.slice().sort(byId),
+    templates: rows.templates.slice().sort(byId),
+    templateExercises: rows.templateExercises.slice().sort(byId),
+  })
 }
 
 async function readContextRows(): Promise<ContextRows> {
@@ -255,6 +278,17 @@ export async function buildLiveCoachContext(
     name: exercise.name,
     hiddenFromLibrary: exercise.hiddenFromLibrary,
   }))
+  const exerciseLibraryState = rows.exercises.slice().sort(byId).map((exercise) => ({
+    id: exercise.id,
+    name: exercise.name,
+    primaryMuscle: exercise.primaryMuscle,
+    secondaryMuscles: exercise.secondaryMuscles,
+    notes: exercise.notes,
+    defaultRestSeconds: exercise.defaultRestSeconds,
+    isCustom: exercise.isCustom,
+    hiddenFromLibrary: exercise.hiddenFromLibrary,
+    createdAt: exercise.createdAt,
+  }))
   const activeWorkoutState = {
     exerciseAvailability: exerciseCatalogState,
     activeWorkout: active
@@ -281,20 +315,21 @@ export async function buildLiveCoachContext(
       .sort((a, b) => a.order - b.order),
     hasLoggedWork: (setsBySession.get(session.id) ?? []).length > 0,
   }))
-  const programStructure = {
-    exerciseCatalog: exerciseCatalogState,
-    programs: rows.programs.slice().sort(byId),
-    templates: rows.templates.slice().sort(byId),
-    templateExercises: rows.templateExercises.slice().sort(byId),
-  }
-  const [activeWorkoutHash, oneTimeWorkoutHash, programHash, aiMemoryHash] =
+  const [
+    activeWorkoutHash,
+    oneTimeWorkoutHash,
+    programHash,
+    exerciseLibraryHash,
+    aiMemoryHash,
+  ] =
     await Promise.all([
       sha256(activeWorkoutState),
       sha256({
         exerciseCatalog: exerciseCatalogState,
         inProgress: inProgressStructure,
       }),
-      sha256(programStructure),
+      hashProgramActionState(rows),
+      sha256(exerciseLibraryState),
       // Saving a note is append-only. Only availability should invalidate a
       // pending proposal; unrelated notes or summaries can safely change.
       sha256({ paused: rows.memorySettings?.paused ?? false }),
@@ -303,6 +338,7 @@ export async function buildLiveCoachContext(
     active_workout: activeWorkoutHash,
     one_time_workout: oneTimeWorkoutHash,
     program: programHash,
+    exercise_library: exerciseLibraryHash,
     ai_memory: aiMemoryHash,
   }
 
