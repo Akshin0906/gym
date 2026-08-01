@@ -164,7 +164,11 @@ PY
 reload_agent() {
   mkdir -p "$AGENTS_DIR"
   render_plist
-  launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+  if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+    # bootout normally returns before launchd has finished removing the old
+    # service. --wait closes that race before bootstrap starts.
+    launchctl bootout --wait "$DOMAIN/$LABEL"
+  fi
   prune_runtime
   launchctl bootstrap "$DOMAIN" "$PLIST_TARGET"
   launchctl enable "$DOMAIN/$LABEL"
