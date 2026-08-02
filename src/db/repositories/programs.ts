@@ -7,6 +7,20 @@ import type {
   TemplateExercise,
 } from '../types'
 
+export const MAX_TARGET_SETS = 100
+
+function assertValidTargetSets(targetSets: number): void {
+  if (
+    !Number.isSafeInteger(targetSets) ||
+    targetSets < 1 ||
+    targetSets > MAX_TARGET_SETS
+  ) {
+    throw new Error(
+      `Target sets must be a whole number from 1 to ${MAX_TARGET_SETS}`,
+    )
+  }
+}
+
 function fromRow(r: ProgramRow): Program {
   return { ...r, isActive: r.isActive === 1 }
 }
@@ -238,7 +252,7 @@ export async function addTemplateExercise(args: {
   targetSets: number
   targetRepRange: string
 }): Promise<string> {
-  if (args.targetSets <= 0) throw new Error('Target sets must be > 0')
+  assertValidTargetSets(args.targetSets)
   const id = crypto.randomUUID()
   await db.transaction('rw', db.templateExercises, async () => {
     const existing = await getTemplateExercises(args.sessionTemplateId)
@@ -258,8 +272,7 @@ export async function updateTemplateExercise(
   id: string,
   patch: { targetSets?: number; targetRepRange?: string },
 ): Promise<void> {
-  if (patch.targetSets !== undefined && patch.targetSets <= 0)
-    throw new Error('Target sets must be > 0')
+  if (patch.targetSets !== undefined) assertValidTargetSets(patch.targetSets)
   await db.templateExercises.update(id, patch)
 }
 

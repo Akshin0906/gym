@@ -15,11 +15,13 @@ import type {
 } from '../db/types'
 import { relativeOrAbsolute } from '../lib/dates'
 import { useActiveWorkout } from '../store/activeWorkout'
+import { useTimer } from '../store/timer'
 
 export function SessionDetailScreen() {
   const { sessionId } = useParams<{ sessionId: string }>()
   const navigate = useNavigate()
   const { sessionId: activeSessionId, setActiveSession } = useActiveWorkout()
+  const stopRest = useTimer((s) => s.stop)
   const [session, setSession] = useState<WorkoutSession | null>(null)
   const [sets, setSets] = useState<LoggedSet[]>([])
   const [exMap, setExMap] = useState<Map<string, Exercise>>(new Map())
@@ -53,7 +55,10 @@ export function SessionDetailScreen() {
     if (!session) return
     if (!confirm('Delete this whole session?')) return
     await deleteSession(session.id)
-    if (activeSessionId === session.id) setActiveSession(null)
+    if (activeSessionId === session.id) {
+      stopRest()
+      setActiveSession(null)
+    }
     navigate('/history')
   }
 

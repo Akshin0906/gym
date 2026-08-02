@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { Archive, CheckCircle2, Copy, Plus, Zap } from 'lucide-react'
+import { ErrorAlert } from '../components/Feedback'
 import { Header, SettingsLink } from '../components/Header'
 import {
   archiveProgram,
@@ -10,15 +11,30 @@ import {
   setProgramActive,
 } from '../db/repositories/programs'
 import type { Program } from '../db/types'
+import { useUnsavedChangesWarning } from '../lib/useUnsavedChangesWarning'
 
 export function ProgramsScreen() {
   const navigate = useNavigate()
   const [programs, setPrograms] = useState<Program[] | null>(null)
   const [adding, setAdding] = useState(false)
   const [newName, setNewName] = useState('')
+  const [createError, setCreateError] = useState<string | null>(null)
+  const [pageError, setPageError] = useState<string | null>(null)
+  const [createdProgramId, setCreatedProgramId] = useState<string | null>(null)
+  useUnsavedChangesWarning(adding && Boolean(newName.trim()))
+
+  useEffect(() => {
+    if (!createdProgramId) return
+    navigate(`/programs/${createdProgramId}`)
+  }, [createdProgramId, navigate])
 
   async function refresh() {
-    setPrograms(await listPrograms())
+    try {
+      setPrograms(await listPrograms())
+      setPageError(null)
+    } catch (caught) {
+      setPageError(caught instanceof Error ? caught.message : String(caught))
+    }
   }
 
   useEffect(() => {
@@ -26,18 +42,43 @@ export function ProgramsScreen() {
   }, [])
 
   async function handleCreate() {
-    if (!newName.trim()) return
-    const id = await createProgram(newName)
-    setNewName('')
-    setAdding(false)
-    navigate(`/programs/${id}`)
+    if (!newName.trim()) {
+      setCreateError('Enter a program name.')
+      return
+    }
+    try {
+      const id = await createProgram(newName)
+      setNewName('')
+      setCreateError(null)
+      setAdding(false)
+      // Navigate after the clean render so the route blocker cannot mistake a
+      // successfully persisted program for an abandoned draft.
+      setCreatedProgramId(id)
+    } catch (caught) {
+      setCreateError(caught instanceof Error ? caught.message : String(caught))
+    }
   }
 
   if (programs === null) {
     return (
       <>
         <Header title="Programs" right={<SettingsLink />} />
-        <p className="p-6 text-neutral-500 text-center">Loading…</p>
+        {pageError ? (
+          <div className="p-4 max-w-md mx-auto space-y-3">
+            <ErrorAlert message={pageError} />
+            <button
+              type="button"
+              onClick={() => void refresh()}
+              className="btn-secondary w-full"
+            >
+              Retry
+            </button>
+          </div>
+        ) : (
+          <p role="status" className="p-6 text-[var(--color-fg-faint)] text-center">
+            Loading…
+          </p>
+        )}
       </>
     )
   }
@@ -67,9 +108,11 @@ export function ProgramsScreen() {
         }
       />
 
-      <div className="px-4 py-4 space-y-6">
+      <div className="px-4 py-4 space-y-6 max-w-2xl mx-auto">
+        {pageError && <ErrorAlert message={pageError} />}
         {adding && (
           <form
+            noValidate
             onSubmit={(e) => {
               e.preventDefault()
               void handleCreate()
@@ -77,13 +120,25 @@ export function ProgramsScreen() {
             className="card p-3 space-y-2"
           >
             <input
+              id="new-program-name"
               type="text"
               autoFocus
               value={newName}
-              onChange={(e) => setNewName(e.target.value)}
+              onChange={(e) => {
+                setNewName(e.target.value)
+                if (createError) setCreateError(null)
+              }}
               placeholder="Program name"
+              aria-label="Program name"
+              aria-invalid={Boolean(createError)}
+              aria-describedby={createError ? 'new-program-error' : undefined}
               className="field"
             />
+            {createError && (
+              <p id="new-program-error" role="alert" className="text-sm text-red-300">
+                {createError}
+              </p>
+            )}
             <div className="flex gap-2">
               <button type="submit" className="btn-primary text-sm">
                 Create
@@ -91,8 +146,15 @@ export function ProgramsScreen() {
               <button
                 type="button"
                 onClick={() => {
+                  if (
+                    newName.trim() &&
+                    !confirm('Discard this new program draft?')
+                  ) {
+                    return
+                  }
                   setAdding(false)
                   setNewName('')
+                  setCreateError(null)
                 }}
                 className="btn-ghost text-sm"
               >
@@ -105,21 +167,36 @@ export function ProgramsScreen() {
         {active.length > 0 && (
           <Section title="Active">
             {active.map((p) => (
-              <ProgramRow key={p.id} program={p} onChange={() => void refresh()} />
+              <ProgramRow
+                key={p.id}
+                program={p}
+                onChange={() => void refresh()}
+                onError={setPageError}
+              />
             ))}
           </Section>
         )}
         {inactive.length > 0 && (
           <Section title="Available">
             {inactive.map((p) => (
-              <ProgramRow key={p.id} program={p} onChange={() => void refresh()} />
+              <ProgramRow
+                key={p.id}
+                program={p}
+                onChange={() => void refresh()}
+                onError={setPageError}
+              />
             ))}
           </Section>
         )}
         {archived.length > 0 && (
           <Section title="Archived">
             {archived.map((p) => (
-              <ProgramRow key={p.id} program={p} onChange={() => void refresh()} />
+              <ProgramRow
+                key={p.id}
+                program={p}
+                onChange={() => void refresh()}
+                onError={setPageError}
+              />
             ))}
           </Section>
         )}
@@ -153,22 +230,31 @@ function Section({
 function ProgramRow({
   program,
   onChange,
+  onError,
 }: {
   program: Program
   onChange: () => void
+  onError: (message: string | null) => void
 }) {
+  async function run(action: () => Promise<unknown>) {
+    onError(null)
+    try {
+      await action()
+      onChange()
+    } catch (caught) {
+      onError(caught instanceof Error ? caught.message : String(caught))
+    }
+  }
+
   async function makeActive() {
-    await setProgramActive(program.id)
-    onChange()
+    await run(() => setProgramActive(program.id))
   }
   async function archive() {
     if (!confirm(`Archive "${program.name}"?`)) return
-    await archiveProgram(program.id)
-    onChange()
+    await run(() => archiveProgram(program.id))
   }
   async function clone() {
-    await cloneProgram(program.id)
-    onChange()
+    await run(() => cloneProgram(program.id))
   }
 
   return (

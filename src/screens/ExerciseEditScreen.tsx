@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
-import { Check, Eye, EyeOff } from 'lucide-react'
+import { Link, useNavigate, useParams } from 'react-router-dom'
+import { BarChart3, Check, Eye, EyeOff } from 'lucide-react'
 import { Header } from '../components/Header'
 import {
   createCustomExercise,
@@ -9,7 +9,12 @@ import {
   type ExerciseInput,
 } from '../db/repositories/exercises'
 import type { Exercise, MuscleGroup } from '../db/types'
-import { MUSCLE_LABEL, MUSCLE_ORDER } from '../lib/muscles'
+import {
+  MUSCLE_LABEL,
+  MUSCLE_ORDER,
+  normalizeSecondaryMuscles,
+} from '../lib/muscles'
+import { MAX_REST_SECONDS, MIN_REST_SECONDS } from '../lib/restTimer'
 
 const DEFAULT_INPUT: ExerciseInput = {
   name: '',
@@ -31,10 +36,20 @@ export function ExerciseEditScreen() {
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
-    if (isNew) return
+    let cancelled = false
+    setExisting(null)
+    setError(null)
+    setSaving(false)
+    if (isNew) {
+      setInput({ ...DEFAULT_INPUT, secondaryMuscles: [] })
+      setLoading(false)
+      return
+    }
+    setLoading(true)
     void getExercise(id!).then((e) => {
+      if (cancelled) return
       if (!e) {
-        setError('Not found')
+        setError('Exercise not found')
       } else {
         setExisting(e)
         setInput({
@@ -48,10 +63,17 @@ export function ExerciseEditScreen() {
       }
       setLoading(false)
     })
+    return () => {
+      cancelled = true
+    }
   }, [id, isNew])
 
   async function handleSave() {
     if (saving) return
+    if (!isNew && !existing) {
+      setError('Exercise not found')
+      return
+    }
     setSaving(true)
     setError(null)
     try {
@@ -74,10 +96,29 @@ export function ExerciseEditScreen() {
   function toggleSecondary(m: MuscleGroup) {
     setInput((prev) => ({
       ...prev,
-      secondaryMuscles: prev.secondaryMuscles.includes(m)
-        ? prev.secondaryMuscles.filter((x) => x !== m)
-        : [...prev.secondaryMuscles, m],
+      secondaryMuscles: normalizeSecondaryMuscles(
+        prev.primaryMuscle,
+        prev.secondaryMuscles.includes(m)
+          ? prev.secondaryMuscles.filter((x) => x !== m)
+          : [...prev.secondaryMuscles, m],
+      ),
     }))
+  }
+
+  if (!isNew && !loading && !existing) {
+    return (
+      <>
+        <Header title="Exercise not found" back="/library" />
+        <div className="px-4 py-10 text-center max-w-md mx-auto">
+          <p className="text-sm text-[var(--color-fg-dim)]">
+            This exercise does not exist or is no longer available.
+          </p>
+          <Link to="/library" className="btn-primary mt-5 inline-flex">
+            Back to Library
+          </Link>
+        </div>
+      </>
+    )
   }
 
   return (
@@ -121,12 +162,17 @@ export function ExerciseEditScreen() {
           <Field label="Primary muscle">
             <select
               value={input.primaryMuscle}
-              onChange={(e) =>
-                setInput({
-                  ...input,
-                  primaryMuscle: e.target.value as MuscleGroup,
-                })
-              }
+              onChange={(e) => {
+                const primaryMuscle = e.target.value as MuscleGroup
+                setInput((prev) => ({
+                  ...prev,
+                  primaryMuscle,
+                  secondaryMuscles: normalizeSecondaryMuscles(
+                    primaryMuscle,
+                    prev.secondaryMuscles,
+                  ),
+                }))
+              }}
               className="field"
             >
               {MUSCLE_ORDER.map((m) => (
@@ -147,6 +193,7 @@ export function ExerciseEditScreen() {
                       type="button"
                       key={m}
                       onClick={() => toggleSecondary(m)}
+                      aria-pressed={on}
                       className={`px-3 py-1.5 rounded-full text-xs font-medium border transition-colors ${
                         on
                           ? 'bg-[var(--color-accent)] text-[oklch(0.18_0.04_50)] border-[var(--color-accent)]'
@@ -173,7 +220,8 @@ export function ExerciseEditScreen() {
           <Field label="Default rest (seconds)">
             <input
               type="number"
-              min={1}
+              min={MIN_REST_SECONDS}
+              max={MAX_REST_SECONDS}
               step={1}
               value={input.defaultRestSeconds}
               onChange={(e) =>
@@ -187,7 +235,19 @@ export function ExerciseEditScreen() {
           </Field>
 
           {!isNew && existing && (
-            <div className="pt-3 border-t border-[var(--color-border)]">
+            <div className="pt-3 border-t border-[var(--color-border)] space-y-3">
+              <Link
+                to={`/library/${existing.id}/history`}
+                className="w-full px-3 py-3 card-tight flex items-center justify-between hover:bg-[var(--color-surface-2)]"
+              >
+                <span className="flex items-center gap-2 text-sm font-medium">
+                  <BarChart3 size={16} className="text-[var(--color-accent)]" />
+                  Complete set history
+                </span>
+                <span className="text-xs text-[var(--color-accent)] font-semibold">
+                  View
+                </span>
+              </Link>
               <button
                 type="button"
                 onClick={toggleHidden}

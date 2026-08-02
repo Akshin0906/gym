@@ -106,6 +106,10 @@ export async function deleteAiNote(id: string): Promise<void> {
   await db.aiNotes.delete(id)
 }
 
+export async function restoreAiNote(note: AiNote): Promise<void> {
+  await db.aiNotes.put(note)
+}
+
 export async function listAiNotesDesc(limit?: number): Promise<AiNote[]> {
   const q = db.aiNotes.orderBy('createdAt').reverse()
   return limit !== undefined ? q.limit(limit).toArray() : q.toArray()

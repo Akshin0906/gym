@@ -73,9 +73,17 @@ interface MemoryItemRow {
 const SNAPSHOT_ID = 'primary'
 const MEMORY_STATE_ID = 'primary'
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
-// Cap the snapshot body so a runaway client export can't exhaust Worker memory
-// or blow past D1 row limits. A full single-user export is well under this.
-const MAX_BODY_BYTES = 8 * 1024 * 1024
+// D1 caps a string/BLOB/row at 2,000,000 bytes. Leave room for the row's other
+// columns so every body accepted here can be persisted instead of failing with
+// SQLITE_TOOBIG. A normal single-user export is far below this threshold.
+export const MAX_BODY_BYTES = 1_900_000
+
+export class PayloadTooLargeError extends Error {
+  constructor() {
+    super('payload_too_large')
+    this.name = 'PayloadTooLargeError'
+  }
+}
 
 function json(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -88,7 +96,7 @@ function json(status: number, body: unknown): Response {
 }
 
 function isObject(v: unknown): v is Record<string, unknown> {
-  return v !== null && typeof v === 'object'
+  return v !== null && typeof v === 'object' && !Array.isArray(v)
 }
 
 function isMode(v: unknown): v is Mode {
@@ -99,14 +107,55 @@ function isMemoryType(v: unknown): v is MemoryType {
   return v === 'workout' || v === 'two_week' || v === 'four_month'
 }
 
-function stringArray(v: unknown): string[] {
-  return Array.isArray(v)
-    ? v.filter((x): x is string => typeof x === 'string')
-    : []
+function assertTrimmedString(
+  value: unknown,
+  field: string,
+  maxLength: number,
+  allowEmpty = false,
+): string {
+  if (typeof value !== 'string') throw new Error(`${field} must be a string`)
+  const trimmed = value.trim()
+  if (!allowEmpty && !trimmed) throw new Error(`${field} must not be empty`)
+  if (trimmed.length > maxLength) {
+    throw new Error(`${field} must be at most ${maxLength} characters`)
+  }
+  return trimmed
 }
 
-function trimmedString(v: unknown, maxLength: number): string {
-  return typeof v === 'string' ? v.trim().slice(0, maxLength) : ''
+function assertTrimmedStringArray(
+  value: unknown,
+  field: string,
+  itemMaxLength: number,
+): string[] {
+  if (!Array.isArray(value)) throw new Error(`${field} must be an array`)
+  return value.map((item, index) =>
+    assertTrimmedString(item, `${field}[${index}]`, itemMaxLength),
+  )
+}
+
+export function isCalendarDate(value: string): boolean {
+  if (!DATE_RE.test(value)) return false
+  const [yearText, monthText, dayText] = value.split('-')
+  const year = Number(yearText)
+  const month = Number(monthText)
+  const day = Number(dayText)
+  if (month < 1 || month > 12 || day < 1) return false
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)
+  const daysInMonth = [
+    31,
+    leapYear ? 29 : 28,
+    31,
+    30,
+    31,
+    30,
+    31,
+    31,
+    30,
+    31,
+    30,
+    31,
+  ]
+  return day <= (daysInMonth[month - 1] ?? 0)
 }
 
 function routePath(ctx: PagesContext): string {
@@ -228,20 +277,58 @@ async function handleGetSnapshot(db: D1Database): Promise<Response> {
   return json(200, { snapshot: snapshotResponse(row) })
 }
 
-function exceedsBodyCap(request: Request): boolean {
-  const len = Number(request.headers.get('content-length') ?? '')
-  return Number.isFinite(len) && len > MAX_BODY_BYTES
+export async function readJsonBodyWithLimit(
+  request: Request,
+  maxBytes = MAX_BODY_BYTES,
+): Promise<unknown> {
+  const declaredHeader = request.headers.get('content-length')
+  if (declaredHeader !== null) {
+    const declaredLength = Number(declaredHeader)
+    if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+      throw new PayloadTooLargeError()
+    }
+  }
+
+  const reader = request.body?.getReader()
+  if (!reader) return JSON.parse('') as unknown
+  const chunks: Uint8Array[] = []
+  let byteLength = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      byteLength += value.byteLength
+      if (byteLength > maxBytes) {
+        try {
+          await reader.cancel()
+        } catch {
+          // The response is already fixed at 413; cancellation is best effort.
+        }
+        throw new PayloadTooLargeError()
+      }
+      chunks.push(value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+
+  const bytes = new Uint8Array(byteLength)
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return JSON.parse(new TextDecoder().decode(bytes)) as unknown
 }
 
 async function handlePutSnapshot(ctx: PagesContext): Promise<Response> {
-  if (exceedsBodyCap(ctx.request)) {
-    return json(413, { error: 'payload_too_large' })
-  }
-
   let body: unknown
   try {
-    body = await ctx.request.json()
-  } catch {
+    body = await readJsonBodyWithLimit(ctx.request)
+  } catch (err) {
+    if (err instanceof PayloadTooLargeError) {
+      return json(413, { error: 'payload_too_large' })
+    }
     return json(400, { error: 'invalid_json' })
   }
 
@@ -282,22 +369,35 @@ async function handlePutSnapshot(ctx: PagesContext): Promise<Response> {
   return json(200, { snapshot: row ? snapshotResponse(row) : null })
 }
 
-function assertBriefingSections(raw: unknown): string {
+export function assertBriefingSections(raw: unknown): string {
   if (!isObject(raw)) throw new Error('sections must be an object')
-  const todaysCall = raw.todaysCall
-  const why = raw.why
+  const todaysCall = assertTrimmedString(
+    raw.todaysCall,
+    'sections.todaysCall',
+    600,
+  )
+  const why = assertTrimmedStringArray(raw.why, 'sections.why', 400)
   const recoveryStatus = raw.recoveryStatus
-  const ouraRecovery = raw.ouraRecovery
-  const trainingTrend = raw.trainingTrend
-  const watchOuts = raw.watchOuts
-  if (typeof todaysCall !== 'string' || !todaysCall.trim()) {
-    throw new Error('sections.todaysCall is required')
+  const ouraRecovery = assertTrimmedString(
+    raw.ouraRecovery,
+    'sections.ouraRecovery',
+    500,
+  )
+  const trainingTrend = assertTrimmedString(
+    raw.trainingTrend,
+    'sections.trainingTrend',
+    500,
+  )
+  const watchOuts = assertTrimmedStringArray(
+    raw.watchOuts,
+    'sections.watchOuts',
+    400,
+  )
+  if (why.length < 1 || why.length > 3) {
+    throw new Error('sections.why must have 1-3 items')
   }
-  if (!Array.isArray(why) || !why.every((x) => typeof x === 'string')) {
-    throw new Error('sections.why must be an array of strings')
-  }
-  if (typeof ouraRecovery !== 'string') {
-    throw new Error('sections.ouraRecovery is required')
+  if (watchOuts.length > 3) {
+    throw new Error('sections.watchOuts must have at most 3 items')
   }
   if (
     recoveryStatus !== undefined &&
@@ -307,25 +407,13 @@ function assertBriefingSections(raw: unknown): string {
   ) {
     throw new Error('sections.recoveryStatus must be fresh, stale, or unavailable')
   }
-  if (typeof trainingTrend !== 'string') {
-    throw new Error('sections.trainingTrend is required')
-  }
-  if (
-    !Array.isArray(watchOuts) ||
-    !watchOuts.every((x) => typeof x === 'string')
-  ) {
-    throw new Error('sections.watchOuts must be an array of strings')
-  }
   return JSON.stringify({
-    todaysCall: todaysCall.trim().slice(0, 600),
-    why: why.map((x) => x.trim().slice(0, 400)).filter(Boolean).slice(0, 3),
+    todaysCall,
+    why,
     ...(recoveryStatus ? { recoveryStatus } : {}),
-    ouraRecovery: ouraRecovery.trim().slice(0, 500),
-    trainingTrend: trainingTrend.trim().slice(0, 500),
-    watchOuts: watchOuts
-      .map((x) => x.trim().slice(0, 400))
-      .filter(Boolean)
-      .slice(0, 3),
+    ouraRecovery,
+    trainingTrend,
+    watchOuts,
   })
 }
 
@@ -348,7 +436,7 @@ async function handleGetBriefing(
   db: D1Database,
   date: string,
 ): Promise<Response> {
-  if (!DATE_RE.test(date)) return json(400, { error: 'invalid_date' })
+  if (!isCalendarDate(date)) return json(400, { error: 'invalid_date' })
   const row = await readBriefing(db, date)
   if (!row) return json(404, { error: 'briefing_not_found' })
   return json(200, { briefing: briefingResponse(row) })
@@ -372,7 +460,7 @@ async function handlePutBriefing(
   ctx: PagesContext,
   date: string,
 ): Promise<Response> {
-  if (!DATE_RE.test(date)) return json(400, { error: 'invalid_date' })
+  if (!isCalendarDate(date)) return json(400, { error: 'invalid_date' })
 
   let body: unknown
   try {
@@ -382,19 +470,33 @@ async function handlePutBriefing(
   }
   if (!isObject(body)) return json(400, { error: 'invalid_briefing' })
 
-  const headline = body.headline
   const mode = body.mode
   const snapshotUpdatedAt = body.snapshotUpdatedAt
-  const model = body.model
-  if (typeof headline !== 'string' || !headline.trim()) {
-    return json(400, { error: 'headline_required' })
+  let headline: string
+  let model: string
+  let source = 'codex'
+  try {
+    headline = assertTrimmedString(body.headline, 'headline', 200)
+    model = assertTrimmedString(body.model, 'model', 120)
+    if (body.source !== undefined) {
+      source = assertTrimmedString(body.source, 'source', 80)
+    }
+  } catch (err) {
+    return json(400, {
+      error: 'invalid_briefing',
+      detail: err instanceof Error ? err.message : String(err),
+    })
   }
   if (!isMode(mode)) return json(400, { error: 'invalid_mode' })
-  if (typeof snapshotUpdatedAt !== 'number') {
+  if (typeof snapshotUpdatedAt !== 'number' || !Number.isFinite(snapshotUpdatedAt)) {
     return json(400, { error: 'snapshotUpdatedAt_required' })
   }
-  if (typeof model !== 'string' || !model.trim()) {
-    return json(400, { error: 'model_required' })
+  if (
+    body.inputSummary !== undefined &&
+    body.inputSummary !== null &&
+    !isObject(body.inputSummary)
+  ) {
+    return json(400, { error: 'invalid_input_summary' })
   }
 
   let sectionsJson: string
@@ -409,10 +511,6 @@ async function handlePutBriefing(
 
   const existing = await readBriefing(ctx.env.WORKOUT_DB, date)
 
-  const source =
-    typeof body.source === 'string' && body.source.trim()
-      ? body.source.trim().slice(0, 80)
-      : 'codex'
   const inputSummaryJson =
     body.inputSummary === undefined ? null : JSON.stringify(body.inputSummary)
   const createdAt = Date.now()
@@ -439,10 +537,10 @@ async function handlePutBriefing(
       createdAt,
       source,
       snapshotUpdatedAt,
-      headline.trim().slice(0, 200),
+      headline,
       mode,
       sectionsJson,
-      model.trim().slice(0, 120),
+      model,
       inputSummaryJson,
     )
     .run()
@@ -501,9 +599,7 @@ function assertMemoryBullets(
   memoryType: MemoryType,
   raw: unknown,
 ): string[] {
-  const bullets = stringArray(raw)
-    .map((x) => x.trim().slice(0, 500))
-    .filter(Boolean)
+  const bullets = assertTrimmedStringArray(raw, 'memory item bullets', 500)
   if (memoryType === 'two_week' && bullets.length !== 1) {
     throw new Error('two_week memory must have exactly one bullet')
   }
@@ -516,7 +612,7 @@ function assertMemoryBullets(
   return bullets
 }
 
-function assertMemoryItem(raw: unknown): {
+export function assertMemoryItem(raw: unknown): {
   id: string
   memoryType: MemoryType
   periodStartAt: number
@@ -532,8 +628,7 @@ function assertMemoryItem(raw: unknown): {
   snapshotUpdatedAt: number | null
 } {
   if (!isObject(raw)) throw new Error('memory item must be an object')
-  const id = trimmedString(raw.id, 180)
-  if (!id) throw new Error('memory item id is required')
+  const id = assertTrimmedString(raw.id, 'memory item id', 180)
   if (!isMemoryType(raw.memoryType)) {
     throw new Error(`invalid memory type for ${id}`)
   }
@@ -543,41 +638,43 @@ function assertMemoryItem(raw: unknown): {
   if (periodEndAt < periodStartAt) {
     throw new Error(`${id}.periodEndAt must be >= periodStartAt`)
   }
-  const model = trimmedString(raw.model, 120)
-  if (!model) throw new Error(`${id}.model is required`)
-  const createdAt =
-    typeof raw.createdAt === 'number' && Number.isFinite(raw.createdAt)
-      ? raw.createdAt
-      : Date.now()
-  const updatedAt =
-    typeof raw.updatedAt === 'number' && Number.isFinite(raw.updatedAt)
-      ? raw.updatedAt
-      : createdAt
-  const snapshotUpdatedAt =
-    typeof raw.snapshotUpdatedAt === 'number' &&
-    Number.isFinite(raw.snapshotUpdatedAt)
-      ? raw.snapshotUpdatedAt
-      : null
+  const model = assertTrimmedString(raw.model, `${id}.model`, 120)
+  const createdAt = assertNumber(raw.createdAt, `${id}.createdAt`)
+  const updatedAt = assertNumber(raw.updatedAt, `${id}.updatedAt`)
+  const snapshotUpdatedAt = assertNullableNumber(
+    raw.snapshotUpdatedAt,
+    `${id}.snapshotUpdatedAt`,
+  )
+  const sourceWorkoutSessionId =
+    raw.sourceWorkoutSessionId === null
+      ? null
+      : assertTrimmedString(
+          raw.sourceWorkoutSessionId,
+          `${id}.sourceWorkoutSessionId`,
+          180,
+        )
   return {
     id,
     memoryType,
     periodStartAt,
     periodEndAt,
-    sourceWorkoutSessionId:
-      typeof raw.sourceWorkoutSessionId === 'string' &&
-      raw.sourceWorkoutSessionId.trim()
-        ? raw.sourceWorkoutSessionId.trim().slice(0, 180)
-        : null,
+    sourceWorkoutSessionId,
     bullets: assertMemoryBullets(memoryType, raw.bullets),
-    sourceSessionIds: stringArray(raw.sourceSessionIds)
-      .map((x) => x.trim().slice(0, 180))
-      .filter(Boolean),
-    sourceNoteIds: stringArray(raw.sourceNoteIds)
-      .map((x) => x.trim().slice(0, 180))
-      .filter(Boolean),
-    sourceSummaryIds: stringArray(raw.sourceSummaryIds)
-      .map((x) => x.trim().slice(0, 180))
-      .filter(Boolean),
+    sourceSessionIds: assertTrimmedStringArray(
+      raw.sourceSessionIds,
+      `${id}.sourceSessionIds`,
+      180,
+    ),
+    sourceNoteIds: assertTrimmedStringArray(
+      raw.sourceNoteIds,
+      `${id}.sourceNoteIds`,
+      180,
+    ),
+    sourceSummaryIds: assertTrimmedStringArray(
+      raw.sourceSummaryIds,
+      `${id}.sourceSummaryIds`,
+      180,
+    ),
     model,
     createdAt,
     updatedAt,
@@ -585,7 +682,12 @@ function assertMemoryItem(raw: unknown): {
   }
 }
 
-function assertMemoryState(raw: unknown): {
+function assertNullableNumber(value: unknown, field: string): number | null {
+  if (value === null) return null
+  return assertNumber(value, field)
+}
+
+export function assertMemoryState(raw: unknown): {
   currentContext: string
   paused: boolean
   windowStartedAt: number
@@ -601,14 +703,22 @@ function assertMemoryState(raw: unknown): {
     raw.fourMonthStartedAt,
     'state.fourMonthStartedAt',
   )
-  const sourceSnapshotUpdatedAt =
-    typeof raw.sourceSnapshotUpdatedAt === 'number' &&
-    Number.isFinite(raw.sourceSnapshotUpdatedAt)
-      ? raw.sourceSnapshotUpdatedAt
-      : null
+  const currentContext = assertTrimmedString(
+    raw.currentContext,
+    'state.currentContext',
+    4000,
+    true,
+  )
+  if (typeof raw.paused !== 'boolean') {
+    throw new Error('state.paused must be a boolean')
+  }
+  const sourceSnapshotUpdatedAt = assertNullableNumber(
+    raw.sourceSnapshotUpdatedAt,
+    'state.sourceSnapshotUpdatedAt',
+  )
   return {
-    currentContext: trimmedString(raw.currentContext, 4000),
-    paused: raw.paused === true,
+    currentContext,
+    paused: raw.paused,
     windowStartedAt,
     fourMonthStartedAt,
     sourceSnapshotUpdatedAt,
@@ -623,13 +733,19 @@ async function handlePutMemory(ctx: PagesContext): Promise<Response> {
     return json(400, { error: 'invalid_json' })
   }
   if (!isObject(body)) return json(400, { error: 'invalid_memory' })
+  if (body.state === undefined && body.items === undefined) {
+    return json(400, {
+      error: 'invalid_memory',
+      detail: 'state or items is required',
+    })
+  }
 
   let state:
     | ReturnType<typeof assertMemoryState>
     | null = null
   let items: ReturnType<typeof assertMemoryItem>[] = []
   try {
-    if (body.state !== undefined && body.state !== null) {
+    if (body.state !== undefined) {
       state = assertMemoryState(body.state)
     }
     if (body.items !== undefined) {

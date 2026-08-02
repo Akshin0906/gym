@@ -2,16 +2,10 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { ChevronDown, Square, Timer as TimerIcon, X } from 'lucide-react'
 import { useTimer } from '../store/timer'
 import { vibrate } from '../lib/audio'
+import { AccessibleDialog } from './AccessibleDialog'
 
-const SLIDER_MIN = 60
-const SLIDER_MAX = 180
-const SLIDER_STEP = 30
-
-function snapToStep(seconds: number): number {
-  const clamped = Math.max(SLIDER_MIN, Math.min(SLIDER_MAX, seconds))
-  const steps = Math.round((clamped - SLIDER_MIN) / SLIDER_STEP)
-  return SLIDER_MIN + steps * SLIDER_STEP
-}
+const SLIDER_MIN = 1
+const BASE_SLIDER_MAX = 300
 
 export function RestTimerBar({
   tabBarHidden = false,
@@ -27,9 +21,13 @@ export function RestTimerBar({
   const [now, setNow] = useState(Date.now)
   const [flashing, setFlashing] = useState(false)
   const [expanded, setExpanded] = useState(true)
+  const [sliderMax, setSliderMax] = useState(() =>
+    Math.max(BASE_SLIDER_MAX, Math.ceil(originalSeconds)),
+  )
   const [coachComposerHeight, setCoachComposerHeight] = useState(0)
   const flashTimeoutRef = useRef<number | undefined>(undefined)
   const wasRunningRef = useRef(false)
+  const showModal = expanded && expiresAt !== null && !flashing
 
   useLayoutEffect(() => {
     if (!coachMode) {
@@ -47,6 +45,10 @@ export function RestTimerBar({
 
   useEffect(() => {
     if (expiresAt === null) return
+    if (flashTimeoutRef.current !== undefined) {
+      window.clearTimeout(flashTimeoutRef.current)
+      flashTimeoutRef.current = undefined
+    }
     setFlashing(false)
     setNow(Date.now())
     let fired = false
@@ -65,20 +67,33 @@ export function RestTimerBar({
     }, 200)
     return () => {
       window.clearInterval(intervalId)
+    }
+  }, [expiresAt, fireExpiry])
+
+  useEffect(
+    () => () => {
       if (flashTimeoutRef.current !== undefined) {
         window.clearTimeout(flashTimeoutRef.current)
         flashTimeoutRef.current = undefined
       }
-    }
-  }, [expiresAt, fireExpiry])
+    },
+    [],
+  )
 
   // Auto-expand on each NEW timer start (transition from idle → running).
   // Slider edits keep `expiresAt` non-null, so they don't trigger this.
   useEffect(() => {
     const isRunning = expiresAt !== null
-    if (isRunning && !wasRunningRef.current) setExpanded(true)
+    if (isRunning) {
+      setSliderMax((current) =>
+        Math.max(current, BASE_SLIDER_MAX, Math.ceil(originalSeconds)),
+      )
+      if (!wasRunningRef.current) setExpanded(true)
+    } else {
+      setSliderMax(BASE_SLIDER_MAX)
+    }
     wasRunningRef.current = isRunning
-  }, [expiresAt])
+  }, [expiresAt, originalSeconds])
 
   function dismissFlash() {
     if (flashTimeoutRef.current !== undefined) {
@@ -106,89 +121,84 @@ export function RestTimerBar({
       ? Math.min(100, (remainingMs / (originalSeconds * 1000)) * 100)
       : 0
 
-  const sliderValue = snapToStep(originalSeconds || 90)
-  const showModal = expanded && expiresAt !== null && !flashing
+  const sliderValue = originalSeconds || 90
 
   if (showModal) {
     return (
-      <div className="fixed inset-0 z-50 flex items-center justify-center px-6">
-        <div
-          className="absolute inset-0"
-          style={{
-            background: 'oklch(0.1 0 0 / 0.7)',
-            backdropFilter: 'blur(8px)',
-            WebkitBackdropFilter: 'blur(8px)',
-          }}
-          onClick={() => setExpanded(false)}
-          aria-hidden
-        />
-        <div
-          className="relative w-full max-w-sm rounded-3xl p-6"
-          style={{
-            background: 'oklch(0.205 0 0)',
-            border: '1px solid var(--color-border)',
-            boxShadow: '0 12px 40px oklch(0 0 0 / 0.6)',
-          }}
-        >
-          <div className="flex items-center justify-between">
-            <button
-              type="button"
-              onClick={() => setExpanded(false)}
-              aria-label="Minimize"
-              className="p-2 -m-2 text-[var(--color-fg-dim)] hover:text-[var(--color-fg)]"
-            >
-              <ChevronDown size={22} strokeWidth={2.25} />
-            </button>
-            <span className="text-[10px] font-bold uppercase tracking-widest text-[var(--color-fg-faint)]">
-              Rest
-            </span>
-            <button
-              type="button"
-              onClick={stop}
-              aria-label="Stop timer"
-              className="p-2 -m-2 text-[var(--color-fg-dim)] hover:text-[var(--color-fg)]"
-            >
-              <Square size={16} fill="currentColor" />
-            </button>
-          </div>
-          <div className="text-center pt-6 pb-2">
-            <span className="text-7xl font-bold nums tabular-nums leading-none">
-              {remainingSec}
-              <span className="text-2xl font-medium text-[var(--color-fg-faint)] ml-1.5 align-top">
-                s
-              </span>
-            </span>
-          </div>
-          <div
-            className="h-1.5 rounded mt-6 overflow-hidden"
-            style={{ background: 'oklch(0 0 0 / 0.4)' }}
+      <AccessibleDialog
+        open
+        onClose={() => setExpanded(false)}
+        labelledBy="rest-timer-title"
+        overlayClassName="items-center justify-center px-6 backdrop-blur-md"
+        className="relative w-full max-w-sm rounded-3xl p-6"
+        style={{
+          background: 'oklch(0.205 0 0)',
+          border: '1px solid var(--color-border)',
+          boxShadow: '0 12px 40px oklch(0 0 0 / 0.6)',
+        }}
+      >
+        <div className="flex items-center justify-between">
+          <button
+            type="button"
+            onClick={() => setExpanded(false)}
+            aria-label="Minimize"
+            className="min-h-11 min-w-11 grid place-items-center text-[var(--color-fg-dim)] hover:text-[var(--color-fg)]"
           >
-            <div
-              className="h-full"
-              style={{
-                width: `${pct}%`,
-                background: 'var(--color-accent)',
-                transition: 'width 200ms linear',
-              }}
-            />
-          </div>
-          <div className="mt-6 flex items-center gap-3">
-            <input
-              type="range"
-              min={SLIDER_MIN}
-              max={SLIDER_MAX}
-              step={SLIDER_STEP}
-              value={sliderValue}
-              onChange={(e) => handleSliderChange(Number(e.target.value))}
-              aria-label="Set rest timer duration"
-              className="flex-1 h-1.5 accent-[var(--color-accent)] cursor-pointer"
-            />
-            <span className="text-sm font-mono nums text-[var(--color-fg-dim)] w-10 text-right">
-              {sliderValue}s
-            </span>
-          </div>
+            <ChevronDown size={22} strokeWidth={2.25} />
+          </button>
+          <span
+            id="rest-timer-title"
+            className="text-[10px] font-bold uppercase tracking-widest text-[var(--color-fg-faint)]"
+          >
+            Rest
+          </span>
+          <button
+            type="button"
+            onClick={stop}
+            aria-label="Stop timer"
+            className="min-h-11 min-w-11 grid place-items-center text-[var(--color-fg-dim)] hover:text-[var(--color-fg)]"
+          >
+            <Square size={16} fill="currentColor" />
+          </button>
         </div>
-      </div>
+        <div className="text-center pt-6 pb-2">
+          <span className="text-7xl font-bold nums tabular-nums leading-none">
+            {remainingSec}
+            <span className="text-2xl font-medium text-[var(--color-fg-faint)] ml-1.5 align-top">
+              s
+            </span>
+          </span>
+        </div>
+        <div
+          className="h-1.5 rounded mt-6 overflow-hidden"
+          style={{ background: 'oklch(0 0 0 / 0.4)' }}
+        >
+          <div
+            className="h-full"
+            style={{
+              width: `${pct}%`,
+              background: 'var(--color-accent)',
+              transition: 'width 200ms linear',
+            }}
+          />
+        </div>
+        <div className="mt-6 flex items-center gap-3">
+          <input
+            type="range"
+            min={SLIDER_MIN}
+            max={sliderMax}
+            step={1}
+            value={sliderValue}
+            onChange={(e) => handleSliderChange(Number(e.target.value))}
+            aria-label="Set rest timer duration"
+            aria-valuetext={`${sliderValue} seconds`}
+            className="flex-1 h-1.5 accent-[var(--color-accent)] cursor-pointer"
+          />
+          <span className="text-sm font-mono nums text-[var(--color-fg-dim)] w-10 text-right">
+            {sliderValue}s
+          </span>
+        </div>
+      </AccessibleDialog>
     )
   }
 

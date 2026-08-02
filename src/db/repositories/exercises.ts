@@ -1,5 +1,7 @@
 import { db } from '../schema'
 import type { Exercise, MuscleGroup } from '../types'
+import { normalizeSecondaryMuscles } from '../../lib/muscles'
+import { isValidRestSeconds } from '../../lib/restTimer'
 
 export interface ExerciseInput {
   name: string
@@ -21,7 +23,9 @@ async function findByNameCI(name: string, excludeId?: string) {
 export async function createCustomExercise(input: ExerciseInput): Promise<string> {
   const name = input.name.trim()
   if (!name) throw new Error('Name is required')
-  if (input.defaultRestSeconds <= 0) throw new Error('Rest must be > 0')
+  if (!isValidRestSeconds(input.defaultRestSeconds)) {
+    throw new Error('Rest must be a whole number from 1 to 3600 seconds')
+  }
   const dup = await findByNameCI(name)
   if (dup) throw new Error(`An exercise named "${dup.name}" already exists`)
 
@@ -29,6 +33,10 @@ export async function createCustomExercise(input: ExerciseInput): Promise<string
   await db.exercises.add({
     ...input,
     name,
+    secondaryMuscles: normalizeSecondaryMuscles(
+      input.primaryMuscle,
+      input.secondaryMuscles,
+    ),
     id,
     isCustom: true,
     createdAt: Date.now(),
@@ -42,11 +50,21 @@ export async function updateExercise(
 ): Promise<void> {
   const name = input.name.trim()
   if (!name) throw new Error('Name is required')
-  if (input.defaultRestSeconds <= 0) throw new Error('Rest must be > 0')
+  if (!isValidRestSeconds(input.defaultRestSeconds)) {
+    throw new Error('Rest must be a whole number from 1 to 3600 seconds')
+  }
   const dup = await findByNameCI(name, id)
   if (dup) throw new Error(`An exercise named "${dup.name}" already exists`)
 
-  await db.exercises.update(id, { ...input, name })
+  const updated = await db.exercises.update(id, {
+    ...input,
+    name,
+    secondaryMuscles: normalizeSecondaryMuscles(
+      input.primaryMuscle,
+      input.secondaryMuscles,
+    ),
+  })
+  if (updated === 0) throw new Error('Exercise not found')
 }
 
 export async function setHidden(id: string, hidden: boolean): Promise<void> {

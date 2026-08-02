@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   addMonths,
   eachDayOfInterval,
@@ -11,33 +11,52 @@ import {
   startOfWeek,
   subMonths,
 } from 'date-fns'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link } from 'react-router-dom'
 import { Trash2 } from 'lucide-react'
+import { ErrorAlert } from '../components/Feedback'
 import { Header, SettingsLink } from '../components/Header'
 import { HistoryListSkeleton } from '../components/Skeleton'
 import { deleteSession, listSessionsDesc } from '../db/repositories/sessions'
 import type { WorkoutSession } from '../db/types'
 import { relativeOrAbsolute, shortDate } from '../lib/dates'
 import { useActiveWorkout } from '../store/activeWorkout'
+import { useTimer } from '../store/timer'
 
 type View = 'list' | 'calendar'
 
 export function HistoryScreen() {
   const [sessions, setSessions] = useState<WorkoutSession[] | null>(null)
   const [view, setView] = useState<View>('list')
+  const [error, setError] = useState<string | null>(null)
   const { sessionId: activeSessionId, setActiveSession } = useActiveWorkout()
+  const stopRest = useTimer((s) => s.stop)
 
   useEffect(() => {
-    void listSessionsDesc().then(setSessions)
+    void listSessionsDesc()
+      .then(setSessions)
+      .catch((caught) => {
+        setError(caught instanceof Error ? caught.message : String(caught))
+        setSessions([])
+      })
   }, [])
 
   const handleDelete = useCallback(
     async (id: string) => {
-      await deleteSession(id)
-      if (activeSessionId === id) setActiveSession(null)
-      setSessions((prev) => (prev ? prev.filter((s) => s.id !== id) : prev))
+      setError(null)
+      try {
+        await deleteSession(id)
+        if (activeSessionId === id) {
+          stopRest()
+          setActiveSession(null)
+        }
+        setSessions((prev) =>
+          prev ? prev.filter((s) => s.id !== id) : prev,
+        )
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : String(caught))
+      }
     },
-    [activeSessionId, setActiveSession],
+    [activeSessionId, setActiveSession, stopRest],
   )
 
   return (
@@ -46,11 +65,16 @@ export function HistoryScreen() {
         title="History"
         right={
           <div className="flex items-center gap-1">
-            <div className="flex bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg p-0.5">
+            <div
+              className="flex bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg p-0.5"
+              role="group"
+              aria-label="History view"
+            >
               <button
                 type="button"
                 onClick={() => setView('list')}
-                className={`text-xs font-medium px-2.5 py-1 rounded-md transition-colors ${
+                aria-pressed={view === 'list'}
+                className={`min-h-11 text-xs font-medium px-2.5 py-1 rounded-md transition-colors ${
                   view === 'list'
                     ? 'bg-[var(--color-surface-2)] text-[var(--color-fg)]'
                     : 'text-[var(--color-fg-faint)]'
@@ -61,7 +85,8 @@ export function HistoryScreen() {
               <button
                 type="button"
                 onClick={() => setView('calendar')}
-                className={`text-xs font-medium px-2.5 py-1 rounded-md transition-colors ${
+                aria-pressed={view === 'calendar'}
+                className={`min-h-11 text-xs font-medium px-2.5 py-1 rounded-md transition-colors ${
                   view === 'calendar'
                     ? 'bg-[var(--color-surface-2)] text-[var(--color-fg)]'
                     : 'text-[var(--color-fg-faint)]'
@@ -74,6 +99,12 @@ export function HistoryScreen() {
           </div>
         }
       />
+
+      {error && (
+        <div className="px-4 pt-4 max-w-2xl mx-auto">
+          <ErrorAlert message={error} />
+        </div>
+      )}
 
       {sessions === null ? (
         <HistoryListSkeleton />
@@ -98,7 +129,7 @@ function ListView({
   onDelete: (id: string) => Promise<void>
 }) {
   return (
-    <ul className="px-4 py-4 space-y-2">
+    <ul className="px-4 py-4 space-y-2 max-w-2xl mx-auto">
       {sessions.map((s) => (
         <SessionRow key={s.id} session={s} onDelete={onDelete} />
       ))}
@@ -113,92 +144,16 @@ function SessionRow({
   session: WorkoutSession
   onDelete: (id: string) => Promise<void>
 }) {
-  const navigate = useNavigate()
-  const [dragX, setDragX] = useState(0)
-  const [revealed, setRevealed] = useState(false)
-  const startX = useRef<number | null>(null)
-  const moved = useRef(false)
-  const REVEAL_THRESHOLD = 80
-  const MAX_REVEAL = 96
-
-  const onPointerDown = (e: React.PointerEvent) => {
-    startX.current = e.clientX
-    moved.current = false
-    ;(e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId)
-  }
-  const onPointerMove = (e: React.PointerEvent) => {
-    if (startX.current === null) return
-    const dx = e.clientX - startX.current
-    if (Math.abs(dx) > 4) moved.current = true
-    const base = revealed ? -MAX_REVEAL : 0
-    const next = Math.min(0, Math.max(-MAX_REVEAL, base + dx))
-    setDragX(next)
-  }
-  const onPointerUp = () => {
-    if (startX.current === null) return
-    startX.current = null
-    setRevealed(dragX <= -REVEAL_THRESHOLD)
-    setDragX((d) => (d <= -REVEAL_THRESHOLD ? -MAX_REVEAL : 0))
-  }
-  const collapse = () => {
-    setRevealed(false)
-    setDragX(0)
-  }
-
   async function handleDeleteClick() {
-    if (!confirm('Delete this workout?')) {
-      collapse()
-      return
-    }
+    if (!confirm(`Delete workout "${session.name}"?`)) return
     await onDelete(session.id)
   }
 
   return (
-    <li className="relative overflow-hidden rounded-xl">
-      <button
-        type="button"
-        aria-label="Delete workout"
-        aria-hidden={!revealed}
-        tabIndex={revealed ? 0 : -1}
-        onClick={() => void handleDeleteClick()}
-        className="absolute inset-y-0 right-0 flex items-center justify-center gap-1.5 px-4 font-semibold text-sm"
-        style={{
-          width: 96,
-          background: 'oklch(0.45 0.18 25)',
-          color: 'oklch(0.98 0.04 25)',
-        }}
-      >
-        <Trash2 size={16} />
-        Delete
-      </button>
-      <div
-        className="card-tight px-3 py-3 hover:bg-[var(--color-surface-2)] relative"
-        style={{
-          transform: `translateX(${dragX}px)`,
-          transition:
-            startX.current === null
-              ? 'transform 220ms cubic-bezier(0.3, 0.9, 0.4, 1.1)'
-              : 'none',
-          touchAction: 'pan-y',
-        }}
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerUp}
-        onPointerCancel={onPointerUp}
-        onClick={(e) => {
-          if (revealed) {
-            e.preventDefault()
-            e.stopPropagation()
-            collapse()
-            return
-          }
-          if (moved.current) {
-            e.preventDefault()
-            e.stopPropagation()
-            return
-          }
-          navigate(`/history/${session.id}`)
-        }}
+    <li className="card-tight overflow-hidden flex items-stretch">
+      <Link
+        to={`/history/${session.id}`}
+        className="min-h-14 min-w-0 flex-1 px-3 py-3 hover:bg-[var(--color-surface-2)]"
       >
         <div className="flex items-center justify-between gap-2">
           <span className="font-semibold truncate">{session.name}</span>
@@ -218,7 +173,15 @@ function SessionRow({
           {relativeOrAbsolute(session.startedAt)}
           {session.programName && ` · ${session.programName}`}
         </div>
-      </div>
+      </Link>
+      <button
+        type="button"
+        aria-label={`Delete ${session.name}`}
+        onClick={() => void handleDeleteClick()}
+        className="min-h-11 min-w-11 px-3 grid place-items-center border-l border-[var(--color-border)] text-red-300 hover:bg-red-950/35"
+      >
+        <Trash2 size={17} aria-hidden="true" />
+      </button>
     </li>
   )
 }
@@ -250,12 +213,15 @@ function CalendarView({ sessions }: { sessions: WorkoutSession[] }) {
     : []
 
   return (
-    <div className="px-4 py-4">
+    <div className="px-2 sm:px-4 py-4 max-w-2xl mx-auto">
       <div className="flex items-center justify-between mb-3">
         <button
           type="button"
-          onClick={() => setMonth(subMonths(month, 1))}
-          className="btn-ghost p-1.5"
+          onClick={() => {
+            setMonth(subMonths(month, 1))
+            setSelected(null)
+          }}
+          className="btn-ghost min-h-11 min-w-11 p-1.5 justify-center"
           aria-label="Previous month"
         >
           ‹
@@ -263,8 +229,11 @@ function CalendarView({ sessions }: { sessions: WorkoutSession[] }) {
         <h2 className="text-base font-bold">{format(month, 'MMMM yyyy')}</h2>
         <button
           type="button"
-          onClick={() => setMonth(addMonths(month, 1))}
-          className="btn-ghost p-1.5"
+          onClick={() => {
+            setMonth(addMonths(month, 1))
+            setSelected(null)
+          }}
+          className="btn-ghost min-h-11 min-w-11 p-1.5 justify-center"
           aria-label="Next month"
         >
           ›
@@ -288,7 +257,9 @@ function CalendarView({ sessions }: { sessions: WorkoutSession[] }) {
               key={key}
               type="button"
               onClick={() => setSelected(d)}
-              className={`aspect-square flex flex-col items-center justify-center text-sm rounded-lg nums ${
+              aria-label={`${format(d, 'EEEE, MMMM d')}${hasSession ? `, ${sessionsByDay.get(key)?.length ?? 0} workout${(sessionsByDay.get(key)?.length ?? 0) === 1 ? '' : 's'}` : ', no workouts'}`}
+              aria-pressed={Boolean(isSel)}
+              className={`min-h-11 flex flex-col items-center justify-center text-sm rounded-lg nums ${
                 inMonth
                   ? 'text-[var(--color-fg)]'
                   : 'text-[var(--color-fg-faint)]/40'

@@ -1,8 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { Search, X } from 'lucide-react'
 import { getExercisesForPicker } from '../db/repositories/exercises'
 import type { Exercise, MuscleGroup } from '../db/types'
 import { MUSCLE_LABEL } from '../lib/muscles'
+import { AccessibleDialog } from './AccessibleDialog'
+import { ErrorAlert } from './Feedback'
 
 interface Props {
   open: boolean
@@ -31,8 +33,11 @@ export function ExercisePickerSheet({
   const [snap, setSnap] = useState<Snap>('half')
   const [dragOffset, setDragOffset] = useState(0)
   const [showAll, setShowAll] = useState(false)
+  const [error, setError] = useState<string | null>(null)
   const startY = useRef<number | null>(null)
   const dragging = useRef(false)
+  const searchRef = useRef<HTMLInputElement>(null)
+  const titleId = useId()
 
   useEffect(() => {
     if (!open) return
@@ -40,7 +45,13 @@ export function ExercisePickerSheet({
     setSnap('half')
     setDragOffset(0)
     setShowAll(false)
-    void getExercisesForPicker().then(setExercises)
+    setError(null)
+    void getExercisesForPicker()
+      .then(setExercises)
+      .catch((caught) => {
+        setError(caught instanceof Error ? caught.message : String(caught))
+        setExercises([])
+      })
   }, [open])
 
   const filtered = useMemo(() => {
@@ -89,29 +100,28 @@ export function ExercisePickerSheet({
 
   if (!open) return null
 
-  const baseHeight = `${sheetVh * 100}vh`
+  const baseHeight = `${sheetVh * 100}dvh`
   const translateY = Math.max(0, dragOffset) // only follow downward drag
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-end"
-      style={{ background: 'oklch(0 0 0 / 0.62)' }}
-      onClick={onClose}
+    <AccessibleDialog
+      open={open}
+      onClose={onClose}
+      labelledBy={titleId}
+      initialFocusRef={searchRef}
+      overlayClassName="items-end"
+      className="w-full flex flex-col rounded-t-2xl outline-none"
+      style={{
+        background: 'var(--color-surface)',
+        borderTop: '1px solid var(--color-border)',
+        paddingBottom: 'var(--app-safe-area-bottom)',
+        height: baseHeight,
+        transform: `translateY(${translateY}px)`,
+        transition: dragging.current
+          ? 'none'
+          : 'transform 260ms cubic-bezier(0.3, 0.9, 0.4, 1.1), height 260ms cubic-bezier(0.3, 0.9, 0.4, 1.1)',
+      }}
     >
-      <div
-        className="w-full flex flex-col rounded-t-2xl"
-        onClick={(e) => e.stopPropagation()}
-        style={{
-          background: 'var(--color-surface)',
-          borderTop: '1px solid var(--color-border)',
-          paddingBottom: 'var(--app-safe-area-bottom)',
-          height: baseHeight,
-          transform: `translateY(${translateY}px)`,
-          transition: dragging.current
-            ? 'none'
-            : 'transform 260ms cubic-bezier(0.3, 0.9, 0.4, 1.1), height 260ms cubic-bezier(0.3, 0.9, 0.4, 1.1)',
-        }}
-      >
         {/* Drag handle area */}
         <div
           className="pt-2 pb-1 flex justify-center cursor-grab active:cursor-grabbing"
@@ -128,13 +138,15 @@ export function ExercisePickerSheet({
           />
         </div>
         <div className="flex items-center gap-3 px-4 pb-2">
-          <h2 className="text-base font-bold flex-1">{title ?? 'Add exercise'}</h2>
+          <h2 id={titleId} className="text-base font-bold flex-1">
+            {title ?? 'Add exercise'}
+          </h2>
           {defaultMuscle && (
             <button
               type="button"
               onClick={() => setShowAll((v) => !v)}
               aria-pressed={!showAll}
-              className="text-xs font-medium px-2.5 py-1 rounded-full"
+              className="min-h-11 text-xs font-medium px-3 py-1 rounded-full"
               style={{
                 background: showAll
                   ? 'var(--color-surface-2)'
@@ -152,7 +164,7 @@ export function ExercisePickerSheet({
             type="button"
             onClick={onClose}
             aria-label="Close"
-            className="btn-ghost p-1.5"
+            className="btn-ghost min-h-11 min-w-11 p-1.5 justify-center"
           >
             <X size={18} />
           </button>
@@ -164,8 +176,8 @@ export function ExercisePickerSheet({
               className="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--color-fg-faint)] pointer-events-none"
             />
             <input
+              ref={searchRef}
               type="search"
-              autoFocus
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               onFocus={() => setSnap('full')}
@@ -175,7 +187,11 @@ export function ExercisePickerSheet({
           </div>
         </div>
         <div className="flex-1 overflow-y-auto">
-          {exercises === null ? (
+          {error ? (
+            <div className="p-4">
+              <ErrorAlert message={error} />
+            </div>
+          ) : exercises === null ? (
             <p className="p-6 text-[var(--color-fg-faint)] text-sm text-center">
               Loading…
             </p>
@@ -190,7 +206,7 @@ export function ExercisePickerSheet({
                   <button
                     type="button"
                     onClick={() => onPick(e.id)}
-                    className="w-full text-left px-4 py-3 hover:bg-[var(--color-surface-2)]"
+                    className="min-h-11 w-full text-left px-4 py-3 hover:bg-[var(--color-surface-2)]"
                   >
                     <div className="font-semibold">{e.name}</div>
                     <div className="text-xs text-[var(--color-fg-faint)] mt-0.5">
@@ -206,7 +222,6 @@ export function ExercisePickerSheet({
             </ul>
           )}
         </div>
-      </div>
-    </div>
+    </AccessibleDialog>
   )
 }

@@ -1,4 +1,10 @@
-import { type ReactNode, useEffect, useLayoutEffect, useMemo } from 'react'
+import {
+  type ReactNode,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+} from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
 import {
   BarChart3,
@@ -31,11 +37,34 @@ function activeTabIndex(pathname: string): number {
   return -1
 }
 
+function routeTitle(pathname: string): string {
+  if (pathname === '/') return 'Today'
+  if (pathname === '/library/new') return 'New exercise'
+  if (pathname.startsWith('/library/') && pathname.endsWith('/history')) {
+    return 'Exercise history'
+  }
+  if (pathname.startsWith('/library/')) return 'Edit exercise'
+  if (pathname === '/library') return 'Exercise library'
+  if (pathname.startsWith('/programs/')) return 'Edit program'
+  if (pathname === '/programs') return 'Programs'
+  if (pathname.startsWith('/history/')) return 'Workout details'
+  if (pathname === '/history') return 'Workout history'
+  if (pathname === '/stats') return 'Stats'
+  if (pathname === '/settings/ai-memory') return 'AI Memory'
+  if (pathname === '/settings') return 'Settings'
+  if (pathname === '/coach') return 'Coach'
+  if (pathname === '/workout') return 'Workout in progress'
+  if (pathname.startsWith('/preview/')) return 'Workout preview'
+  return 'Page not found'
+}
+
 export function Layout({ children }: { children: ReactNode }) {
   const { pathname } = useLocation()
   const hideTabs = HIDE_TAB_BAR_PREFIXES.some((p) => pathname.startsWith(p))
   const isCoach = pathname.startsWith('/coach')
   const idx = useMemo(() => activeTabIndex(pathname), [pathname])
+  const mainRef = useRef<HTMLElement>(null)
+  const title = useMemo(() => routeTitle(pathname), [pathname])
 
   useEffect(() => {
     // Persistent (not once) so the AudioContext is re-resumed on every tap.
@@ -47,6 +76,12 @@ export function Layout({ children }: { children: ReactNode }) {
 
   useLayoutEffect(() => installAppViewportSizing(), [])
 
+  useEffect(() => {
+    document.title = `${title} · Workout Tracker`
+    const frame = window.requestAnimationFrame(() => mainRef.current?.focus())
+    return () => window.cancelAnimationFrame(frame)
+  }, [pathname, title])
+
   return (
     <div
       data-app-shell
@@ -56,7 +91,17 @@ export function Layout({ children }: { children: ReactNode }) {
         transform: 'translate3d(0, var(--app-viewport-top), 0)',
       }}
     >
+      <a
+        href="#main-content"
+        className="absolute left-3 top-3 z-[100] -translate-y-24 rounded-lg bg-[var(--color-accent)] px-3 py-2 font-semibold text-black transition-transform focus:translate-y-0"
+      >
+        Skip to content
+      </a>
       <main
+        ref={mainRef}
+        id="main-content"
+        tabIndex={-1}
+        aria-label={title}
         className={`flex-1 min-h-0 ${
           isCoach
             ? 'overflow-hidden'
@@ -69,7 +114,7 @@ export function Layout({ children }: { children: ReactNode }) {
       {!hideTabs && (
         <nav
           aria-label="Primary"
-          className="relative flex items-stretch z-40 backdrop-blur shrink-0"
+          className="relative flex items-stretch z-40 backdrop-blur shrink-0 w-full max-w-3xl mx-auto"
           style={{
             height: 'var(--tab-bar-height)',
             paddingBottom: 'calc(var(--app-safe-area-bottom) / 2)',

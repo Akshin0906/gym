@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { ChevronRight, Eye, EyeOff, Plus, Search } from 'lucide-react'
 import { Header, SettingsLink } from '../components/Header'
+import { ErrorAlert } from '../components/Feedback'
 import { ExerciseListSkeleton } from '../components/Skeleton'
 import { listAllExercises } from '../db/repositories/exercises'
 import type { Exercise, MuscleGroup } from '../db/types'
@@ -14,9 +15,15 @@ export function LibraryScreen() {
   const [exercises, setExercises] = useState<Exercise[] | null>(null)
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<Filter>('all')
+  const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
-    void listAllExercises().then(setExercises)
+    void listAllExercises()
+      .then(setExercises)
+      .catch((caught) => {
+        setError(caught instanceof Error ? caught.message : String(caught))
+        setExercises([])
+      })
   }, [])
 
   const filtered = useMemo(() => {
@@ -53,7 +60,7 @@ export function LibraryScreen() {
         }
       />
 
-      <div className="px-4 pt-3 pb-2 space-y-3">
+      <div className="px-4 pt-3 pb-2 space-y-3 max-w-3xl mx-auto">
         <div className="relative">
           <Search
             size={16}
@@ -83,7 +90,8 @@ export function LibraryScreen() {
         </div>
       </div>
 
-      <div className="px-4 pb-8">
+      <div className="px-4 pb-8 max-w-3xl mx-auto">
+        {error && <ErrorAlert message={error} />}
         {exercises === null ? (
           <ExerciseListSkeleton />
         ) : visible.length === 0 && hidden.length === 0 ? (
@@ -123,7 +131,8 @@ function Chip({
     <button
       type="button"
       onClick={onClick}
-      className={`shrink-0 px-3 py-1.5 rounded-full text-xs font-medium border transition-colors ${
+      aria-pressed={active}
+      className={`shrink-0 min-h-11 px-3 py-1.5 rounded-full text-xs font-medium border transition-colors ${
         active
           ? 'bg-[var(--color-fg)] text-[var(--color-bg)] border-[var(--color-fg)]'
           : 'bg-transparent text-[var(--color-fg-dim)] border-[var(--color-border)] hover:text-[var(--color-fg)] hover:border-[var(--color-fg-dim)]'

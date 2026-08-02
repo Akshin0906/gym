@@ -9,6 +9,8 @@ export interface ToastNotice {
 export function ErrorAlert({ message }: { message: string }) {
   return (
     <div
+      role="alert"
+      aria-live="assertive"
       className="rounded-lg flex gap-2 px-3 py-2 text-sm"
       style={{
         background: 'oklch(0.25 0.06 25 / 0.4)',
@@ -66,7 +68,7 @@ export function Toast({
           <button
             type="button"
             onClick={action.onClick}
-            className="shrink-0 px-2 py-1 -my-1 rounded-md font-semibold text-[var(--color-accent)] hover:bg-[var(--color-surface-2)]"
+            className="shrink-0 min-h-11 px-2 py-1 -my-1 rounded-md font-semibold text-[var(--color-accent)] hover:bg-[var(--color-surface-2)]"
           >
             {action.label}
           </button>
@@ -75,7 +77,7 @@ export function Toast({
           type="button"
           onClick={onDismiss}
           aria-label="Dismiss"
-          className="p-1 -mr-1 rounded-md text-[var(--color-fg-faint)] hover:text-[var(--color-fg)] hover:bg-[var(--color-surface-2)]"
+          className="min-h-11 min-w-11 grid place-items-center -mr-1 rounded-md text-[var(--color-fg-faint)] hover:text-[var(--color-fg)] hover:bg-[var(--color-surface-2)]"
         >
           <X size={14} />
         </button>

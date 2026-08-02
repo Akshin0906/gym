@@ -8,7 +8,6 @@ import {
 import {
   deleteSet,
   isResumable,
-  RESUME_WINDOW_MS,
   restoreSet,
 } from './repositories/sessions'
 import type {
@@ -47,8 +46,8 @@ function briefing(date: string): DailyBriefing {
     sections: {
       todaysCall: 'Train chest',
       why: ['fresh'],
-      ouraRecovery: '',
-      trainingTrend: '',
+      ouraRecovery: 'Recovery data unavailable.',
+      trainingTrend: 'Training is on track.',
       watchOuts: [],
     },
     model: 'codex',
@@ -148,20 +147,22 @@ describe('export/import round-trip', () => {
   })
 })
 
-describe('isResumable (overnight resume window)', () => {
+describe('isResumable (same local calendar day)', () => {
   const now = new Date(2026, 5, 21, 8, 0).getTime() // 8:00am
 
-  it('resumes a session that crossed midnight', () => {
+  it('does not resume a session from the previous calendar day', () => {
     const lastNight = new Date(2026, 5, 20, 23, 50).getTime() // 11:50pm prior day
-    expect(isResumable(lastNight, now)).toBe(true)
+    expect(isResumable(lastNight, now)).toBe(false)
   })
 
-  it('does not resume a session older than the window', () => {
-    expect(isResumable(now - RESUME_WINDOW_MS - 1, now)).toBe(false)
+  it('resumes an earlier session from today', () => {
+    const earlierToday = new Date(2026, 5, 21, 0, 1).getTime()
+    expect(isResumable(earlierToday, now)).toBe(true)
   })
 
-  it('resumes a session within the window', () => {
-    expect(isResumable(now - RESUME_WINDOW_MS + 1, now)).toBe(true)
+  it('does not resume a future timestamp', () => {
+    const laterToday = new Date(2026, 5, 21, 9, 0).getTime()
+    expect(isResumable(laterToday, now)).toBe(false)
   })
 })
 

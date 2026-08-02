@@ -106,6 +106,8 @@ export function CoachScreen() {
   const remoteRef = useRef<CoachConversationState | null>(null)
   const proposalsRef = useRef<CoachProposal[]>([])
   const endRef = useRef<HTMLDivElement>(null)
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const shouldAutoScroll = useRef(true)
 
   const refreshLocalContext = useCallback(async () => {
     const live = await buildLiveCoachContext(preferredSessionId)
@@ -331,7 +333,13 @@ export function CoachScreen() {
   }, [refreshLocalContext, refreshRemote])
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: loading ? 'auto' : 'smooth' })
+    if (!shouldAutoScroll.current) return
+    const reduceMotion = window.matchMedia?.(
+      '(prefers-reduced-motion: reduce)',
+    ).matches
+    endRef.current?.scrollIntoView({
+      behavior: loading || reduceMotion ? 'auto' : 'smooth',
+    })
   }, [messages.length, proposals.length, loading])
 
   const proposalsByMessage = useMemo(() => {
@@ -352,6 +360,7 @@ export function CoachScreen() {
 
   async function send(text: string, reasoningEffort: CoachReasoningEffort) {
     if (sending) return
+    shouldAutoScroll.current = true
     setSending(true)
     setPageError(null)
     try {
@@ -548,16 +557,48 @@ export function CoachScreen() {
       />
       <CoachStatus remote={remote} context={context} />
 
-      <div className="flex-1 min-h-0 overflow-y-auto overscroll-y-contain">
-        <div className="max-w-md mx-auto px-3 pt-4 pb-16 space-y-3">
+      <div
+        ref={scrollRef}
+        className="flex-1 min-h-0 overflow-y-auto overscroll-y-contain"
+        onScroll={() => {
+          const element = scrollRef.current
+          if (!element) return
+          shouldAutoScroll.current =
+            element.scrollHeight - element.scrollTop - element.clientHeight <
+            120
+        }}
+      >
+        <div
+          role="log"
+          aria-live="polite"
+          aria-relevant="additions text"
+          aria-busy={loading || sending}
+          className="max-w-md mx-auto px-3 pt-4 pb-16 space-y-3"
+        >
           {pageError && (
-            <div className="rounded-xl px-3 py-2 text-sm bg-red-950/35 text-red-200 border border-red-900/50">
-              {pageError}
+            <div
+              role="alert"
+              className="rounded-xl px-3 py-3 text-sm bg-red-950/35 text-red-200 border border-red-900/50"
+            >
+              <p>{pageError}</p>
+              <button
+                type="button"
+                onClick={() => {
+                  setLoading(true)
+                  void loadInitial()
+                }}
+                className="mt-2 min-h-11 rounded-lg px-3 font-semibold text-white hover:bg-red-900/35"
+              >
+                Retry
+              </button>
             </div>
           )}
 
           {loading ? (
-            <div className="py-16 flex items-center justify-center gap-2 text-sm text-[var(--color-fg-faint)]">
+            <div
+              role="status"
+              className="py-16 flex items-center justify-center gap-2 text-sm text-[var(--color-fg-faint)]"
+            >
               <LoaderCircle size={17} className="animate-spin" /> Loading Coach…
             </div>
           ) : messages.length === 0 && proposals.length === 0 ? (
@@ -583,7 +624,10 @@ export function CoachScreen() {
 
           {orphanProposals.map(proposalCard)}
           {pendingJob && (
-            <div className="flex min-h-11 items-center gap-2 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-1.5 text-sm text-[var(--color-fg-dim)]">
+            <div
+              role="status"
+              className="flex min-h-11 items-center gap-2 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-1.5 text-sm text-[var(--color-fg-dim)]"
+            >
               {waitingForMac ? (
                 <WifiOff size={15} className="shrink-0" aria-hidden="true" />
               ) : (

@@ -95,7 +95,8 @@ export function buildWeeklyVolume(
     const v = setVolume(s.weightLbs, s.reps)
     bucket.values[exercise.primaryMuscle] =
       (bucket.values[exercise.primaryMuscle] ?? 0) + v
-    for (const m of exercise.secondaryMuscles) {
+    for (const m of new Set(exercise.secondaryMuscles)) {
+      if (m === exercise.primaryMuscle) continue
       bucket.values[m] =
         (bucket.values[m] ?? 0) + v * SECONDARY_VOLUME_WEIGHT
     }
@@ -130,7 +131,8 @@ export function buildWeeklySetCounts(
     }
     bucket.values[exercise.primaryMuscle] =
       (bucket.values[exercise.primaryMuscle] ?? 0) + 1
-    for (const m of exercise.secondaryMuscles) {
+    for (const m of new Set(exercise.secondaryMuscles)) {
+      if (m === exercise.primaryMuscle) continue
       bucket.values[m] = (bucket.values[m] ?? 0) + SECONDARY_VOLUME_WEIGHT
     }
   }

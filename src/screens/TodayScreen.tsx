@@ -15,6 +15,7 @@ import {
   getLastCompletedSessionForProgram,
   getResumableSession,
   startSession,
+  UnfinishedWorkoutError,
 } from '../db/repositories/sessions'
 import type {
   Program,
@@ -22,10 +23,12 @@ import type {
   WorkoutSession,
 } from '../db/types'
 import { useActiveWorkout } from '../store/activeWorkout'
+import { useTimer } from '../store/timer'
 
 export function TodayScreen() {
   const navigate = useNavigate()
   const { setActiveSession } = useActiveWorkout()
+  const stopRest = useTimer((s) => s.stop)
   const [state, setState] = useState<{
     resumable: WorkoutSession | null
     program: Program | null
@@ -86,7 +89,21 @@ export function TodayScreen() {
     setBusy(true)
     setError(null)
     try {
-      const id = await startSession(null, null)
+      let id: string
+      try {
+        id = await startSession(null, null)
+      } catch (err) {
+        if (!(err instanceof UnfinishedWorkoutError)) throw err
+        const confirmed = confirm(
+          'End the unfinished workout (or discard it if it is empty) and start a new workout?',
+        )
+        if (!confirmed) {
+          setBusy(false)
+          return
+        }
+        stopRest()
+        id = await startSession(null, null, { resolveExisting: true })
+      }
       setActiveSession(id)
       navigate('/workout')
     } catch (err) {

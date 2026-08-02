@@ -23,13 +23,19 @@ export function CountUp({
     const to = value
     if (from === to) return
 
+    if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
+      setDisplay(to)
+      prevRef.current = to
+      return
+    }
+
     if (rafRef.current !== null) cancelAnimationFrame(rafRef.current)
     startRef.current = null
 
     const tick = (t: number) => {
       if (startRef.current === null) startRef.current = t
       const elapsed = t - startRef.current
-      const p = Math.min(1, elapsed / duration)
+      const p = duration <= 0 ? 1 : Math.min(1, elapsed / duration)
       const eased = 1 - Math.pow(1 - p, 3)
       const v = from + (to - from) * eased
       setDisplay(Math.round(v))

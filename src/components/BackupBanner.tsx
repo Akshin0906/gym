@@ -4,6 +4,8 @@ import {
   buildExportPayload,
   downloadExport,
 } from '../db/repositories/exportImport'
+import { db } from '../db/schema'
+import { ErrorAlert } from './Feedback'
 import { countSessions, countSets } from '../db/repositories/sessions'
 import {
   daysSince,
@@ -16,30 +18,56 @@ export function BackupBanner() {
   const [show, setShow] = useState(false)
   const [lastExportAt, setLastExportAt] = useState<number | null>(null)
   const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
 
   const refresh = useCallback(async () => {
     const lea = getLastExportAt()
-    const [setCount, sessionCount] = await Promise.all([
+    const [
+      setCount,
+      sessionCount,
+      programCount,
+      customExerciseCount,
+      noteCount,
+      summaryCount,
+      memorySettings,
+    ] = await Promise.all([
       countSets(),
       countSessions(),
+      db.programs.count(),
+      db.exercises.filter((exercise) => exercise.isCustom).count(),
+      db.aiNotes.count(),
+      db.aiMemorySummaries.count(),
+      db.aiMemorySettings.get('default'),
     ])
-    const hasAnyData = setCount > 0 || sessionCount > 0
+    const hasAnyData =
+      setCount > 0 ||
+      sessionCount > 0 ||
+      programCount > 0 ||
+      customExerciseCount > 0 ||
+      noteCount > 0 ||
+      summaryCount > 0 ||
+      Boolean(memorySettings?.currentContext.trim())
     setLastExportAt(lea)
     setShow(shouldRemindToBackup(lea, hasAnyData))
   }, [])
 
   useEffect(() => {
-    void refresh()
+    void refresh().catch((caught) => {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    })
   }, [refresh])
 
   async function handleExport() {
     if (busy) return
     setBusy(true)
+    setError(null)
     try {
       const payload = await buildExportPayload()
       downloadExport(payload)
       markExportedNow()
       await refresh()
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
     } finally {
       setBusy(false)
     }
@@ -79,6 +107,11 @@ export function BackupBanner() {
           <Download size={16} strokeWidth={2.25} />
           {busy ? 'Exporting…' : 'Export now'}
         </button>
+        {error && (
+          <div className="mt-3">
+            <ErrorAlert message={error} />
+          </div>
+        )}
       </div>
     </div>
   )

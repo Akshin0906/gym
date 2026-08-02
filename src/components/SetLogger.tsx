@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Check, Pencil, Sparkles, Timer, Trash2, X } from 'lucide-react'
+import { Check, Pencil, Timer, Trash2, X } from 'lucide-react'
 import {
   deleteSet,
   logSet,
@@ -17,10 +17,7 @@ interface Props {
   previousSets: LoggedSet[]
   defaultRestSeconds: number
   onChange: () => void
-  onStartRest?: (seconds: number) => void
-  // Fires only on a newly logged set, with that set's number (== the exercise's
-  // set count after the insert). Lets the parent auto-collapse at target.
-  onSetLogged?: (loggedSetNumber: number) => void
+  onStartRest?: (seconds: number, loggedSetCount: number) => void
 }
 
 export function SetLogger({
@@ -31,20 +28,11 @@ export function SetLogger({
   defaultRestSeconds,
   onChange,
   onStartRest,
-  onSetLogged,
 }: Props) {
-  const [recentPrId, setRecentPrId] = useState<string | null>(null)
   // Holds the just-deleted set so the Undo toast can re-insert it.
   const [undo, setUndo] = useState<{ notice: ToastNotice; set: LoggedSet } | null>(
     null,
   )
-
-  // Clear the PR flash after its animation completes.
-  useEffect(() => {
-    if (!recentPrId) return
-    const t = window.setTimeout(() => setRecentPrId(null), 6000)
-    return () => window.clearTimeout(t)
-  }, [recentPrId])
 
   const handleDelete = useCallback(
     async (set: LoggedSet) => {
@@ -94,7 +82,6 @@ export function SetLogger({
             <SetRow
               key={s.id}
               set={s}
-              prFlash={s.id === recentPrId}
               onChange={onChange}
               onDelete={() => void handleDelete(s)}
             />
@@ -112,10 +99,8 @@ export function SetLogger({
         }
         previousSet={existingSets.at(-1) ?? previousSets.at(-1) ?? null}
         defaultRestSeconds={defaultRestSeconds}
-        onLogged={(setId, isPR, setNumber) => {
-          if (isPR) setRecentPrId(setId)
+        onLogged={() => {
           onChange()
-          onSetLogged?.(setNumber)
         }}
         onStartRest={onStartRest}
       />
@@ -140,12 +125,10 @@ function SetNumberBadge({ n }: { n: number }) {
 
 function SetRow({
   set,
-  prFlash,
   onChange,
   onDelete,
 }: {
   set: LoggedSet
-  prFlash: boolean
   onChange: () => void
   onDelete: () => void
 }) {
@@ -275,9 +258,7 @@ function SetRow({
       </button>
       {/* Set row content (slides) */}
       <div
-        className={`flex items-center gap-3 pl-2 pr-3 py-2 rounded-xl bg-[var(--color-surface)] border border-[var(--color-border)] relative ${
-          prFlash ? 'pr-flash' : ''
-        }`}
+        className="flex items-center gap-3 pl-2 pr-2 py-2 rounded-xl bg-[var(--color-surface)] border border-[var(--color-border)] relative"
         style={{
           transform: `translateX(${dragX}px)`,
           transition: startX.current === null ? 'transform 220ms cubic-bezier(0.3, 0.9, 0.4, 1.1)' : 'none',
@@ -310,11 +291,6 @@ function SetRow({
               @{set.rpe}
             </span>
           )}
-          {prFlash && (
-            <span className="pr-pill ml-2">
-              <Sparkles size={10} strokeWidth={2.5} /> PR
-            </span>
-          )}
         </div>
         <button
           type="button"
@@ -323,9 +299,20 @@ function SetRow({
             setEditing(true)
           }}
           aria-label="Edit set"
-          className="p-2 text-[var(--color-fg-faint)] hover:text-[var(--color-fg)]"
+          className="min-h-11 min-w-11 grid place-items-center text-[var(--color-fg-faint)] hover:text-[var(--color-fg)]"
         >
           <Pencil size={16} />
+        </button>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation()
+            onDelete()
+          }}
+          aria-label="Delete set"
+          className="min-h-11 min-w-11 grid place-items-center text-[var(--color-fg-faint)] hover:text-red-400"
+        >
+          <Trash2 size={16} />
         </button>
       </div>
     </li>
@@ -346,14 +333,19 @@ function NewSetRow({
   nextSetNumber: number
   previousSet: LoggedSet | null
   defaultRestSeconds: number
-  onLogged: (setId: string, isPR: boolean, setNumber: number) => void
-  onStartRest?: (seconds: number) => void
+  onLogged: () => void
+  onStartRest?: (seconds: number, loggedSetCount: number) => void
 }) {
   const [w, setW] = useState(previousSet ? String(previousSet.weightLbs) : '')
   const [r, setR] = useState(previousSet ? String(previousSet.reps) : '')
   const [rpe, setRpe] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const committedSetCountRef = useRef(nextSetNumber - 1)
+
+  useEffect(() => {
+    committedSetCountRef.current = nextSetNumber - 1
+  }, [nextSetNumber])
 
   async function submit() {
     if (busy) return
@@ -371,7 +363,10 @@ function NewSetRow({
       // in-gym action, otherwise silent.
       vibrate(10)
       setRpe('')
-      onLogged(result.id, result.isPR, result.setNumber)
+      // Update synchronously before the IndexedDB refresh/rerender. A fast tap
+      // on Start Rest must see the just-committed final set.
+      committedSetCountRef.current = result.setNumber
+      onLogged()
       // Rest timer does NOT auto-start on log — start it manually with the
       // Timer button below. (onStartRest is still wired to that button.)
     } catch (err) {
@@ -424,7 +419,10 @@ function NewSetRow({
         {onStartRest && (
           <button
             type="button"
-            onClick={() => onStartRest(defaultRestSeconds)}
+            disabled={busy}
+            onClick={() =>
+              onStartRest(defaultRestSeconds, committedSetCountRef.current)
+            }
             aria-label={`Start ${defaultRestSeconds}s rest`}
             className="btn-secondary text-sm px-3"
           >

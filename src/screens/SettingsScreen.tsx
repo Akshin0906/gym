@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import {
   Activity,
   AlertCircle,
@@ -59,8 +59,11 @@ import {
   ymd,
   type OuraPersonalInfo,
 } from '../lib/oura'
+import { useActiveWorkout } from '../store/activeWorkout'
+import { useTimer } from '../store/timer'
 
 export function SettingsScreen() {
+  const navigate = useNavigate()
   const fileRef = useRef<HTMLInputElement>(null)
   const [exporting, setExporting] = useState(false)
   const [importing, setImporting] = useState(false)
@@ -106,12 +109,16 @@ export function SettingsScreen() {
     try {
       const backup = await buildExportPayload()
       downloadExport(backup)
+      markExportedNow()
       const text = await file.text()
       const result = await importPayload(text)
+      useActiveWorkout.getState().setActiveSession(null)
+      useTimer.getState().stop()
       const totals = Object.entries(result.imported)
         .map(([k, n]) => `${n} ${k}`)
         .join(', ')
-      showToast(`Import complete: ${totals}.`)
+      showToast(`Import complete: ${totals}. Returning to Today…`)
+      window.setTimeout(() => navigate('/', { replace: true }), 1600)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
@@ -173,6 +180,7 @@ export function SettingsScreen() {
             ref={fileRef}
             type="file"
             accept="application/json,.json"
+            aria-label="Choose workout backup JSON file"
             className="hidden"
             onChange={(e) => {
               const file = e.target.files?.[0]
@@ -343,7 +351,11 @@ function CloudSyncSection({
             void handlePair()
           }}
         >
+          <label htmlFor="cloud-pairing-code" className="sr-only">
+            Cloud pairing code
+          </label>
           <input
+            id="cloud-pairing-code"
             type="password"
             autoComplete="one-time-code"
             value={pairingSecret}
@@ -351,7 +363,11 @@ function CloudSyncSection({
             placeholder="Pairing code"
             className="field font-mono"
           />
+          <label htmlFor="cloud-device-name" className="sr-only">
+            Device name
+          </label>
           <input
+            id="cloud-device-name"
             type="text"
             autoComplete="off"
             value={deviceName}
@@ -400,10 +416,10 @@ function CloudSyncSection({
         )}
         {syncing ? 'Syncing…' : 'Sync now'}
       </button>
-      {status.lastSnapshotError && (
+      {configured && status.lastSnapshotError && (
         <ErrorAlert message={`Cloud sync failed: ${status.lastSnapshotError}`} />
       )}
-      {status.lastMemoryError && (
+      {configured && status.lastMemoryError && (
         <ErrorAlert message={`Cloud memory failed: ${status.lastMemoryError}`} />
       )}
       {authError && <ErrorAlert message={authError} />}
@@ -416,9 +432,13 @@ function AiMemorySettingsLink() {
 
   useEffect(() => {
     let cancelled = false
-    void ensureAiMemorySettings().then((settings) => {
-      if (!cancelled) setStatus(settings.paused ? 'Stopped' : 'Running')
-    })
+    void ensureAiMemorySettings()
+      .then((settings) => {
+        if (!cancelled) setStatus(settings.paused ? 'Stopped' : 'Running')
+      })
+      .catch(() => {
+        if (!cancelled) setStatus('Unavailable')
+      })
     return () => {
       cancelled = true
     }
@@ -451,11 +471,19 @@ function StorageSection() {
   const [status, setStatus] = useState<PersistStatus | null>(null)
   const [usage, setUsage] = useState<StorageUsage | null>(null)
   const [busy, setBusy] = useState(false)
+  const [requestResult, setRequestResult] = useState<string | null>(null)
 
   const load = useCallback(async () => {
-    const [s, u] = await Promise.all([getPersistStatus(), getStorageUsage()])
-    setStatus(s)
-    setUsage(u)
+    try {
+      const [s, u] = await Promise.all([getPersistStatus(), getStorageUsage()])
+      setStatus(s)
+      setUsage(u)
+    } catch (caught) {
+      setStatus('unsupported')
+      setRequestResult(
+        caught instanceof Error ? caught.message : String(caught),
+      )
+    }
   }, [])
 
   useEffect(() => {
@@ -466,7 +494,15 @@ function StorageSection() {
     if (busy) return
     setBusy(true)
     try {
-      setStatus(await requestPersist())
+      const next = await requestPersist()
+      setStatus(next)
+      setRequestResult(
+        next === 'persisted'
+          ? 'Persistent storage was granted.'
+          : next === 'transient'
+            ? 'The browser did not grant persistent storage. Keep exporting backups regularly.'
+            : 'Persistent storage is not available in this browser.',
+      )
     } finally {
       setBusy(false)
     }
@@ -531,6 +567,11 @@ function StorageSection() {
           {usageLabel && (
             <p className="text-xs text-[var(--color-fg-faint)] px-1 nums">
               {usageLabel}
+            </p>
+          )}
+          {requestResult && (
+            <p role="status" className="text-sm text-[var(--color-fg-dim)] px-1">
+              {requestResult}
             </p>
           )}
         </>
@@ -737,7 +778,11 @@ function SetupBody({
         }}
         className="space-y-2"
       >
+        <label htmlFor="oura-client-id" className="sr-only">
+          Oura Client ID
+        </label>
         <input
+          id="oura-client-id"
           type="text"
           autoComplete="off"
           value={clientIdInput}

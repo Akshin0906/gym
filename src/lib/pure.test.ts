@@ -105,6 +105,15 @@ describe('buildWeeklyVolume', () => {
     expect(rows).toHaveLength(1)
     expect(rows[0].values.chest).toBe(1000)
   })
+
+  it('does not double-credit duplicate or primary secondary muscles', () => {
+    const exercises = new Map([
+      ['bench', ex('bench', 'chest', ['chest', 'triceps', 'triceps'])],
+    ])
+    const rows = buildWeeklyVolume([set('bench', 100, 10, week1a)], exercises)
+    expect(rows[0].values.chest).toBe(1000)
+    expect(rows[0].values.triceps).toBe(500)
+  })
 })
 
 describe('buildWeeklySetCounts', () => {
@@ -148,6 +157,18 @@ describe('buildWeeklySetCounts', () => {
     )
     expect(rows).toHaveLength(1)
     expect(rows[0].values.chest).toBe(1)
+  })
+
+  it('deduplicates legacy secondary-muscle values', () => {
+    const exercises = new Map([
+      ['bench', ex('bench', 'chest', ['chest', 'triceps', 'triceps'])],
+    ])
+    const rows = buildWeeklySetCounts(
+      [set('bench', 100, 10, week1a)],
+      exercises,
+    )
+    expect(rows[0].values.chest).toBe(1)
+    expect(rows[0].values.triceps).toBe(0.5)
   })
 })
 

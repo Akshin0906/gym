@@ -1,6 +1,12 @@
 import { lazy, Suspense } from 'react'
-import { BrowserRouter, Route, Routes } from 'react-router-dom'
+import {
+  createBrowserRouter,
+  Outlet,
+  RouterProvider,
+  useLocation,
+} from 'react-router-dom'
 import { Layout } from './components/Layout'
+import { RouteErrorBoundary, RouteLoading } from './components/RouteFeedback'
 import { TodayScreen } from './screens/TodayScreen'
 
 // TodayScreen is the landing route — keep it eager so first paint never shows a
@@ -14,6 +20,11 @@ const LibraryScreen = lazy(() =>
 const ExerciseEditScreen = lazy(() =>
   import('./screens/ExerciseEditScreen').then((m) => ({
     default: m.ExerciseEditScreen,
+  })),
+)
+const ExerciseHistoryScreen = lazy(() =>
+  import('./screens/ExerciseHistoryScreen').then((m) => ({
+    default: m.ExerciseHistoryScreen,
   })),
 )
 const ActiveWorkoutScreen = lazy(() =>
@@ -68,30 +79,47 @@ const NotFoundScreen = lazy(() =>
   })),
 )
 
-export function App() {
+function RoutedApp() {
+  const { pathname } = useLocation()
+
   return (
-    <BrowserRouter>
-      <Layout>
-        <Suspense fallback={null}>
-          <Routes>
-            <Route path="/" element={<TodayScreen />} />
-            <Route path="/library" element={<LibraryScreen />} />
-            <Route path="/library/new" element={<ExerciseEditScreen />} />
-            <Route path="/library/:id" element={<ExerciseEditScreen />} />
-            <Route path="/programs" element={<ProgramsScreen />} />
-            <Route path="/programs/:id" element={<ProgramEditorScreen />} />
-            <Route path="/history" element={<HistoryScreen />} />
-            <Route path="/history/:sessionId" element={<SessionDetailScreen />} />
-            <Route path="/stats" element={<StatsScreen />} />
-            <Route path="/settings" element={<SettingsScreen />} />
-            <Route path="/settings/ai-memory" element={<AiMemoryScreen />} />
-            <Route path="/coach" element={<CoachScreen />} />
-            <Route path="/workout" element={<ActiveWorkoutScreen />} />
-            <Route path="/preview/:templateId" element={<SessionPreviewScreen />} />
-            <Route path="*" element={<NotFoundScreen />} />
-          </Routes>
+    <Layout>
+      <RouteErrorBoundary key={pathname}>
+        <Suspense fallback={<RouteLoading />}>
+          <Outlet />
         </Suspense>
-      </Layout>
-    </BrowserRouter>
+      </RouteErrorBoundary>
+    </Layout>
   )
+}
+
+const router = createBrowserRouter([
+  {
+    element: <RoutedApp />,
+    children: [
+      { path: '/', element: <TodayScreen /> },
+      { path: '/library', element: <LibraryScreen /> },
+      { path: '/library/new', element: <ExerciseEditScreen /> },
+      {
+        path: '/library/:id/history',
+        element: <ExerciseHistoryScreen />,
+      },
+      { path: '/library/:id', element: <ExerciseEditScreen /> },
+      { path: '/programs', element: <ProgramsScreen /> },
+      { path: '/programs/:id', element: <ProgramEditorScreen /> },
+      { path: '/history', element: <HistoryScreen /> },
+      { path: '/history/:sessionId', element: <SessionDetailScreen /> },
+      { path: '/stats', element: <StatsScreen /> },
+      { path: '/settings', element: <SettingsScreen /> },
+      { path: '/settings/ai-memory', element: <AiMemoryScreen /> },
+      { path: '/coach', element: <CoachScreen /> },
+      { path: '/workout', element: <ActiveWorkoutScreen /> },
+      { path: '/preview/:templateId', element: <SessionPreviewScreen /> },
+      { path: '*', element: <NotFoundScreen /> },
+    ],
+  },
+])
+
+export function App() {
+  return <RouterProvider router={router} />
 }

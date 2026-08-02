@@ -14,7 +14,6 @@ import {
 interface Env extends CloudAuthEnv {
   CLOUD_PAIRING_SECRET: string
   WORKOUT_DB: D1Database
-  LLM_RATE?: KVNamespace
 }
 
 interface PagesContext {
@@ -23,18 +22,8 @@ interface PagesContext {
   params: { path?: string | string[] }
 }
 
-interface KVNamespace {
-  get(key: string): Promise<string | null>
-  put(
-    key: string,
-    value: string,
-    options?: { expirationTtl?: number },
-  ): Promise<void>
-}
-
 const PAIR_ATTEMPT_LIMIT = 5
 const PAIR_ATTEMPT_WINDOW_SECONDS = 900
-const PAIR_ATTEMPT_TTL_SECONDS = 1800
 
 function json(
   status: number,
@@ -52,7 +41,7 @@ function json(
 }
 
 function isObject(v: unknown): v is Record<string, unknown> {
-  return v !== null && typeof v === 'object'
+  return v !== null && typeof v === 'object' && !Array.isArray(v)
 }
 
 function routePath(ctx: PagesContext): string {
@@ -68,21 +57,37 @@ function clientIp(request: Request): string {
   )
 }
 
-async function isWithinPairAttemptLimit(
-  kv: KVNamespace,
+export async function isWithinPairAttemptLimit(
+  db: D1Database,
   request: Request,
 ): Promise<boolean> {
-  const bucket = Math.floor(
-    Date.now() / (PAIR_ATTEMPT_WINDOW_SECONDS * 1000),
-  )
-  const key = `cloud_pair:${clientIp(request)}:${bucket}`
-  const raw = await kv.get(key)
-  const count = raw ? Number(raw) : 0
-  if (count >= PAIR_ATTEMPT_LIMIT) return false
-  await kv.put(key, String(count + 1), {
-    expirationTtl: PAIR_ATTEMPT_TTL_SECONDS,
-  })
-  return true
+  const now = Date.now()
+  const windowMs = PAIR_ATTEMPT_WINDOW_SECONDS * 1000
+  const windowStartedAt = Math.floor(now / windowMs) * windowMs
+  // Never persist a raw client IP. More importantly, the single D1 UPSERT is
+  // atomic: concurrent requests cannot all read the same counter and overwrite
+  // each other, which is possible with a KV get/put pair.
+  const clientHash = await sha256Hex(clientIp(request))
+  const row = await db
+    .prepare(
+      `INSERT INTO cloud_pair_attempts
+         (client_hash, window_started_at, attempt_count, expires_at)
+       VALUES (?, ?, 1, ?)
+       ON CONFLICT(client_hash, window_started_at) DO UPDATE SET
+         attempt_count = cloud_pair_attempts.attempt_count + 1,
+         expires_at = excluded.expires_at
+       RETURNING attempt_count`,
+    )
+    .bind(
+      clientHash,
+      windowStartedAt,
+      windowStartedAt + windowMs * 2,
+    )
+    .first<{ attempt_count: number }>()
+  if (!row || !Number.isInteger(row.attempt_count)) {
+    throw new Error('pairing rate limiter did not return an attempt count')
+  }
+  return row.attempt_count <= PAIR_ATTEMPT_LIMIT
 }
 
 function sessionBody(session: {
@@ -122,12 +127,7 @@ async function handlePair(ctx: PagesContext): Promise<Response> {
       error: 'server_misconfigured: CLOUD_PAIRING_SECRET unset',
     })
   }
-  if (!ctx.env.LLM_RATE) {
-    return json(500, {
-      error: 'server_misconfigured: LLM_RATE unset',
-    })
-  }
-  if (!(await isWithinPairAttemptLimit(ctx.env.LLM_RATE, ctx.request))) {
+  if (!(await isWithinPairAttemptLimit(ctx.env.WORKOUT_DB, ctx.request))) {
     return json(429, { error: 'rate_limited' })
   }
 

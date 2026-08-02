@@ -124,6 +124,29 @@ const ACTION_SCOPES = [
   'ai_memory',
 ] as const
 type ActionScope = (typeof ACTION_SCOPES)[number]
+type ValidatedAction = Record<string, unknown> & { type: string }
+const MUSCLE_GROUPS = [
+  'chest',
+  'back',
+  'shoulders',
+  'biceps',
+  'triceps',
+  'forearms',
+  'quads',
+  'hamstrings',
+  'glutes',
+  'calves',
+  'abs',
+  'traps',
+] as const
+type MuscleGroup = (typeof MUSCLE_GROUPS)[number]
+
+interface ValidatedActionPlan {
+  title: string
+  summary: string
+  scope: ActionScope
+  actions: ValidatedAction[]
+}
 
 class ApiError extends Error {
   readonly status: number
@@ -270,7 +293,373 @@ function isActionScope(value: unknown): value is ActionScope {
   )
 }
 
-function trustedActionStateHash(
+function invalidActionPlan(detail: string): never {
+  throw new ApiError(400, 'invalid_action_plan', detail)
+}
+
+function actionString(
+  value: unknown,
+  field: string,
+  maxLength = 120,
+): string {
+  if (typeof value !== 'string') invalidActionPlan(`${field} must be text`)
+  const trimmed = value.trim()
+  if (!trimmed) invalidActionPlan(`${field} is required`)
+  if (trimmed.length > maxLength) invalidActionPlan(`${field} is too long`)
+  return trimmed
+}
+
+function actionPositiveInteger(value: unknown, field: string): number {
+  if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > 20) {
+    invalidActionPlan(`${field} must be a whole number from 1 to 20`)
+  }
+  return value as number
+}
+
+function actionNonNegativeInteger(value: unknown, field: string): number {
+  if (!Number.isInteger(value) || (value as number) < 0 || (value as number) > 1000) {
+    invalidActionPlan(`${field} must be a whole number from 0 to 1000`)
+  }
+  return value as number
+}
+
+function actionBoundedInteger(
+  value: unknown,
+  field: string,
+  minimum: number,
+  maximum: number,
+): number {
+  if (
+    !Number.isInteger(value) ||
+    (value as number) < minimum ||
+    (value as number) > maximum
+  ) {
+    invalidActionPlan(
+      `${field} must be a whole number from ${minimum} to ${maximum}`,
+    )
+  }
+  return value as number
+}
+
+function actionBoundedText(
+  value: unknown,
+  field: string,
+  maxLength: number,
+): string {
+  if (typeof value !== 'string') invalidActionPlan(`${field} must be text`)
+  const trimmed = value.trim()
+  if (trimmed.length > maxLength) invalidActionPlan(`${field} is too long`)
+  return trimmed
+}
+
+function actionNullableId(value: unknown, field: string): string | null {
+  if (value === null) return null
+  return actionString(value, field, 200)
+}
+
+function actionMuscleGroup(value: unknown, field: string): MuscleGroup {
+  if (
+    typeof value !== 'string' ||
+    !(MUSCLE_GROUPS as readonly string[]).includes(value)
+  ) {
+    invalidActionPlan(`${field} is not a supported muscle group`)
+  }
+  return value as MuscleGroup
+}
+
+function actionSecondaryMuscles(
+  value: unknown,
+  field: string,
+  primaryMuscle: MuscleGroup,
+): MuscleGroup[] {
+  if (!Array.isArray(value) || value.length > MUSCLE_GROUPS.length - 1) {
+    invalidActionPlan(`${field} must be a list of muscle groups`)
+  }
+  const parsed = value.map((item, index) =>
+    actionMuscleGroup(item, `${field}[${index}]`),
+  )
+  if (new Set(parsed).size !== parsed.length) {
+    invalidActionPlan(`${field} contains a duplicate muscle group`)
+  }
+  if (parsed.includes(primaryMuscle)) {
+    invalidActionPlan(`${field} cannot include the primary muscle group`)
+  }
+  return parsed
+}
+
+function validatePlannedExercises(
+  value: unknown,
+  field: string,
+): Record<string, unknown>[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 30) {
+    invalidActionPlan(`${field} must contain 1 to 30 exercises`)
+  }
+  const exercises = value.map((raw, index) => {
+    if (!isObject(raw)) invalidActionPlan(`${field}[${index}] must be an object`)
+    return {
+      exerciseId: actionString(raw.exerciseId, `${field}[${index}].exerciseId`, 200),
+      targetSets: actionPositiveInteger(
+        raw.targetSets,
+        `${field}[${index}].targetSets`,
+      ),
+      repRange: actionString(raw.repRange, `${field}[${index}].repRange`, 50),
+    }
+  })
+  if (new Set(exercises.map((exercise) => exercise.exerciseId)).size !== exercises.length) {
+    invalidActionPlan(`${field} contains a duplicate exercise`)
+  }
+  return exercises
+}
+
+function validateReplacementSessions(
+  value: unknown,
+  field: string,
+): Record<string, unknown>[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 20) {
+    invalidActionPlan(`${field} must contain 1 to 20 sessions`)
+  }
+  const sessions = value.map((raw, index) => {
+    if (!isObject(raw)) invalidActionPlan(`${field}[${index}] must be an object`)
+    return {
+      sessionTemplateId: actionNullableId(
+        raw.sessionTemplateId,
+        `${field}[${index}].sessionTemplateId`,
+      ),
+      name: actionString(raw.name, `${field}[${index}].name`),
+      exercises: validatePlannedExercises(
+        raw.exercises,
+        `${field}[${index}].exercises`,
+      ),
+    }
+  })
+  const names = sessions.map((session) =>
+    (session.name as string).toLocaleLowerCase(),
+  )
+  if (new Set(names).size !== names.length) {
+    invalidActionPlan(`${field} has duplicate names`)
+  }
+  const retainedIds = sessions
+    .map((session) => session.sessionTemplateId)
+    .filter((id): id is string => id !== null)
+  if (new Set(retainedIds).size !== retainedIds.length) {
+    invalidActionPlan(`${field} has duplicate session template IDs`)
+  }
+  return sessions
+}
+
+function validateAction(raw: unknown, index: number): ValidatedAction {
+  if (!isObject(raw)) invalidActionPlan(`actions[${index}] must be an object`)
+  const field = `actions[${index}]`
+  const type = actionString(raw.type, `${field}.type`)
+  switch (type) {
+    case 'swap_active_exercise':
+      return {
+        type,
+        sessionId: actionString(raw.sessionId, `${field}.sessionId`, 200),
+        fromExerciseId: actionString(
+          raw.fromExerciseId,
+          `${field}.fromExerciseId`,
+          200,
+        ),
+        toExerciseId: actionString(raw.toExerciseId, `${field}.toExerciseId`, 200),
+        targetSets: actionPositiveInteger(raw.targetSets, `${field}.targetSets`),
+        repRange: actionString(raw.repRange, `${field}.repRange`, 50),
+      }
+    case 'add_active_exercise':
+      return {
+        type,
+        sessionId: actionString(raw.sessionId, `${field}.sessionId`, 200),
+        exerciseId: actionString(raw.exerciseId, `${field}.exerciseId`, 200),
+        position: actionNonNegativeInteger(raw.position, `${field}.position`),
+        targetSets: actionPositiveInteger(raw.targetSets, `${field}.targetSets`),
+        repRange: actionString(raw.repRange, `${field}.repRange`, 50),
+      }
+    case 'update_active_exercise_targets':
+      return {
+        type,
+        sessionId: actionString(raw.sessionId, `${field}.sessionId`, 200),
+        exerciseId: actionString(raw.exerciseId, `${field}.exerciseId`, 200),
+        targetSets: actionPositiveInteger(raw.targetSets, `${field}.targetSets`),
+        repRange: actionString(raw.repRange, `${field}.repRange`, 50),
+      }
+    case 'create_one_time_workout':
+      return {
+        type,
+        name: actionString(raw.name, `${field}.name`),
+        exercises: validatePlannedExercises(raw.exercises, `${field}.exercises`),
+      }
+    case 'create_session_template':
+      return {
+        type,
+        programId: actionString(raw.programId, `${field}.programId`, 200),
+        name: actionString(raw.name, `${field}.name`),
+        exercises: validatePlannedExercises(raw.exercises, `${field}.exercises`),
+      }
+    case 'create_program': {
+      if (!Array.isArray(raw.sessions) || raw.sessions.length < 1 || raw.sessions.length > 20) {
+        invalidActionPlan(`${field}.sessions must contain 1 to 20 sessions`)
+      }
+      const sessions = raw.sessions.map((session, sessionIndex) => {
+        if (!isObject(session)) {
+          invalidActionPlan(`${field}.sessions[${sessionIndex}] must be an object`)
+        }
+        return {
+          name: actionString(
+            session.name,
+            `${field}.sessions[${sessionIndex}].name`,
+          ),
+          exercises: validatePlannedExercises(
+            session.exercises,
+            `${field}.sessions[${sessionIndex}].exercises`,
+          ),
+        }
+      })
+      const names = sessions.map((session) => session.name.toLocaleLowerCase())
+      if (new Set(names).size !== names.length) {
+        invalidActionPlan(`${field}.sessions has duplicate names`)
+      }
+      return {
+        type,
+        name: actionString(raw.name, `${field}.name`),
+        sessions,
+      }
+    }
+    case 'rename_program':
+      return {
+        type,
+        programId: actionString(raw.programId, `${field}.programId`, 200),
+        name: actionString(raw.name, `${field}.name`),
+      }
+    case 'replace_program':
+      return {
+        type,
+        programId: actionString(raw.programId, `${field}.programId`, 200),
+        name: actionString(raw.name, `${field}.name`),
+        sessions: validateReplacementSessions(raw.sessions, `${field}.sessions`),
+      }
+    case 'archive_program':
+      return {
+        type,
+        programId: actionString(raw.programId, `${field}.programId`, 200),
+      }
+    case 'replace_session_template':
+      return {
+        type,
+        sessionTemplateId: actionString(
+          raw.sessionTemplateId,
+          `${field}.sessionTemplateId`,
+          200,
+        ),
+        name: actionString(raw.name, `${field}.name`),
+        exercises: validatePlannedExercises(raw.exercises, `${field}.exercises`),
+      }
+    case 'delete_session_template':
+      return {
+        type,
+        sessionTemplateId: actionString(
+          raw.sessionTemplateId,
+          `${field}.sessionTemplateId`,
+          200,
+        ),
+      }
+    case 'create_custom_exercise': {
+      const primaryMuscle = actionMuscleGroup(
+        raw.primaryMuscle,
+        `${field}.primaryMuscle`,
+      )
+      return {
+        type,
+        name: actionString(raw.name, `${field}.name`),
+        primaryMuscle,
+        secondaryMuscles: actionSecondaryMuscles(
+          raw.secondaryMuscles,
+          `${field}.secondaryMuscles`,
+          primaryMuscle,
+        ),
+        notes: actionBoundedText(raw.notes, `${field}.notes`, 2000),
+        defaultRestSeconds: actionBoundedInteger(
+          raw.defaultRestSeconds,
+          `${field}.defaultRestSeconds`,
+          1,
+          3600,
+        ),
+      }
+    }
+    case 'save_ai_note':
+      return {
+        type,
+        body: actionString(raw.body, `${field}.body`, 1000),
+      }
+    default:
+      return invalidActionPlan(`Unsupported Coach action: ${type}`)
+  }
+}
+
+export function validateActionPlan(value: unknown): ValidatedActionPlan {
+  if (!isObject(value)) invalidActionPlan('actionPlan must be an object')
+  if (!isActionScope(value.scope)) invalidActionPlan('actionPlan has an invalid scope')
+  if (!Array.isArray(value.actions) || value.actions.length < 1 || value.actions.length > 12) {
+    invalidActionPlan('actionPlan must contain 1 to 12 actions')
+  }
+  const plan: ValidatedActionPlan = {
+    title: actionString(value.title, 'actionPlan.title'),
+    summary: actionString(value.summary, 'actionPlan.summary', 1000),
+    scope: value.scope,
+    actions: value.actions.map(validateAction),
+  }
+  const activeTypes = new Set([
+    'swap_active_exercise',
+    'add_active_exercise',
+    'update_active_exercise_targets',
+  ])
+  if (plan.scope === 'active_workout') {
+    if (!plan.actions.every((action) => activeTypes.has(action.type))) {
+      invalidActionPlan('active_workout scope may only modify the active workout')
+    }
+    const sessionIds = new Set(plan.actions.map((action) => action.sessionId))
+    if (sessionIds.size !== 1) {
+      invalidActionPlan('active_workout actions must target the same session')
+    }
+  } else if (plan.scope === 'ai_memory') {
+    if (plan.actions.length !== 1 || plan.actions[0]?.type !== 'save_ai_note') {
+      invalidActionPlan('ai_memory scope requires exactly one save_ai_note action')
+    }
+  } else if (plan.scope === 'exercise_library') {
+    if (
+      plan.actions.length !== 1 ||
+      plan.actions[0]?.type !== 'create_custom_exercise'
+    ) {
+      invalidActionPlan(
+        'exercise_library scope requires exactly one create_custom_exercise action',
+      )
+    }
+  } else {
+    if (plan.actions.length !== 1) {
+      invalidActionPlan('workout and program creation plans require exactly one action')
+    }
+    const type = plan.actions[0]?.type
+    if (plan.scope === 'one_time_workout' && type !== 'create_one_time_workout') {
+      invalidActionPlan('one_time_workout scope requires a create_one_time_workout action')
+    }
+    const programTypes = new Set([
+      'create_session_template',
+      'create_program',
+      'rename_program',
+      'replace_program',
+      'archive_program',
+      'replace_session_template',
+      'delete_session_template',
+    ])
+    if (plan.scope === 'program' && !programTypes.has(type ?? '')) {
+      invalidActionPlan(
+        'program scope may only create, rename, replace, archive, or delete a saved program workout',
+      )
+    }
+  }
+  return plan
+}
+
+export function trustedActionStateHash(
   contextJson: string,
   scope: ActionScope,
 ): string {
@@ -1302,21 +1691,16 @@ async function handleCompleteJob(
 
   let actionPlan: Record<string, unknown> | null = null
   if (body.actionPlan !== undefined && body.actionPlan !== null) {
-    if (!isObject(body.actionPlan)) {
-      throw new ApiError(400, 'invalid_action_plan', 'actionPlan must be an object')
-    }
-    if (!isActionScope(body.actionPlan.scope)) {
-      throw new ApiError(400, 'invalid_action_scope')
-    }
+    const validatedPlan = validateActionPlan(body.actionPlan)
     if (!validSha256Hex(context.state_hash)) {
       throw new ApiError(409, 'state_hash_unavailable')
     }
     actionPlan = {
-      ...body.actionPlan,
+      ...validatedPlan,
       sourceStateHash: context.state_hash,
       sourceActionStateHash: trustedActionStateHash(
         context.context_json,
-        body.actionPlan.scope,
+        validatedPlan.scope,
       ),
     }
     if (jsonByteLength(actionPlan) > MAX_ACTION_PLAN_BYTES) {

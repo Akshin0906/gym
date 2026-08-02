@@ -16,7 +16,7 @@ import { listAllExercises } from '../db/repositories/exercises'
 import { listAllSets } from '../db/repositories/sessions'
 import type { Exercise, LoggedSet, MuscleGroup } from '../db/types'
 import {
-  buildWeeklySetCounts,
+  buildWeeklyVolume,
   estimated1RM,
   lastNIsoWeeks,
 } from '../lib/analytics'
@@ -66,11 +66,10 @@ const LINE_COLORS = [
 
 const MIN_DAYS_FOR_TREND = 3
 const RECENT_WEEKS = 4
+type TrendRow = { day: number } & Record<string, number>
 
-// Set counts are whole for primary muscles and halves for secondaries, so the
-// only fractional case is a trailing ".5".
-function fmtSets(n: number): string {
-  return Number.isInteger(n) ? String(n) : n.toFixed(1)
+function fmtVolume(n: number): string {
+  return n.toLocaleString(undefined, { maximumFractionDigits: 1 })
 }
 
 export function StatsScreen() {
@@ -109,7 +108,7 @@ export function StatsScreen() {
     })()
   }, [])
 
-  const trendData = useMemo(() => {
+  const trendData = useMemo<TrendRow[]>(() => {
     if (selectedExIds.size === 0) return []
     // Bucket by day, take the best (max) est-1RM for each (day, exercise).
     // Keys in each row are exercise IDs; <Line dataKey={id}> picks them up.
@@ -126,7 +125,7 @@ export function StatsScreen() {
       if ((row[s.exerciseId] ?? 0) < e1) row[s.exerciseId] = e1
     }
     return Array.from(dayMap.entries())
-      .map(([day, values]) => ({ day, ...values }))
+      .map(([day, values]) => ({ day, ...values }) as TrendRow)
       .sort((a, b) => a.day - b.day)
   }, [allSets, selectedExIds])
 
@@ -144,22 +143,22 @@ export function StatsScreen() {
     })
   }
 
-  const setWeeks = useMemo(
+  const volumeWeeks = useMemo(
     // Contiguous last-N ISO weeks (gaps shown as 0) rather than the last N weeks
     // that contain data, so a layoff/deload reads as a dip instead of vanishing.
-    () => lastNIsoWeeks(buildWeeklySetCounts(allSets, exMap), RECENT_WEEKS),
+    () => lastNIsoWeeks(buildWeeklyVolume(allSets, exMap), RECENT_WEEKS),
     [allSets, exMap],
   )
 
   const tableMuscles = useMemo(() => {
     const present = new Set<MuscleGroup>()
-    for (const row of setWeeks) {
+    for (const row of volumeWeeks) {
       for (const m of Object.keys(row.values) as MuscleGroup[]) {
         if ((row.values[m] ?? 0) > 0) present.add(m)
       }
     }
     return MUSCLE_ORDER.filter((m) => present.has(m))
-  }, [setWeeks])
+  }, [volumeWeeks])
 
   const summary = useMemo(() => {
     const now = new Date()
@@ -206,7 +205,7 @@ export function StatsScreen() {
             <SummaryCard
               label="Volume"
               value={summary.volume7d}
-              suffix=" lb"
+              suffix=" lb·reps"
               format={(n) => n.toLocaleString()}
             />
           </div>
@@ -272,58 +271,85 @@ export function StatsScreen() {
                     Select one or more exercises to see progression.
                   </p>
                 ) : (
-                  <ResponsiveContainer width="100%" height={240}>
-                    <LineChart
-                      data={trendData}
-                      margin={{ top: 8, right: 12, left: 0, bottom: 0 }}
-                    >
-                      <CartesianGrid stroke="#262626" strokeDasharray="3 3" />
-                      <XAxis
-                        dataKey="day"
-                        type="number"
-                        domain={['dataMin', 'dataMax']}
-                        tickFormatter={(t) => format(t, 'M/d')}
-                        stroke="#737373"
-                        fontSize={11}
-                        interval="preserveStartEnd"
-                        minTickGap={28}
-                      />
-                      <YAxis
-                        stroke="#737373"
-                        fontSize={11}
-                        width={40}
-                        domain={['auto', 'auto']}
-                      />
-                      <Tooltip
-                        contentStyle={{
-                          backgroundColor: '#171717',
-                          border: '1px solid #404040',
-                          borderRadius: 4,
-                          fontSize: 12,
-                        }}
-                        labelFormatter={(t) =>
-                          format(t as number, 'MMM d, yyyy')
-                        }
-                        formatter={(v: number) => [`${v} lb`, undefined]}
-                      />
-                      {selectedExs.length > 1 && (
-                        <Legend wrapperStyle={{ fontSize: 11 }} />
-                      )}
-                      {selectedExs.map((ex, i) => (
-                        <Line
-                          key={ex.id}
-                          type="monotone"
-                          dataKey={ex.id}
-                          name={ex.name}
-                          stroke={LINE_COLORS[i % LINE_COLORS.length]}
-                          strokeWidth={2}
-                          dot={{ r: 3 }}
-                          connectNulls
-                          isAnimationActive={false}
+                  <>
+                    <ResponsiveContainer width="100%" height={240}>
+                      <LineChart
+                        data={trendData}
+                        margin={{ top: 8, right: 12, left: 0, bottom: 0 }}
+                      >
+                        <CartesianGrid stroke="#262626" strokeDasharray="3 3" />
+                        <XAxis
+                          dataKey="day"
+                          type="number"
+                          domain={['dataMin', 'dataMax']}
+                          tickFormatter={(t) => format(t, 'M/d')}
+                          stroke="#737373"
+                          fontSize={11}
+                          interval="preserveStartEnd"
+                          minTickGap={28}
                         />
-                      ))}
-                    </LineChart>
-                  </ResponsiveContainer>
+                        <YAxis
+                          stroke="#737373"
+                          fontSize={11}
+                          width={40}
+                          domain={['auto', 'auto']}
+                        />
+                        <Tooltip
+                          contentStyle={{
+                            backgroundColor: '#171717',
+                            border: '1px solid #404040',
+                            borderRadius: 4,
+                            fontSize: 12,
+                          }}
+                          labelFormatter={(t) =>
+                            format(t as number, 'MMM d, yyyy')
+                          }
+                          formatter={(v: number) => [`${v} lb`, undefined]}
+                        />
+                        {selectedExs.length > 1 && (
+                          <Legend wrapperStyle={{ fontSize: 11 }} />
+                        )}
+                        {selectedExs.map((ex, i) => (
+                          <Line
+                            key={ex.id}
+                            type="monotone"
+                            dataKey={ex.id}
+                            name={ex.name}
+                            stroke={LINE_COLORS[i % LINE_COLORS.length]}
+                            strokeWidth={2}
+                            dot={{ r: 3 }}
+                            connectNulls
+                            isAnimationActive={false}
+                          />
+                        ))}
+                      </LineChart>
+                    </ResponsiveContainer>
+                    <table className="sr-only">
+                      <caption>Estimated one-rep max trend data</caption>
+                      <thead>
+                        <tr>
+                          <th>Date</th>
+                          {selectedExs.map((exercise) => (
+                            <th key={exercise.id}>{exercise.name}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {trendData.map((row) => (
+                          <tr key={row.day}>
+                            <td>{format(row.day, 'MMM d, yyyy')}</td>
+                            {selectedExs.map((exercise) => (
+                              <td key={exercise.id}>
+                                {row[exercise.id] === undefined
+                                  ? 'No data'
+                                  : `${row[exercise.id]} pounds`}
+                              </td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </>
                 )}
               </div>
             </>
@@ -335,18 +361,21 @@ export function StatsScreen() {
             Weekly volume per muscle
           </h2>
           <div className="card overflow-x-auto">
-            {setWeeks.length === 0 || tableMuscles.length === 0 ? (
+            {volumeWeeks.length === 0 || tableMuscles.length === 0 ? (
               <p className="text-sm text-[var(--color-fg-faint)] p-4 text-center">
                 No data.
               </p>
             ) : (
               <table className="w-full text-sm border-collapse">
+                <caption className="sr-only">
+                  Weekly lifting volume in pound-repetitions by muscle group
+                </caption>
                 <thead>
                   <tr>
                     <th className="sticky left-0 z-10 bg-[var(--color-surface)] text-left text-[11px] font-bold uppercase tracking-wider text-[var(--color-fg-faint)] py-2 pl-3 pr-2">
                       Muscle
                     </th>
-                    {setWeeks.map((w) => (
+                    {volumeWeeks.map((w) => (
                       <th
                         key={w.weekKey}
                         className="nums text-right text-[11px] font-bold uppercase tracking-wider text-[var(--color-fg-faint)] py-2 px-3 whitespace-nowrap"
@@ -372,7 +401,7 @@ export function StatsScreen() {
                           {MUSCLE_LABEL[m]}
                         </span>
                       </th>
-                      {setWeeks.map((w) => {
+                      {volumeWeeks.map((w) => {
                         const v = w.values[m] ?? 0
                         return (
                           <td
@@ -380,7 +409,7 @@ export function StatsScreen() {
                             className="nums text-right py-2 px-3"
                           >
                             {v > 0 ? (
-                              fmtSets(v)
+                              fmtVolume(v)
                             ) : (
                               <span className="text-[var(--color-fg-faint)]">
                                 –
@@ -400,7 +429,7 @@ export function StatsScreen() {
                     >
                       Total
                     </th>
-                    {setWeeks.map((w) => {
+                    {volumeWeeks.map((w) => {
                       const total = tableMuscles.reduce(
                         (sum, m) => sum + (w.values[m] ?? 0),
                         0,
@@ -410,7 +439,7 @@ export function StatsScreen() {
                           key={w.weekKey}
                           className="nums text-right py-2 px-3 font-semibold"
                         >
-                          {fmtSets(total)}
+                          {fmtVolume(total)}
                         </td>
                       )
                     })}
@@ -420,7 +449,7 @@ export function StatsScreen() {
             )}
           </div>
           <p className="text-[11px] text-[var(--color-fg-faint)] px-1">
-            Sets per muscle. Secondary muscles count as ½.
+            Volume in lb·reps. Secondary muscles receive 50% credit.
           </p>
         </section>
       </div>
@@ -483,49 +512,71 @@ function RecoverySection() {
             No readiness data in last 10 days.
           </p>
         ) : (
-          <ResponsiveContainer width="100%" height={220}>
-            <LineChart data={readiness} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
-              <CartesianGrid stroke="#262626" strokeDasharray="3 3" />
-              <XAxis
-                dataKey="day"
-                tickFormatter={(d) => format(parseISO(d as string), 'M/d')}
-                stroke="#737373"
-                fontSize={11}
-                interval="preserveStartEnd"
-                minTickGap={28}
-              />
-              <YAxis
-                domain={[0, 100]}
-                ticks={[0, 25, 50, 75, 100]}
-                stroke="#737373"
-                fontSize={11}
-                width={32}
-              />
-              <Tooltip
-                contentStyle={{
-                  backgroundColor: '#171717',
-                  border: '1px solid #404040',
-                  borderRadius: 4,
-                  fontSize: 12,
-                }}
-                labelFormatter={(d) =>
-                  format(parseISO(d as string), 'MMM d, yyyy')
-                }
-                formatter={(v) => [
-                  v === null || v === undefined ? '—' : (v as number),
-                  'readiness',
-                ]}
-              />
-              <Line
-                type="monotone"
-                dataKey="score"
-                stroke="oklch(0.74 0.18 50)"
-                strokeWidth={2}
-                dot={{ r: 3, fill: 'oklch(0.74 0.18 50)' }}
-                connectNulls
-              />
-            </LineChart>
-          </ResponsiveContainer>
+          <>
+            <ResponsiveContainer width="100%" height={220}>
+              <LineChart
+                data={readiness}
+                margin={{ top: 8, right: 12, left: 0, bottom: 0 }}
+              >
+                <CartesianGrid stroke="#262626" strokeDasharray="3 3" />
+                <XAxis
+                  dataKey="day"
+                  tickFormatter={(d) => format(parseISO(d as string), 'M/d')}
+                  stroke="#737373"
+                  fontSize={11}
+                  interval="preserveStartEnd"
+                  minTickGap={28}
+                />
+                <YAxis
+                  domain={[0, 100]}
+                  ticks={[0, 25, 50, 75, 100]}
+                  stroke="#737373"
+                  fontSize={11}
+                  width={32}
+                />
+                <Tooltip
+                  contentStyle={{
+                    backgroundColor: '#171717',
+                    border: '1px solid #404040',
+                    borderRadius: 4,
+                    fontSize: 12,
+                  }}
+                  labelFormatter={(d) =>
+                    format(parseISO(d as string), 'MMM d, yyyy')
+                  }
+                  formatter={(v) => [
+                    v === null || v === undefined ? '—' : (v as number),
+                    'readiness',
+                  ]}
+                />
+                <Line
+                  type="monotone"
+                  dataKey="score"
+                  stroke="oklch(0.74 0.18 50)"
+                  strokeWidth={2}
+                  dot={{ r: 3, fill: 'oklch(0.74 0.18 50)' }}
+                  connectNulls
+                />
+              </LineChart>
+            </ResponsiveContainer>
+            <table className="sr-only">
+              <caption>Oura readiness trend data</caption>
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Readiness score</th>
+                </tr>
+              </thead>
+              <tbody>
+                {readiness.map((day) => (
+                  <tr key={day.day}>
+                    <td>{format(parseISO(day.day), 'MMM d, yyyy')}</td>
+                    <td>{day.score ?? 'No score'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </>
         )}
       </div>
     </section>

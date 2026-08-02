@@ -19,12 +19,10 @@ interface Props {
 }
 
 export function SessionFeedback({ sessionName, onSave, onSkip }: Props) {
-  const [planned, setPlanned] = useState<SliderValue | null>(null)
-  const [feel, setFeel] = useState<SliderValue | null>(null)
-  const canSave = planned !== null && feel !== null
+  const [planned, setPlanned] = useState<SliderValue>(3)
+  const [feel, setFeel] = useState<SliderValue>(3)
 
   function handleSave() {
-    if (planned === null || feel === null) return
     onSave({ planned, feel })
   }
 
@@ -58,8 +56,7 @@ export function SessionFeedback({ sessionName, onSave, onSkip }: Props) {
         <button
           type="button"
           onClick={handleSave}
-          disabled={!canSave}
-          className="btn-primary w-full disabled:opacity-50 disabled:cursor-not-allowed"
+          className="btn-primary w-full"
         >
           <CheckCircle2 size={18} />
           Save
@@ -78,7 +75,7 @@ export function SessionFeedback({ sessionName, onSave, onSkip }: Props) {
 
 interface FeedbackQuestionProps {
   question: string
-  value: SliderValue | null
+  value: SliderValue
   labels: readonly string[]
   onChange: (v: SliderValue) => void
 }
@@ -89,29 +86,23 @@ function FeedbackQuestion({
   labels,
   onChange,
 }: FeedbackQuestionProps) {
-  const isTouched = value !== null
   return (
-    <div className="card p-4 space-y-3">
-      <div className="text-sm font-medium">{question}</div>
+    <fieldset className="card p-4 space-y-3">
+      <legend className="text-sm font-medium px-1">{question}</legend>
       <input
         type="range"
         min="1"
         max="5"
         step="1"
-        value={value ?? 3}
+        value={value}
         onChange={(e) => onChange(Number(e.target.value) as SliderValue)}
         aria-label={question}
+        aria-valuetext={labels[value - 1]}
         className="w-full accent-[var(--color-accent)] cursor-pointer touch-pan-x"
       />
-      <div
-        className={`text-center text-sm transition-colors ${
-          isTouched
-            ? 'text-[var(--color-fg)] font-medium'
-            : 'text-[var(--color-fg-faint)]'
-        }`}
-      >
-        {isTouched ? labels[value - 1] : '—'}
+      <div className="text-center text-sm text-[var(--color-fg)] font-medium">
+        {labels[value - 1]}
       </div>
-    </div>
+    </fieldset>
   )
 }

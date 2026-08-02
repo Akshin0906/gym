@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react'
-import { ChevronDown, ChevronLeft } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import { BarChart3, ChevronDown, ChevronLeft } from 'lucide-react'
+import { Link } from 'react-router-dom'
 import {
   CartesianGrid,
   Line,
@@ -22,6 +23,7 @@ import type { Exercise, LoggedSet } from '../db/types'
 import { estimated1RM } from '../lib/analytics'
 import { relativeOrAbsolute } from '../lib/dates'
 import { MUSCLE_LABEL } from '../lib/muscles'
+import { AccessibleDialog } from './AccessibleDialog'
 
 interface Props {
   exerciseId: string
@@ -47,6 +49,8 @@ export function ExerciseDetailOverlay({
   const [data, setData] = useState<Data | null>(null)
   const [lastExpanded, setLastExpanded] = useState(false)
   const [pickerOpen, setPickerOpen] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const closeButtonRef = useRef<HTMLButtonElement>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -68,19 +72,32 @@ export function ExerciseDetailOverlay({
   }, [exerciseId, currentSessionId, onClose])
 
   async function handlePick(toExerciseId: string) {
-    await swapExerciseInSession(currentSessionId, exerciseId, toExerciseId)
-    setPickerOpen(false)
-    onSwapped()
+    setError(null)
+    try {
+      await swapExerciseInSession(currentSessionId, exerciseId, toExerciseId)
+      setPickerOpen(false)
+      onSwapped()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      setPickerOpen(false)
+    }
   }
 
   if (!data) {
     return (
-      <div
-        className="fixed inset-0 z-50"
+      <AccessibleDialog
+        open
+        onClose={onClose}
+        labelledBy="exercise-detail-loading-title"
+        closeOnBackdrop={false}
+        className="w-full h-full"
         style={{ background: 'var(--color-bg)' }}
       >
+        <h1 id="exercise-detail-loading-title" className="sr-only">
+          Exercise details
+        </h1>
         <p className="p-6 text-center text-[var(--color-fg-faint)]">Loading…</p>
-      </div>
+      </AccessibleDialog>
     )
   }
 
@@ -99,8 +116,13 @@ export function ExerciseDetailOverlay({
 
   return (
     <>
-      <div
-        className="fixed inset-0 z-50 flex flex-col"
+      <AccessibleDialog
+        open
+        onClose={onClose}
+        labelledBy="exercise-detail-title"
+        initialFocusRef={closeButtonRef}
+        closeOnBackdrop={false}
+        className="w-full h-full flex flex-col"
         style={{ background: 'var(--color-bg)' }}
       >
         <header
@@ -111,6 +133,7 @@ export function ExerciseDetailOverlay({
           }}
         >
           <button
+            ref={closeButtonRef}
             type="button"
             onClick={onClose}
             aria-label="Back"
@@ -119,7 +142,10 @@ export function ExerciseDetailOverlay({
             <ChevronLeft size={24} strokeWidth={2} />
           </button>
           <div className="flex-1 min-w-0">
-            <h1 className="text-lg font-semibold leading-tight truncate">
+            <h1
+              id="exercise-detail-title"
+              className="text-lg font-semibold leading-tight truncate"
+            >
               {exercise.name}
             </h1>
             <p className="text-xs text-[var(--color-fg-dim)] truncate mt-0.5">
@@ -260,11 +286,34 @@ export function ExerciseDetailOverlay({
                     />
                   </LineChart>
                 </ResponsiveContainer>
+                <table className="sr-only">
+                  <caption>{exercise.name} estimated one-rep max history</caption>
+                  <thead>
+                    <tr>
+                      <th>Date</th>
+                      <th>Estimated one-rep max</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {points.map((point) => (
+                      <tr key={point.completedAt}>
+                        <td>{format(point.completedAt, 'MMM d, yyyy')}</td>
+                        <td>{point.e1rm} pounds</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
             )}
           </section>
 
           <section>
+            <Link
+              to={`/library/${exercise.id}/history`}
+              className="w-full btn-secondary py-3 text-sm font-semibold justify-center mb-2"
+            >
+              <BarChart3 size={16} /> View complete set history
+            </Link>
             <button
               type="button"
               onClick={() => setPickerOpen(true)}
@@ -273,11 +322,17 @@ export function ExerciseDetailOverlay({
               Swap exercise for this session
             </button>
             <p className="text-xs text-[var(--color-fg-faint)] mt-2 px-1">
-              Only this workout changes — your program stays the same.
+              Only this workout changes. Targets and position carry over, and
+              logged sets remain attached to the original exercise.
             </p>
+            {error && (
+              <p className="text-sm text-red-400 mt-2" role="alert">
+                {error}
+              </p>
+            )}
           </section>
         </div>
-      </div>
+      </AccessibleDialog>
 
       <ExercisePickerSheet
         open={pickerOpen}

@@ -27,7 +27,8 @@ import type {
   SliderValue,
   WorkoutSession,
 } from '../db/types'
-import { uploadCloudSnapshot } from '../lib/cloud'
+import { isCloudConfigured, uploadCloudSnapshot } from '../lib/cloud'
+import { shouldCompleteExerciseAfterRest } from '../lib/workoutFlow'
 import { useActiveWorkout } from '../store/activeWorkout'
 import { useTimer } from '../store/timer'
 
@@ -35,6 +36,7 @@ export function ActiveWorkoutScreen() {
   const navigate = useNavigate()
   const { sessionId, setActiveSession } = useActiveWorkout()
   const startRest = useTimer((s) => s.start)
+  const stopRest = useTimer((s) => s.stop)
 
   const [session, setSession] = useState<WorkoutSession | null>(null)
   const [setsBySession, setSetsBySession] = useState<LoggedSet[]>([])
@@ -100,6 +102,7 @@ export function ActiveWorkoutScreen() {
   // don't fight that navigation by redirecting to '/'. Only redirect when the
   // screen was opened without an active session (direct nav).
   const hadSessionRef = useRef(false)
+  const completionSyncRef = useRef<Promise<unknown> | null>(null)
   useEffect(() => {
     if (sessionId) {
       hadSessionRef.current = true
@@ -133,6 +136,7 @@ export function ActiveWorkoutScreen() {
       ? 'Discard this empty workout?'
       : 'End this workout?'
     if (!confirm(message)) return
+    stopRest()
     if (isEmpty) {
       await deleteSession(session.id)
       setActiveSession(null)
@@ -143,6 +147,11 @@ export function ActiveWorkoutScreen() {
     // leave it in limbo. Feedback fields are patched after, or stay null
     // if the user skips.
     await endSession(session.id)
+    completionSyncRef.current = isCloudConfigured()
+      ? uploadCloudSnapshot('workout_completed').catch(() => {
+          // The completed session is durable locally; Settings surfaces sync errors.
+        })
+      : Promise.resolve()
     setFeedbackForSessionId(session.id)
   }
 
@@ -152,7 +161,15 @@ export function ActiveWorkoutScreen() {
   }) {
     if (feedbackForSessionId) {
       await updateSessionFeedback(feedbackForSessionId, answers)
-      void uploadCloudSnapshot('workout_completed').catch(() => {
+      // Let the completion snapshot finish before uploading the feedback update,
+      // so a slower stale request cannot overwrite the newer snapshot.
+      const completionSync = completionSyncRef.current
+      void (async () => {
+        await completionSync
+        if (isCloudConfigured()) {
+          await uploadCloudSnapshot('workout_completed')
+        }
+      })().catch(() => {
         // Settings keeps the last sync error; completion should not block.
       })
     }
@@ -161,9 +178,6 @@ export function ActiveWorkoutScreen() {
   }
 
   function handleFeedbackSkip() {
-    void uploadCloudSnapshot('workout_completed').catch(() => {
-      // Settings keeps the last sync error; completion should not block.
-    })
     setActiveSession(null)
     navigate('/history')
   }
@@ -197,16 +211,6 @@ export function ActiveWorkoutScreen() {
       next.add(exerciseId)
       return next
     })
-  }
-
-  // Auto-collapse the first time a logged set reaches the target count. Keyed on
-  // the exact count, so logging further sets after reopening won't re-trigger it.
-  function maybeAutoCollapse(
-    exerciseId: string,
-    targetSets: number,
-    loggedSetNumber: number,
-  ) {
-    if (targetSets > 0 && loggedSetNumber === targetSets) markDone(exerciseId)
   }
 
   if (loading || !session) {
@@ -330,8 +334,19 @@ export function ActiveWorkoutScreen() {
           previousSets={prev}
           defaultRestSeconds={ex.defaultRestSeconds}
           onChange={() => void refreshSets(session.id)}
-          onStartRest={(secs) => startRest(secs, ex.id)}
-          onSetLogged={(n) => maybeAutoCollapse(ex.id, snap.targetSets, n)}
+          onStartRest={(secs, committedSetCount) => {
+            startRest(secs, ex.id)
+            // The spec's final-set flow is Log set → Start Rest → next
+            // exercise. Collapse only after the user has had that chance.
+            if (
+              shouldCompleteExerciseAfterRest(
+                snap.targetSets,
+                committedSetCount,
+              )
+            ) {
+              markDone(ex.id)
+            }
+          }}
         />
         <button
           type="button"

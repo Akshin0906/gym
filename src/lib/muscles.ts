@@ -29,3 +29,10 @@ export const MUSCLE_LABEL: Record<MuscleGroup, string> = {
   abs: 'Abs',
   traps: 'Traps',
 }
+
+export function normalizeSecondaryMuscles(
+  primary: MuscleGroup,
+  secondary: MuscleGroup[],
+): MuscleGroup[] {
+  return Array.from(new Set(secondary)).filter((muscle) => muscle !== primary)
+}

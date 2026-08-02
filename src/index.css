@@ -11,7 +11,8 @@
   --color-border: oklch(0.31 0 0);
   --color-fg: oklch(0.985 0 0);
   --color-fg-dim: oklch(0.72 0 0);
-  --color-fg-faint: oklch(0.55 0 0);
+  /* 4.63:1 or better on every app surface, meeting WCAG AA for body text. */
+  --color-fg-faint: oklch(0.63 0 0);
 
   --color-accent: oklch(0.74 0.18 50);
   --color-accent-strong: oklch(0.66 0.21 45);
@@ -61,6 +62,15 @@ button {
 :where(button, [role='button']):disabled {
   cursor: not-allowed;
 }
+
+button,
+[role='button'] {
+  touch-action: manipulation;
+}
+
+main:focus {
+  outline: none;
+}
 input[type='text'],
 input[type='search'],
 input[type='number'],
@@ -101,6 +111,7 @@ select {
   justify-content: center;
   gap: 0.5rem;
   transition: background 120ms ease, transform 80ms ease;
+  min-height: 2.75rem;
 }
 .btn-primary:hover {
   background: var(--color-accent-strong);
@@ -123,6 +134,7 @@ select {
   align-items: center;
   justify-content: center;
   gap: 0.5rem;
+  min-height: 2.75rem;
 }
 .btn-secondary:hover {
   background: oklch(0.27 0 0);
@@ -135,6 +147,7 @@ select {
   display: inline-flex;
   align-items: center;
   gap: 0.5rem;
+  min-height: 2.75rem;
 }
 .btn-ghost:hover {
   color: var(--color-fg);
@@ -171,6 +184,10 @@ select {
 .field-inset:focus {
   border-color: var(--color-accent);
   box-shadow: 0 0 0 3px oklch(0.74 0.18 50 / 0.18);
+}
+
+input[type='range'] {
+  min-height: 2.75rem;
 }
 
 /* Skeleton shimmer */
@@ -213,7 +230,9 @@ select {
   }
 }
 .pr-flash {
-  animation: pr-flash 1.6s ease-out forwards;
+  animation: none;
+  background: oklch(0.7 0.18 90 / 0.16);
+  border-color: oklch(0.78 0.18 90);
 }
 
 .pr-pill {

@@ -8,7 +8,11 @@ import {
   getProgram,
   getTemplateExercises,
 } from '../db/repositories/programs'
-import { startSession } from '../db/repositories/sessions'
+import {
+  SessionTemplateUnavailableError,
+  startSession,
+  UnfinishedWorkoutError,
+} from '../db/repositories/sessions'
 import type {
   Exercise,
   Program,
@@ -16,6 +20,7 @@ import type {
   TemplateExercise,
 } from '../db/types'
 import { useActiveWorkout } from '../store/activeWorkout'
+import { useTimer } from '../store/timer'
 
 interface Data {
   template: SessionTemplate
@@ -27,9 +32,12 @@ export function SessionPreviewScreen() {
   const { templateId } = useParams<{ templateId: string }>()
   const navigate = useNavigate()
   const { setActiveSession } = useActiveWorkout()
+  const stopRest = useTimer((s) => s.stop)
   const [data, setData] = useState<Data | null>(null)
   const [notFound, setNotFound] = useState(false)
+  const [unavailable, setUnavailable] = useState(false)
   const [starting, setStarting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
     if (!templateId) return
@@ -44,13 +52,17 @@ export function SessionPreviewScreen() {
         getProgram(template.programId),
         getTemplateExercises(template.id),
       ])
+      if (!program || !program.isActive || program.archivedAt !== null) {
+        if (!cancelled) setUnavailable(true)
+        return
+      }
       const exMap = await getExercisesByIds(tes.map((t) => t.exerciseId))
       const rows = tes
         .slice()
         .sort((a, b) => a.order - b.order)
         .map((te) => ({ te, exercise: exMap.get(te.exerciseId) }))
       if (!cancelled) {
-        setData({ template, program: program ?? null, rows })
+        setData({ template, program, rows })
       }
     })()
     return () => {
@@ -61,9 +73,35 @@ export function SessionPreviewScreen() {
   async function handleStart() {
     if (!data || starting) return
     setStarting(true)
-    const id = await startSession(data.template, data.program)
-    setActiveSession(id)
-    navigate('/workout')
+    setError(null)
+    try {
+      let id: string
+      try {
+        id = await startSession(data.template, data.program)
+      } catch (err) {
+        if (!(err instanceof UnfinishedWorkoutError)) throw err
+        const confirmed = confirm(
+          'End the unfinished workout (or discard it if it is empty) and start this workout?',
+        )
+        if (!confirmed) {
+          setStarting(false)
+          return
+        }
+        stopRest()
+        id = await startSession(data.template, data.program, {
+          resolveExisting: true,
+        })
+      }
+      setActiveSession(id)
+      navigate('/workout')
+    } catch (err) {
+      if (err instanceof SessionTemplateUnavailableError) {
+        setUnavailable(true)
+      } else {
+        setError(err instanceof Error ? err.message : String(err))
+      }
+      setStarting(false)
+    }
   }
 
   if (notFound) {
@@ -72,6 +110,17 @@ export function SessionPreviewScreen() {
         <Header title="Workout" back="/" />
         <p className="p-6 text-[var(--color-fg-faint)] text-center">
           This workout doesn't exist anymore.
+        </p>
+      </>
+    )
+  }
+
+  if (unavailable) {
+    return (
+      <>
+        <Header title="Workout unavailable" back="/" />
+        <p className="p-6 text-[var(--color-fg-faint)] text-center">
+          This session is not part of the active program anymore.
         </p>
       </>
     )
@@ -132,6 +181,11 @@ export function SessionPreviewScreen() {
         }}
       >
         <div className="max-w-md mx-auto">
+          {error && (
+            <p className="mb-2 text-sm text-red-400 text-center" role="alert">
+              {error}
+            </p>
+          )}
           <button
             type="button"
             onClick={() => void handleStart()}
