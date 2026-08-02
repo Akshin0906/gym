@@ -59,7 +59,13 @@ function isObject(v: unknown): v is Record<string, unknown> {
 }
 
 function isMode(v: unknown): v is RecommendationMode {
-  return v === 'push' || v === 'normal' || v === 'light' || v === 'deload'
+  return (
+    v === 'push' ||
+    v === 'normal' ||
+    v === 'light' ||
+    v === 'deload' ||
+    v === 'rest'
+  )
 }
 
 function stringOrEmpty(v: unknown): string {

@@ -18,8 +18,10 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -32,14 +34,87 @@ from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 
-RUNNER_VERSION = "2.1"
+RUNNER_VERSION = "3.0"
 PROMPT_VERSION = "2026-08-01"
+VALIDATOR_COMPATIBILITY_VERSION = "2026-08-01-atomic-v2"
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 DEFAULT_CODEX_REASONING_EFFORT = "xhigh"
 PACIFIC = ZoneInfo("America/Los_Angeles")
-MODES = {"push", "normal", "light", "deload"}
+MODES = {"push", "normal", "light", "deload", "rest"}
 RECOVERY_STATUSES = {"fresh", "stale", "unavailable"}
 MEMORY_TYPES = {"workout", "two_week", "four_month"}
+MAX_SAFE_INTEGER = 9_007_199_254_740_991
+TERMINATION_SIGNALS = frozenset({signal.SIGINT, signal.SIGTERM})
+
+# Codex currently materializes these runtime stores even for an ephemeral,
+# tool-disabled `codex exec`. They are state owned by the dedicated automation
+# home, not copied personal configuration. Unknown top-level state still fails
+# closed so a personal Codex home cannot gradually grow into this one.
+CODEX_RUNTIME_FILES = frozenset(
+    {
+        ".app-server-state-reconciled-v1",
+        ".personality_migration",
+        ".sandbox_migration",
+        "auth.json",
+        "installation_id",
+        "models_cache.json",
+    }
+)
+CODEX_RUNTIME_DIRS = frozenset(
+    {
+        ".tmp",
+        "cache",
+        "ipc",
+        "shell_snapshots",
+        "sqlite",
+        "thread-writer-locks",
+        "tmp",
+    }
+)
+CODEX_SQLITE_FILE_RE = re.compile(
+    r"(?:goals|logs|memories|state)_\d+\.sqlite(?:-(?:shm|wal))?\Z"
+)
+CODEX_SYSTEM_SKILLS_MARKER_RE = re.compile(r"[0-9a-f]{8,128}\n?\Z")
+CODEX_SYSTEM_SKILL_DIRS = frozenset(
+    {
+        "imagegen",
+        "openai-docs",
+        "plugin-creator",
+        "review-agent",
+        "skill-creator",
+        "skill-installer",
+    }
+)
+
+# Audited against `codex features list` in codex-cli 0.146.0-alpha.9.2. The CLI
+# still installs bundled system-skill descriptions, but every currently exposed
+# tool-bearing surface that can be disabled is turned off. JSONL auditing is the
+# final fail-closed compatibility check for future CLI changes.
+DISABLED_CODEX_FEATURES = (
+    "apps",
+    "auth_elicitation",
+    "browser_use",
+    "browser_use_external",
+    "browser_use_full_cdp_access",
+    "code_mode_host",
+    "computer_use",
+    "goals",
+    "hooks",
+    "image_generation",
+    "in_app_browser",
+    "memories",
+    "multi_agent",
+    "plugins",
+    "remote_plugin",
+    "shell_snapshot",
+    "shell_tool",
+    "skill_mcp_dependency_install",
+    "skill_search",
+    "tool_call_mcp_elicitation",
+    "tool_suggest",
+    "unified_exec",
+    "workspace_dependencies",
+)
 
 EXIT_OK = 0
 EXIT_TRANSIENT = 75
@@ -72,6 +147,18 @@ class AlreadyRunning(RunnerError):
     kind = "already_running"
 
 
+class StalePublishError(TransientError):
+    kind = "stale_publish"
+
+
+class TerminationRequested(RunnerError):
+    kind = "terminated"
+
+    def __init__(self, signum: int):
+        super().__init__(f"Received signal {signum}; child processes were stopped")
+        self.exit_code = 128 + signum
+
+
 def env_int(name: str, default: int, minimum: int = 1) -> int:
     raw = os.environ.get(name)
     if raw is None:
@@ -102,6 +189,7 @@ def env_float(name: str, default: float, minimum: float = 0.0) -> float:
 class Config:
     release_root: Path
     automation_root: Path
+    codex_home: Path
     state_dir: Path
     log_dir: Path
     prompt_file: Path
@@ -142,6 +230,11 @@ class Config:
         return cls(
             release_root=release_root,
             automation_root=automation_root,
+            codex_home=Path(
+                os.environ.get(
+                    "WORKOUT_CODEX_HOME", automation_root / "codex-home"
+                )
+            ).expanduser(),
             state_dir=Path(
                 os.environ.get("WORKOUT_STATE_DIR", automation_root / "state")
             ).expanduser(),
@@ -294,10 +387,10 @@ def resolve_codex_binary(override: str | None = None) -> Path:
 
 
 def clean_child_env() -> dict[str, str]:
+    """Minimal non-Codex child environment (used by the Oura companion)."""
     home = str(Path.home())
     env = {
         "HOME": home,
-        "CODEX_HOME": str(Path(home) / ".codex"),
         "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
         "LANG": os.environ.get("LANG", "en_US.UTF-8"),
         "LC_ALL": os.environ.get("LC_ALL", "en_US.UTF-8"),
@@ -305,6 +398,88 @@ def clean_child_env() -> dict[str, str]:
     }
     if os.environ.get("TMPDIR"):
         env["TMPDIR"] = os.environ["TMPDIR"]
+    return env
+
+
+def validate_codex_system_skills(path: Path) -> None:
+    if path.is_symlink() or not path.is_dir():
+        raise ConfigError("Dedicated Codex skills must be a real directory")
+    entries = list(path.iterdir())
+    if {entry.name for entry in entries} != {".system"}:
+        raise ConfigError("Dedicated Codex home contains personal or unknown skills")
+
+    system = path / ".system"
+    if system.is_symlink() or not system.is_dir():
+        raise ConfigError("Dedicated Codex system skills must be a real directory")
+    marker = system / ".codex-system-skills.marker"
+    if marker.is_symlink() or not marker.is_file():
+        raise ConfigError("Dedicated Codex system skills marker is missing")
+    try:
+        marker_value = marker.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError("Dedicated Codex system skills marker is unreadable") from exc
+    if not CODEX_SYSTEM_SKILLS_MARKER_RE.fullmatch(marker_value):
+        raise ConfigError("Dedicated Codex system skills marker is invalid")
+
+    skill_entries = [entry for entry in system.iterdir() if entry.name != marker.name]
+    if {entry.name for entry in skill_entries} != CODEX_SYSTEM_SKILL_DIRS:
+        raise ConfigError("Dedicated Codex system skills do not match the audited bundle")
+    for entry in skill_entries:
+        if entry.is_symlink() or not entry.is_dir():
+            raise ConfigError("Dedicated Codex system skills contain unknown state")
+    for entry in system.rglob("*"):
+        if entry.is_symlink():
+            raise ConfigError("Dedicated Codex system skills must not contain symlinks")
+
+
+def validate_codex_home(path: Path) -> None:
+    if path.is_symlink():
+        raise ConfigError("Dedicated Codex home must not be a symlink")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise ConfigError(f"Dedicated Codex home is unavailable: {path}") from exc
+    personal = (Path.home() / ".codex").resolve()
+    if resolved == personal:
+        raise ConfigError("Daily automation must not use the personal Codex home")
+    if not resolved.is_dir():
+        raise ConfigError("Dedicated Codex home must be a real directory")
+    if stat.S_IMODE(resolved.stat().st_mode) & 0o077:
+        raise ConfigError("Dedicated Codex home permissions must not allow group/other access")
+
+    auth = resolved / "auth.json"
+    if auth.is_symlink() or not auth.is_file():
+        raise ConfigError("Dedicated Codex home is missing a regular auth.json")
+    if stat.S_IMODE(auth.stat().st_mode) & 0o077:
+        raise ConfigError("Dedicated Codex auth.json permissions must be private")
+
+    for entry in resolved.iterdir():
+        if entry.name == "skills":
+            validate_codex_system_skills(entry)
+            continue
+        if entry.name in CODEX_RUNTIME_FILES or CODEX_SQLITE_FILE_RE.fullmatch(
+            entry.name
+        ):
+            if entry.is_symlink() or not entry.is_file():
+                raise ConfigError(
+                    f"Dedicated Codex runtime file is invalid: {entry.name}"
+                )
+            continue
+        if entry.name in CODEX_RUNTIME_DIRS:
+            if entry.is_symlink() or not entry.is_dir():
+                raise ConfigError(
+                    f"Dedicated Codex runtime directory is invalid: {entry.name}"
+                )
+            continue
+        raise ConfigError(
+            f"Dedicated Codex home contains forbidden or unknown state: {entry.name}"
+        )
+
+
+def clean_codex_env(config: Config) -> dict[str, str]:
+    validate_codex_home(config.codex_home)
+    env = clean_child_env()
+    env["CODEX_HOME"] = str(config.codex_home.resolve())
     return env
 
 
@@ -348,6 +523,19 @@ def require_string(value: Any, field: str, *, allow_empty: bool = False) -> str:
     return cleaned
 
 
+def require_bounded_string(
+    value: Any,
+    field: str,
+    maximum: int,
+    *,
+    allow_empty: bool = False,
+) -> str:
+    cleaned = require_string(value, field, allow_empty=allow_empty)
+    if len(cleaned) > maximum:
+        raise ConfigError(f"{field} must be at most {maximum} characters")
+    return cleaned
+
+
 @dataclasses.dataclass(frozen=True)
 class SnapshotFacts:
     snapshot: dict[str, Any]
@@ -356,14 +544,18 @@ class SnapshotFacts:
     updated_date: dt.date
     completed_workouts: list[dict[str, Any]]
     logged_sets: list[dict[str, Any]]
+    ai_memory_settings: list[dict[str, Any]]
+    ai_notes: list[dict[str, Any]]
+    ai_memory_summaries: list[dict[str, Any]]
 
 
 def validate_snapshot(body: Any, today: dt.date) -> SnapshotFacts:
     envelope = require_object(body, "snapshot response")
     snapshot = require_object(envelope.get("snapshot"), "snapshot")
-    updated_at = snapshot.get("updatedAt")
-    if not finite_number(updated_at):
-        raise WaitingError("Cloud snapshot is missing a valid updatedAt value")
+    try:
+        updated_at = require_epoch_ms(snapshot.get("updatedAt"), "snapshot.updatedAt")
+    except ConfigError as exc:
+        raise WaitingError("Cloud snapshot is missing a valid updatedAt value") from exc
     payload = require_object(snapshot.get("payload"), "snapshot.payload")
     if not finite_number(payload.get("schemaVersion")):
         raise WaitingError("Cloud snapshot payload has no schemaVersion")
@@ -375,6 +567,9 @@ def validate_snapshot(body: Any, today: dt.date) -> SnapshotFacts:
         "templateExercises",
         "workoutSessions",
         "loggedSets",
+        "aiMemorySettings",
+        "aiNotes",
+        "aiMemorySummaries",
     ):
         if not isinstance(data.get(name), list):
             raise WaitingError(f"Cloud snapshot is missing {name}")
@@ -394,6 +589,20 @@ def validate_snapshot(body: Any, today: dt.date) -> SnapshotFacts:
     if age_days < -1:
         raise ConfigError("Cloud snapshot timestamp is unexpectedly in the future")
     logged_sets = [item for item in data["loggedSets"] if isinstance(item, dict)]
+    ai_memory_settings = [
+        item for item in data["aiMemorySettings"] if isinstance(item, dict)
+    ]
+    ai_notes = [item for item in data["aiNotes"] if isinstance(item, dict)]
+    ai_memory_summaries = [
+        item for item in data["aiMemorySummaries"] if isinstance(item, dict)
+    ]
+    for name, items in (
+        ("aiMemorySettings", ai_memory_settings),
+        ("aiNotes", ai_notes),
+        ("aiMemorySummaries", ai_memory_summaries),
+    ):
+        if len(items) != len(data[name]):
+            raise ConfigError(f"Cloud snapshot {name} contains an invalid row")
     return SnapshotFacts(
         snapshot=snapshot,
         data=data,
@@ -401,6 +610,9 @@ def validate_snapshot(body: Any, today: dt.date) -> SnapshotFacts:
         updated_date=updated.date(),
         completed_workouts=completed,
         logged_sets=logged_sets,
+        ai_memory_settings=ai_memory_settings,
+        ai_notes=ai_notes,
+        ai_memory_summaries=ai_memory_summaries,
     )
 
 
@@ -460,6 +672,21 @@ def unavailable_recovery(now: dt.datetime) -> dict[str, Any]:
     }
 
 
+class RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Expose redirects as HTTP errors so authentication is never forwarded."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
+
+
 class CloudClient:
     def __init__(self, config: Config, secret: str, logger: logging.Logger):
         self.base = config.app_url
@@ -468,6 +695,7 @@ class CloudClient:
         self.retries = config.http_retries
         self.retry_delay = config.retry_delay_seconds
         self.logger = logger
+        self.opener = urllib.request.build_opener(RejectRedirectHandler())
 
     def request(
         self,
@@ -492,7 +720,7 @@ class CloudClient:
         for attempt in range(1, self.retries + 1):
             request = urllib.request.Request(url, data=payload, method=method, headers=headers)
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                with self.opener.open(request, timeout=self.timeout) as response:
                     status = int(response.status)
                     raw = response.read(16 * 1024 * 1024 + 1)
                 if len(raw) > 16 * 1024 * 1024:
@@ -530,6 +758,43 @@ class CloudClient:
         raise TransientError(f"Cloud request {path} failed after retries") from last_error
 
 
+_ACTIVE_PROCESS: subprocess.Popen[str] | None = None
+
+
+@contextlib.contextmanager
+def blocked_termination_signals() -> Iterator[None]:
+    """Defer SIGINT/SIGTERM while a child is registered or reaped."""
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, TERMINATION_SIGNALS)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def terminate_process_group(
+    process: subprocess.Popen[str], *, grace_seconds: float = 10.0
+) -> None:
+    with blocked_termination_signals():
+        if process.poll() is not None:
+            return
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+
+
+def handle_termination_signal(signum: int, _frame: Any) -> None:
+    process = _ACTIVE_PROCESS
+    if process is not None and process.poll() is None:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
+    raise TerminationRequested(signum)
+
+
 def run_bounded(
     command: list[str],
     *,
@@ -540,32 +805,43 @@ def run_bounded(
     stderr_path: Path,
     stdin_text: str | None = None,
 ) -> int:
+    global _ACTIVE_PROCESS
     stdout_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open(
         "w", encoding="utf-8"
     ) as stderr:
-        process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            env=env,
-            stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
-            stdout=stdout,
-            stderr=stderr,
-            text=True,
-            start_new_session=True,
-        )
+        process: subprocess.Popen[str] | None = None
         try:
+            # A pending termination signal is delivered only after the new
+            # process group is visible to the handler. If delivery raises while
+            # the mask is restored, the outer exception path still reaps it.
+            with blocked_termination_signals():
+                process = subprocess.Popen(
+                    command,
+                    cwd=cwd,
+                    env=env,
+                    stdin=(
+                        subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL
+                    ),
+                    stdout=stdout,
+                    stderr=stderr,
+                    text=True,
+                    start_new_session=True,
+                )
+                _ACTIVE_PROCESS = process
             process.communicate(input=stdin_text, timeout=timeout)
         except subprocess.TimeoutExpired:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+            if process is not None:
+                terminate_process_group(process)
             raise TransientError(f"Command timed out after {timeout} seconds")
+        except BaseException:
+            if process is not None:
+                terminate_process_group(process)
+            raise
+        finally:
+            if process is not None and _ACTIVE_PROCESS is process:
+                _ACTIVE_PROCESS = None
+        assert process is not None
         return int(process.returncode)
 
 
@@ -667,11 +943,11 @@ def build_model_prompt(
     )
 
 
-def check_codex_login(codex: Path) -> None:
+def check_codex_login(config: Config, codex: Path) -> None:
     try:
         result = subprocess.run(
             [str(codex), "login", "status"],
-            env=clean_child_env(),
+            env=clean_codex_env(config),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -685,6 +961,74 @@ def check_codex_login(codex: Path) -> None:
         raise ConfigError("Codex is not logged in with ChatGPT")
 
 
+def audit_codex_events(events_path: Path, audit_path: Path) -> dict[str, Any]:
+    """Fail closed if the unattended turn emitted a tool or malformed event."""
+    try:
+        payload = events_path.read_bytes()
+    except OSError as exc:
+        raise ConfigError("Codex event stream is missing or unreadable") from exc
+    if len(payload) > 32 * 1024 * 1024:
+        raise ConfigError("Codex event stream is unexpectedly large")
+
+    event_types: dict[str, int] = {}
+    item_types: dict[str, int] = {}
+    completed = False
+    agent_message = False
+    line_count = 0
+    for line_number, raw_line in enumerate(payload.splitlines(), start=1):
+        if not raw_line.strip():
+            continue
+        line_count += 1
+        try:
+            event = json.loads(raw_line)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ConfigError(
+                f"Codex event stream has invalid JSON on line {line_number}"
+            ) from exc
+        event = require_object(event, f"Codex event line {line_number}")
+        event_type = require_string(
+            event.get("type"), f"Codex event line {line_number}.type"
+        )
+        event_types[event_type] = event_types.get(event_type, 0) + 1
+        if event_type in {"error", "turn.failed"}:
+            raise TransientError(f"Codex reported {event_type}")
+        if event_type == "turn.completed":
+            completed = True
+        if event_type.startswith("item."):
+            item = require_object(
+                event.get("item"), f"Codex event line {line_number}.item"
+            )
+            item_type = require_string(
+                item.get("type"), f"Codex event line {line_number}.item.type"
+            )
+            item_types[item_type] = item_types.get(item_type, 0) + 1
+            if item_type not in {"agent_message", "reasoning"}:
+                raise ConfigError(
+                    f"Codex used a forbidden or unexpected tool item: {item_type}"
+                )
+            if item_type == "agent_message" and event_type == "item.completed":
+                agent_message = True
+        elif event_type not in {
+            "thread.started",
+            "turn.started",
+            "turn.completed",
+            "warning",
+        }:
+            raise ConfigError(f"Unexpected Codex event type: {event_type}")
+
+    if not completed or not agent_message:
+        raise ConfigError("Codex event stream did not contain a completed answer")
+    audit = {
+        "sha256": sha256_bytes(payload),
+        "lineCount": line_count,
+        "eventTypes": dict(sorted(event_types.items())),
+        "itemTypes": dict(sorted(item_types.items())),
+        "toolsObserved": False,
+    }
+    atomic_write_json(audit_path, audit)
+    return audit
+
+
 def invoke_codex(
     config: Config,
     codex: Path,
@@ -694,6 +1038,52 @@ def invoke_codex(
     final_path = run_dir / "codex-output.json"
     events_path = run_dir / "codex-events.jsonl"
     stderr_path = run_dir / "codex.stderr.log"
+    command = build_codex_command(config, codex, run_dir, final_path)
+    status = run_bounded(
+        command,
+        cwd=run_dir,
+        env=clean_codex_env(config),
+        timeout=config.codex_timeout_seconds,
+        stdout_path=events_path,
+        stderr_path=stderr_path,
+        stdin_text=prompt,
+    )
+    if status != 0:
+        raise TransientError(f"Codex exited with status {status}")
+    audit_codex_events(events_path, run_dir / "codex-events-audit.json")
+    if not final_path.is_file():
+        raise ConfigError("Codex did not create its structured output file")
+    output = read_json(final_path, max_bytes=4 * 1024 * 1024)
+
+    version_result = subprocess.run(
+        [str(codex), "--version"],
+        env=clean_codex_env(config),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    version = version_result.stdout.strip() if version_result.returncode == 0 else "unknown"
+    return require_object(output, "Codex output"), version[:120]
+
+
+def build_codex_command(
+    config: Config,
+    codex: Path,
+    run_dir: Path,
+    final_path: Path,
+    *,
+    use_caffeinate: bool = True,
+) -> list[str]:
+    disabled_skills = ",".join(
+        "{path="
+        + json.dumps(
+            str(config.codex_home / "skills" / ".system" / name / "SKILL.md")
+        )
+        + ",enabled=false}"
+        for name in sorted(CODEX_SYSTEM_SKILL_DIRS)
+    )
     command = [
         str(codex),
         "exec",
@@ -701,6 +1091,7 @@ def invoke_codex(
         str(run_dir),
         "--skip-git-repo-check",
         "--ignore-user-config",
+        "--ignore-rules",
         "--strict-config",
         "--ephemeral",
         "--sandbox",
@@ -710,64 +1101,31 @@ def invoke_codex(
         "--config",
         'approval_policy="never"',
         "--config",
+        'web_search="disabled"',
+        "--config",
         f'model_reasoning_effort="{config.codex_effort}"',
         "--config",
         'shell_environment_policy.inherit="none"',
-        "--disable",
-        "apps",
-        "--disable",
-        "browser_use",
-        "--disable",
-        "computer_use",
-        "--disable",
-        "goals",
-        "--disable",
-        "hooks",
-        "--disable",
-        "multi_agent",
-        "--disable",
-        "plugins",
-        "--disable",
-        "remote_plugin",
-        "--disable",
-        "shell_tool",
-        "--color",
-        "never",
-        "--json",
-        "--output-schema",
-        str(config.schema_file),
-        "--output-last-message",
-        str(final_path),
-        "-",
+        "--config",
+        f"skills.config=[{disabled_skills}]",
     ]
-    if Path("/usr/bin/caffeinate").is_file():
+    for feature in DISABLED_CODEX_FEATURES:
+        command.extend(("--disable", feature))
+    command.extend(
+        (
+            "--color",
+            "never",
+            "--json",
+            "--output-schema",
+            str(config.schema_file),
+            "--output-last-message",
+            str(final_path),
+            "-",
+        )
+    )
+    if use_caffeinate and Path("/usr/bin/caffeinate").is_file():
         command = ["/usr/bin/caffeinate", "-is"] + command
-    status = run_bounded(
-        command,
-        cwd=run_dir,
-        env=clean_child_env(),
-        timeout=config.codex_timeout_seconds,
-        stdout_path=events_path,
-        stderr_path=stderr_path,
-        stdin_text=prompt,
-    )
-    if status != 0:
-        raise TransientError(f"Codex exited with status {status}")
-    if not final_path.is_file():
-        raise ConfigError("Codex did not create its structured output file")
-    output = read_json(final_path, max_bytes=4 * 1024 * 1024)
-
-    version_result = subprocess.run(
-        [str(codex), "--version"],
-        env=clean_child_env(),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=15,
-        check=False,
-    )
-    version = version_result.stdout.strip() if version_result.returncode == 0 else "unknown"
-    return require_object(output, "Codex output"), version[:120]
+    return command
 
 
 def string_list(value: Any, field: str, *, maximum: int | None = None) -> list[str]:
@@ -779,57 +1137,323 @@ def string_list(value: Any, field: str, *, maximum: int | None = None) -> list[s
     return cleaned
 
 
+def require_epoch_ms(value: Any, field: str) -> int:
+    if (
+        not finite_number(value)
+        or value < 0
+        or value > MAX_SAFE_INTEGER
+        or not float(value).is_integer()
+    ):
+        raise ConfigError(f"{field} must be a non-negative integer timestamp")
+    return int(value)
+
+
+def pacific_day_start_ms(epoch_ms: int) -> int:
+    local = dt.datetime.fromtimestamp(epoch_ms / 1000.0, PACIFIC)
+    return int(local.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+
+
+def pacific_date_start_ms(value: str) -> int:
+    try:
+        day = dt.date.fromisoformat(value)
+    except ValueError as exc:
+        raise ConfigError("today must be an ISO calendar date") from exc
+    if day.isoformat() != value:
+        raise ConfigError("today must be an ISO calendar date")
+    return int(dt.datetime.combine(day, dt.time.min, PACIFIC).timestamp() * 1000)
+
+
+def add_calendar_days_ms(epoch_ms: int, days: int) -> int:
+    local = dt.datetime.fromtimestamp(epoch_ms / 1000.0, PACIFIC)
+    target = local.date() + dt.timedelta(days=days)
+    return int(dt.datetime.combine(target, local.timetz(), PACIFIC).timestamp() * 1000)
+
+
+def add_calendar_months_ms(epoch_ms: int, months: int) -> int:
+    """Match JavaScript Date.setMonth calendar rollover in Pacific time."""
+    local = dt.datetime.fromtimestamp(epoch_ms / 1000.0, PACIFIC)
+    month_index = local.year * 12 + (local.month - 1) + months
+    year, zero_based_month = divmod(month_index, 12)
+    first = dt.datetime(
+        year,
+        zero_based_month + 1,
+        1,
+        local.hour,
+        local.minute,
+        local.second,
+        local.microsecond,
+        tzinfo=PACIFIC,
+    )
+    target = first + dt.timedelta(days=local.day - 1)
+    return int(target.timestamp() * 1000)
+
+
+def require_unique_ids(value: Any, field: str) -> list[str]:
+    if not isinstance(value, list):
+        raise ConfigError(f"{field} must be an array of strings")
+    result: list[str] = []
+    seen: set[str] = set()
+    for index, raw in enumerate(value):
+        item = require_bounded_string(raw, f"{field}[{index}]", 180)
+        if item in seen:
+            raise ConfigError(f"{field} contains duplicate id: {item}")
+        seen.add(item)
+        result.append(item)
+    return result
+
+
+def canonical_completed_sessions(facts: SnapshotFacts) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in facts.completed_workouts:
+        session_id = require_bounded_string(
+            raw.get("id"), "completed workout id", 172
+        )
+        if session_id in seen:
+            raise ConfigError(f"Cloud snapshot has duplicate workout id: {session_id}")
+        seen.add(session_id)
+        completed_at = require_epoch_ms(
+            raw.get("completedAt"), f"workout {session_id}.completedAt"
+        )
+        started_raw = raw.get("startedAt")
+        started_at = (
+            completed_at
+            if started_raw is None
+            else require_epoch_ms(started_raw, f"workout {session_id}.startedAt")
+        )
+        if started_at > completed_at:
+            raise ConfigError(f"Workout {session_id} starts after it completes")
+        result.append(
+            {
+                "id": session_id,
+                "startedAt": started_at,
+                "completedAt": completed_at,
+            }
+        )
+    return sorted(result, key=lambda item: (item["completedAt"], item["id"]))
+
+
+def canonical_ai_notes(facts: SnapshotFacts) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in facts.ai_notes:
+        note_id = require_bounded_string(raw.get("id"), "AI note id", 180)
+        if note_id in seen:
+            raise ConfigError(f"Cloud snapshot has duplicate AI note id: {note_id}")
+        seen.add(note_id)
+        created_at = require_epoch_ms(raw.get("createdAt"), f"AI note {note_id}.createdAt")
+        result.append({"id": note_id, "createdAt": created_at})
+    return sorted(result, key=lambda item: (item["createdAt"], item["id"]))
+
+
+def trusted_summary_records(
+    facts: SnapshotFacts, existing_items: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    by_id: dict[str, dict[str, Any]] = {}
+
+    def add(raw: dict[str, Any], *, type_field: str, label: str) -> None:
+        memory_type = raw.get(type_field)
+        if memory_type not in {"two_week", "four_month"}:
+            if label == "snapshot summary":
+                raise ConfigError("Snapshot AI memory summary has an invalid period type")
+            return
+        item_id = require_bounded_string(raw.get("id"), f"{label} id", 180)
+        start = require_epoch_ms(raw.get("periodStartAt"), f"{item_id}.periodStartAt")
+        end = require_epoch_ms(raw.get("periodEndAt"), f"{item_id}.periodEndAt")
+        if end <= start:
+            raise ConfigError(f"{item_id} has a non-positive memory period")
+        record = {
+            "id": item_id,
+            "memoryType": memory_type,
+            "periodStartAt": start,
+            "periodEndAt": end,
+        }
+        prior = by_id.get(item_id)
+        if prior is not None and prior != record:
+            raise ConfigError(f"Conflicting trusted memory summary id: {item_id}")
+        by_id[item_id] = record
+
+    for item in facts.ai_memory_summaries:
+        add(item, type_field="periodType", label="snapshot summary")
+    for item in existing_items:
+        add(item, type_field="memoryType", label="cloud memory item")
+    return sorted(
+        by_id.values(),
+        key=lambda item: (item["periodStartAt"], item["periodEndAt"], item["id"]),
+    )
+
+
+def trusted_memory_state(
+    facts: SnapshotFacts,
+    memory_envelope: dict[str, Any],
+    sessions: list[dict[str, Any]],
+    *,
+    today: str,
+) -> dict[str, Any]:
+    def parse(raw: Any, label: str) -> dict[str, Any] | None:
+        if raw is None:
+            return None
+        state = require_object(raw, label)
+        current_context = require_string(
+            state.get("currentContext"), f"{label}.currentContext", allow_empty=True
+        )[:4000]
+        if not isinstance(state.get("paused"), bool):
+            raise ConfigError(f"{label}.paused must be a boolean")
+        return {
+            "currentContext": current_context,
+            "paused": state["paused"],
+            "windowStartedAt": require_epoch_ms(
+                state.get("windowStartedAt"), f"{label}.windowStartedAt"
+            ),
+            "fourMonthStartedAt": require_epoch_ms(
+                state.get("fourMonthStartedAt"), f"{label}.fourMonthStartedAt"
+            ),
+        }
+
+    if len(facts.ai_memory_settings) > 1:
+        raise ConfigError("Cloud snapshot has multiple AI memory settings rows")
+    snapshot_state: dict[str, Any] | None = None
+    if facts.ai_memory_settings:
+        settings = facts.ai_memory_settings[0]
+        if require_string(settings.get("id"), "AI memory settings id") != "default":
+            raise ConfigError("Cloud snapshot AI memory settings id must be default")
+        snapshot_state = parse(settings, "snapshot AI memory state")
+    cloud_state = parse(memory_envelope.get("state"), "cloud memory state")
+
+    today_start = pacific_date_start_ms(today)
+    candidates = [state for state in (snapshot_state, cloud_state) if state is not None]
+    if candidates:
+        for state in candidates:
+            for field in ("windowStartedAt", "fourMonthStartedAt"):
+                value = state[field]
+                if pacific_day_start_ms(value) != value:
+                    raise ConfigError(f"Trusted memory {field} is not a Pacific day boundary")
+                if value > today_start:
+                    raise ConfigError(f"Trusted memory {field} is in the future")
+        window_started_at = max(state["windowStartedAt"] for state in candidates)
+        four_month_started_at = max(
+            state["fourMonthStartedAt"] for state in candidates
+        )
+    else:
+        earliest = min((item["startedAt"] for item in sessions), default=today_start)
+        window_started_at = pacific_day_start_ms(earliest)
+        four_month_started_at = window_started_at
+
+    owner = snapshot_state or cloud_state
+    return {
+        "currentContext": owner["currentContext"] if owner is not None else "",
+        "paused": owner["paused"] if owner is not None else False,
+        "windowStartedAt": window_started_at,
+        "fourMonthStartedAt": four_month_started_at,
+        "sourceSnapshotUpdatedAt": facts.updated_at,
+    }
+
+
+def advance_existing_periods(
+    start: int,
+    *,
+    memory_type: str,
+    today_start: int,
+    periods: set[tuple[str, int, int]],
+) -> int:
+    for _ in range(10_000):
+        end = (
+            add_calendar_days_ms(start, 14)
+            if memory_type == "two_week"
+            else add_calendar_months_ms(start, 4)
+        )
+        if end > today_start or (memory_type, start, end) not in periods:
+            return start
+        start = end
+    raise ConfigError(f"Too many existing {memory_type} memory periods")
+
+
 def validate_memory_item(
     raw: Any,
     *,
+    expected: dict[str, Any],
     snapshot_updated_at: int | float,
-    existing_ids: set[str],
-    seen: set[str],
+    generated_at: int,
     model: str,
+    allowed_note_ids: list[str] | None = None,
 ) -> dict[str, Any]:
-    item = require_object(raw, "memory item")
+    item = require_object(raw, f"memory item {expected['id']}")
+    expected_keys = {
+        "id",
+        "memoryType",
+        "periodStartAt",
+        "periodEndAt",
+        "sourceWorkoutSessionId",
+        "bullets",
+        "sourceSessionIds",
+        "sourceNoteIds",
+        "sourceSummaryIds",
+    }
+    if set(item) != expected_keys:
+        raise ConfigError(
+            f"Memory item {expected['id']} must contain only candidate content fields"
+        )
     item_id = require_string(item.get("id"), "memory item id")
-    if item_id in existing_ids:
-        raise ConfigError(f"Codex returned existing memory item as new: {item_id}")
-    if item_id in seen:
-        raise ConfigError(f"Codex returned duplicate memory item: {item_id}")
-    seen.add(item_id)
+    if item_id != expected["id"]:
+        raise ConfigError(f"Unexpected memory item id: {item_id}")
     memory_type = item.get("memoryType")
-    if memory_type not in MEMORY_TYPES:
-        raise ConfigError(f"Invalid memory type for {item_id}")
-    start = item.get("periodStartAt")
-    end = item.get("periodEndAt")
-    if not finite_number(start) or not finite_number(end) or end < start:
-        raise ConfigError(f"Invalid memory period for {item_id}")
+    if memory_type != expected["memoryType"]:
+        raise ConfigError(f"Memory item {item_id} has the wrong type")
+    start = require_epoch_ms(item.get("periodStartAt"), f"{item_id}.periodStartAt")
+    end = require_epoch_ms(item.get("periodEndAt"), f"{item_id}.periodEndAt")
+    if (start, end) != (expected["periodStartAt"], expected["periodEndAt"]):
+        raise ConfigError(f"Memory item {item_id} has a non-canonical period")
+
     bullets = string_list(item.get("bullets"), f"{item_id}.bullets")
-    if memory_type == "workout" and not 1 <= len(bullets) <= 3:
-        raise ConfigError(f"Workout memory {item_id} must have 1-3 bullets")
-    if memory_type == "two_week" and len(bullets) != 1:
-        raise ConfigError(f"Two-week memory {item_id} must have one bullet")
-    if memory_type == "four_month" and len(bullets) != 2:
-        raise ConfigError(f"Four-month memory {item_id} must have two bullets")
+    if any(len(bullet) > 500 for bullet in bullets):
+        raise ConfigError(f"Memory item {item_id} bullets must be at most 500 characters")
+    required_bullets = {"workout": (1, 3), "two_week": (1, 1), "four_month": (2, 2)}
+    minimum, maximum = required_bullets[memory_type]
+    if not minimum <= len(bullets) <= maximum:
+        raise ConfigError(
+            f"Memory item {item_id} must have {minimum}"
+            + (f"-{maximum}" if minimum != maximum else "")
+            + " bullets"
+        )
+
     source_workout = item.get("sourceWorkoutSessionId")
-    if source_workout is not None and not isinstance(source_workout, str):
-        raise ConfigError(f"{item_id}.sourceWorkoutSessionId must be a string or null")
-    created = item.get("createdAt")
-    updated = item.get("updatedAt")
-    if not finite_number(created) or not finite_number(updated):
-        raise ConfigError(f"Invalid timestamps for memory item {item_id}")
-    if item.get("snapshotUpdatedAt") != snapshot_updated_at:
-        raise ConfigError(f"Memory item {item_id} has the wrong snapshotUpdatedAt")
+    if source_workout != expected["sourceWorkoutSessionId"]:
+        raise ConfigError(f"Memory item {item_id} has the wrong workout source")
+
+    def exact_sources(field: str) -> list[str]:
+        actual = require_unique_ids(item.get(field), f"{item_id}.{field}")
+        canonical = expected[field]
+        if set(actual) != set(canonical):
+            raise ConfigError(f"Memory item {item_id} has invalid {field}")
+        return canonical
+
+    source_session_ids = exact_sources("sourceSessionIds")
+    source_summary_ids = exact_sources("sourceSummaryIds")
+    if allowed_note_ids is None:
+        source_note_ids = exact_sources("sourceNoteIds")
+    else:
+        actual_notes = require_unique_ids(
+            item.get("sourceNoteIds"), f"{item_id}.sourceNoteIds"
+        )
+        allowed = set(allowed_note_ids)
+        if not set(actual_notes).issubset(allowed):
+            raise ConfigError(f"Memory item {item_id} references an unknown AI note")
+        selected = set(actual_notes)
+        source_note_ids = [note_id for note_id in allowed_note_ids if note_id in selected]
+
     return {
         "id": item_id,
         "memoryType": memory_type,
-        "periodStartAt": start,
-        "periodEndAt": end,
-        "sourceWorkoutSessionId": source_workout.strip() if isinstance(source_workout, str) and source_workout.strip() else None,
+        "periodStartAt": expected["periodStartAt"],
+        "periodEndAt": expected["periodEndAt"],
+        "sourceWorkoutSessionId": expected["sourceWorkoutSessionId"],
         "bullets": bullets,
-        "sourceSessionIds": string_list(item.get("sourceSessionIds"), f"{item_id}.sourceSessionIds"),
-        "sourceNoteIds": string_list(item.get("sourceNoteIds"), f"{item_id}.sourceNoteIds"),
-        "sourceSummaryIds": string_list(item.get("sourceSummaryIds"), f"{item_id}.sourceSummaryIds"),
+        "sourceSessionIds": source_session_ids,
+        "sourceNoteIds": source_note_ids,
+        "sourceSummaryIds": source_summary_ids,
         "model": model,
-        "createdAt": created,
-        "updatedAt": updated,
+        "createdAt": generated_at,
+        "updatedAt": generated_at,
         "snapshotUpdatedAt": snapshot_updated_at,
     }
 
@@ -846,66 +1470,216 @@ def validate_model_output(
     model: str,
     reasoning_effort: str,
     codex_version: str,
+    generated_at: int | float,
 ) -> dict[str, Any]:
+    if not model.strip() or len(model.strip()) > 120:
+        raise ConfigError("Configured Codex model name must be 1-120 characters")
     root = require_object(raw, "Codex output")
     if set(root) != {"briefing", "memory"}:
         raise ConfigError("Codex output must contain only briefing and memory")
 
     memory_envelope = require_object(memory_body, "memory response")
+    expected_memory_revision = memory_envelope.get("revision")
+    if (
+        not isinstance(expected_memory_revision, int)
+        or isinstance(expected_memory_revision, bool)
+        or expected_memory_revision < 0
+        or expected_memory_revision >= MAX_SAFE_INTEGER
+    ):
+        raise ConfigError("Cloud memory response has an invalid revision")
     existing_items_raw = memory_envelope.get("items")
     if not isinstance(existing_items_raw, list):
         raise ConfigError("Cloud memory items must be an array")
     existing_items = [require_object(item, "existing memory item") for item in existing_items_raw]
-    existing_ids = {
-        require_string(item.get("id"), "existing memory item id") for item in existing_items
-    }
+    existing_ids: set[str] = set()
+    for item in existing_items:
+        item_id = require_bounded_string(
+            item.get("id"), "existing memory item id", 180
+        )
+        if item_id in existing_ids:
+            raise ConfigError(f"Cloud memory has duplicate item id: {item_id}")
+        existing_ids.add(item_id)
 
     memory_out = require_object(root.get("memory"), "memory")
-    state = require_object(memory_out.get("state"), "memory.state")
-    current_context = require_string(
-        state.get("currentContext"), "memory.state.currentContext", allow_empty=True
-    )[:4000]
-    if not isinstance(state.get("paused"), bool):
-        raise ConfigError("memory.state.paused must be a boolean")
-    for field in ("windowStartedAt", "fourMonthStartedAt"):
-        if not finite_number(state.get(field)):
-            raise ConfigError(f"memory.state.{field} must be a number")
-    if state.get("sourceSnapshotUpdatedAt") != facts.updated_at:
-        raise ConfigError("memory.state.sourceSnapshotUpdatedAt does not match snapshot")
+    if set(memory_out) != {"newItems"}:
+        raise ConfigError("memory must contain only newItems")
 
     new_items_raw = memory_out.get("newItems")
     if not isinstance(new_items_raw, list):
         raise ConfigError("memory.newItems must be an array")
-    seen: set[str] = set()
-    new_items = [
-        validate_memory_item(
-            item,
-            snapshot_updated_at=facts.updated_at,
-            existing_ids=existing_ids,
-            seen=seen,
-            model=model,
-        )
-        for item in new_items_raw
-    ]
-    if state["paused"] and new_items:
+
+    raw_by_id: dict[str, dict[str, Any]] = {}
+    for raw_item in new_items_raw:
+        item = require_object(raw_item, "memory item")
+        item_id = require_string(item.get("id"), "memory item id")
+        if item_id in existing_ids:
+            raise ConfigError(f"Codex returned existing memory item as new: {item_id}")
+        if item_id in raw_by_id:
+            raise ConfigError(f"Codex returned duplicate memory item: {item_id}")
+        raw_by_id[item_id] = item
+
+    generated_timestamp = require_epoch_ms(generated_at, "generated_at")
+    sessions = canonical_completed_sessions(facts)
+    notes = canonical_ai_notes(facts)
+    note_ids = [item["id"] for item in notes]
+    summaries = trusted_summary_records(facts, existing_items)
+    trusted_state = trusted_memory_state(
+        facts, memory_envelope, sessions, today=today
+    )
+    new_items: list[dict[str, Any]] = []
+
+    if trusted_state["paused"] and raw_by_id:
         raise ConfigError("Paused memory cannot add new items")
+    if not trusted_state["paused"]:
+        existing_workout_sources = {
+            item.get("sourceWorkoutSessionId")
+            for item in existing_items
+            if item.get("memoryType") == "workout"
+            and isinstance(item.get("sourceWorkoutSessionId"), str)
+            and item.get("sourceWorkoutSessionId").strip()
+        }
+
+        def take(
+            expected: dict[str, Any], *, allowed_notes: list[str] | None = None
+        ) -> dict[str, Any]:
+            item_id = expected["id"]
+            raw_item = raw_by_id.pop(item_id, None)
+            if raw_item is None:
+                raise ConfigError(f"Codex omitted required memory item: {item_id}")
+            return validate_memory_item(
+                raw_item,
+                expected=expected,
+                snapshot_updated_at=facts.updated_at,
+                generated_at=generated_timestamp,
+                model=model,
+                allowed_note_ids=allowed_notes,
+            )
+
+        for session in sessions:
+            session_id = session["id"]
+            if session_id in existing_workout_sources:
+                continue
+            expected = {
+                "id": f"workout:{session_id}",
+                "memoryType": "workout",
+                "periodStartAt": session["startedAt"],
+                "periodEndAt": session["completedAt"],
+                "sourceWorkoutSessionId": session_id,
+                "sourceSessionIds": [session_id],
+                "sourceNoteIds": [],
+                "sourceSummaryIds": [],
+            }
+            new_items.append(take(expected, allowed_notes=note_ids))
+
+        today_start = pacific_date_start_ms(today)
+        periods = {
+            (item["memoryType"], item["periodStartAt"], item["periodEndAt"])
+            for item in summaries
+        }
+        two_week_start = advance_existing_periods(
+            trusted_state["windowStartedAt"],
+            memory_type="two_week",
+            today_start=today_start,
+            periods=periods,
+        )
+        two_week_end = add_calendar_days_ms(two_week_start, 14)
+        if two_week_end <= today_start:
+            source_sessions = [
+                item["id"]
+                for item in sessions
+                if two_week_start <= item["completedAt"] < two_week_end
+            ]
+            source_notes = [
+                item["id"]
+                for item in notes
+                if two_week_start <= item["createdAt"] < two_week_end
+            ]
+            expected = {
+                "id": f"two_week:{two_week_start}:{two_week_end}",
+                "memoryType": "two_week",
+                "periodStartAt": two_week_start,
+                "periodEndAt": two_week_end,
+                "sourceWorkoutSessionId": None,
+                "sourceSessionIds": source_sessions,
+                "sourceNoteIds": source_notes,
+                "sourceSummaryIds": [],
+            }
+            new_item = take(expected, allowed_notes=source_notes)
+            new_items.append(new_item)
+            summaries.append(
+                {
+                    "id": expected["id"],
+                    "memoryType": "two_week",
+                    "periodStartAt": two_week_start,
+                    "periodEndAt": two_week_end,
+                }
+            )
+            two_week_start = two_week_end
+        trusted_state["windowStartedAt"] = two_week_start
+
+        four_month_start = advance_existing_periods(
+            trusted_state["fourMonthStartedAt"],
+            memory_type="four_month",
+            today_start=today_start,
+            periods=periods,
+        )
+        four_month_end = add_calendar_months_ms(four_month_start, 4)
+        if four_month_end <= today_start:
+            source_summaries = [
+                item["id"]
+                for item in sorted(
+                    summaries,
+                    key=lambda summary: (
+                        summary["periodStartAt"],
+                        summary["periodEndAt"],
+                        summary["id"],
+                    ),
+                )
+                if item["memoryType"] == "two_week"
+                and four_month_start <= item["periodStartAt"]
+                and item["periodEndAt"] <= four_month_end
+            ]
+            expected = {
+                "id": f"four_month:{four_month_start}:{four_month_end}",
+                "memoryType": "four_month",
+                "periodStartAt": four_month_start,
+                "periodEndAt": four_month_end,
+                "sourceWorkoutSessionId": None,
+                "sourceSessionIds": [],
+                "sourceNoteIds": [],
+                "sourceSummaryIds": source_summaries,
+            }
+            new_items.append(take(expected))
+            four_month_start = four_month_end
+        trusted_state["fourMonthStartedAt"] = four_month_start
+
+    if raw_by_id:
+        unexpected = ", ".join(sorted(raw_by_id))
+        raise ConfigError(f"Codex returned unexpected memory items: {unexpected}")
     memory_payload = {
-        "state": {
-            "currentContext": current_context,
-            "paused": state["paused"],
-            "windowStartedAt": state["windowStartedAt"],
-            "fourMonthStartedAt": state["fourMonthStartedAt"],
-            "sourceSnapshotUpdatedAt": facts.updated_at,
-        },
-        "items": existing_items + new_items,
+        "state": trusted_state,
+        # The server upserts only supervisor-validated new items. Existing rows
+        # are never resent, so an artifact cannot overwrite prior memory.
+        "items": new_items,
     }
 
     briefing = require_object(root.get("briefing"), "briefing")
+    if set(briefing) != {"headline", "mode", "sections"}:
+        raise ConfigError("briefing must contain only headline, mode, and sections")
     headline = require_string(briefing.get("headline"), "briefing.headline")[:200]
     mode = briefing.get("mode")
     if mode not in MODES:
         raise ConfigError("briefing.mode is invalid")
     sections = require_object(briefing.get("sections"), "briefing.sections")
+    if set(sections) != {
+        "todaysCall",
+        "why",
+        "recoveryStatus",
+        "ouraRecovery",
+        "trainingTrend",
+        "watchOuts",
+    }:
+        raise ConfigError("briefing.sections has an invalid shape")
     recovery_status = sections.get("recoveryStatus")
     expected_recovery = recovery.get("status")
     if recovery_status not in RECOVERY_STATUSES:
@@ -974,10 +1748,12 @@ def validate_model_output(
         "manifest": {
             "date": today,
             "snapshotUpdatedAt": facts.updated_at,
+            "expectedMemoryRevision": expected_memory_revision,
             "recoveryStatus": recovery_status,
             "newMemoryItemIds": [item["id"] for item in new_items],
             "runId": run_id,
             "runnerVersion": RUNNER_VERSION,
+            "validatorCompatibilityVersion": VALIDATOR_COMPATIBILITY_VERSION,
             "promptVersion": PROMPT_VERSION,
             "promptHash": prompt_hash,
             "codexVersion": codex_version,
@@ -990,8 +1766,10 @@ def validate_model_output(
 def validate_spool(
     raw: Any,
     *,
-    today: str,
-    snapshot_updated_at: int | float,
+    today: str | None,
+    snapshot_updated_at: int | float | None,
+    memory_revision: int | None,
+    prompt_hash: str,
     model: str,
     reasoning_effort: str,
 ) -> dict[str, Any]:
@@ -999,63 +1777,215 @@ def validate_spool(
     if set(spool) != {"briefing", "memory", "manifest"}:
         raise ConfigError("Spool has an invalid shape")
     manifest = require_object(spool.get("manifest"), "spool.manifest")
-    if manifest.get("date") != today:
+    expected_manifest_fields = {
+        "date",
+        "snapshotUpdatedAt",
+        "expectedMemoryRevision",
+        "recoveryStatus",
+        "newMemoryItemIds",
+        "runId",
+        "runnerVersion",
+        "validatorCompatibilityVersion",
+        "promptVersion",
+        "promptHash",
+        "codexVersion",
+        "model",
+        "reasoningEffort",
+    }
+    if set(manifest) != expected_manifest_fields:
+        raise ConfigError("Spool manifest has an invalid shape")
+    spool_date = require_string(manifest.get("date"), "spool.manifest.date")
+    try:
+        parsed_date = dt.date.fromisoformat(spool_date)
+    except ValueError as exc:
+        raise ConfigError("Spool date is invalid") from exc
+    if parsed_date.isoformat() != spool_date:
+        raise ConfigError("Spool date is invalid")
+    if today is not None and spool_date != today:
         raise ConfigError("Spool date does not match today")
-    if manifest.get("snapshotUpdatedAt") != snapshot_updated_at:
+    manifest_snapshot = manifest.get("snapshotUpdatedAt")
+    if not finite_number(manifest_snapshot):
+        raise ConfigError("Spool snapshot is invalid")
+    if snapshot_updated_at is not None and manifest_snapshot != snapshot_updated_at:
         raise ConfigError("Spool snapshot does not match current snapshot")
+    manifest_revision = manifest.get("expectedMemoryRevision")
+    if (
+        not isinstance(manifest_revision, int)
+        or isinstance(manifest_revision, bool)
+        or manifest_revision < 0
+        or manifest_revision >= MAX_SAFE_INTEGER
+    ):
+        raise ConfigError("Spool memory revision is invalid")
+    if memory_revision is not None and manifest_revision != memory_revision:
+        raise ConfigError("Spool memory revision does not match current memory")
+    if manifest.get("runnerVersion") != RUNNER_VERSION:
+        raise ConfigError("Spool runner version is incompatible")
+    if manifest.get("validatorCompatibilityVersion") != VALIDATOR_COMPATIBILITY_VERSION:
+        raise ConfigError("Spool validator version is incompatible")
+    if manifest.get("promptVersion") != PROMPT_VERSION:
+        raise ConfigError("Spool prompt version is incompatible")
+    if manifest.get("promptHash") != prompt_hash:
+        raise ConfigError("Spool prompt fingerprint is incompatible")
     if manifest.get("model") != model:
         raise ConfigError("Spool model does not match the configured model")
     if manifest.get("reasoningEffort") != reasoning_effort:
         raise ConfigError("Spool reasoning effort does not match the configured effort")
     briefing = require_object(spool.get("briefing"), "spool.briefing")
     memory = require_object(spool.get("memory"), "spool.memory")
-    if briefing.get("snapshotUpdatedAt") != snapshot_updated_at:
+    if briefing.get("snapshotUpdatedAt") != manifest_snapshot:
         raise ConfigError("Spool briefing snapshot does not match")
     state = require_object(memory.get("state"), "spool.memory.state")
-    if state.get("sourceSnapshotUpdatedAt") != snapshot_updated_at:
+    if state.get("sourceSnapshotUpdatedAt") != manifest_snapshot:
         raise ConfigError("Spool memory snapshot does not match")
-    if not isinstance(memory.get("items"), list):
+    items = memory.get("items")
+    if not isinstance(items, list):
         raise ConfigError("Spool memory items must be an array")
+    item_ids: list[str] = []
+    for item in items:
+        item_object = require_object(item, "spool memory item")
+        item_ids.append(require_string(item_object.get("id"), "spool memory item id"))
+        if item_object.get("snapshotUpdatedAt") != manifest_snapshot:
+            raise ConfigError("Spool memory item snapshot does not match")
+    if len(item_ids) != len(set(item_ids)):
+        raise ConfigError("Spool memory contains duplicate item IDs")
+    new_ids = require_unique_ids(
+        manifest.get("newMemoryItemIds"), "spool.manifest.newMemoryItemIds"
+    )
+    if item_ids != new_ids:
+        raise ConfigError("Spool memory items do not match its manifest")
+    input_summary = require_object(
+        briefing.get("inputSummary"), "spool.briefing.inputSummary"
+    )
+    if input_summary.get("runnerVersion") != RUNNER_VERSION:
+        raise ConfigError("Spool briefing runner version is incompatible")
+    if input_summary.get("promptVersion") != PROMPT_VERSION:
+        raise ConfigError("Spool briefing prompt version is incompatible")
+    if input_summary.get("promptHash") != prompt_hash:
+        raise ConfigError("Spool briefing prompt fingerprint is incompatible")
     return spool
+
+
+def verify_committed_briefing(
+    raw: Any,
+    expected: dict[str, Any],
+    *,
+    date: str,
+    field: str,
+) -> dict[str, Any]:
+    remote = require_object(raw, field)
+    if remote.get("briefingDate") != date:
+        raise TransientError(f"{field} returned the wrong date")
+    for key, value in expected.items():
+        if remote.get(key) != value:
+            raise TransientError(f"{field} returned the wrong {key}")
+    expected_summary = require_object(
+        expected.get("inputSummary"), "spool.briefing.inputSummary"
+    )
+    remote_summary = require_object(remote.get("inputSummary"), f"{field}.inputSummary")
+    if remote_summary.get("runId") != expected_summary.get("runId"):
+        raise TransientError(f"{field} is not bound to the requested publish ID")
+    return remote
+
+
+def verify_committed_memory_state(
+    raw: Any,
+    expected: dict[str, Any],
+    *,
+    field: str,
+) -> dict[str, Any]:
+    remote = require_object(raw, field)
+    for key, value in expected.items():
+        if remote.get(key) != value:
+            raise TransientError(f"{field} returned the wrong {key}")
+    return remote
 
 
 def publish_spool(
     cloud: CloudClient,
     spool: dict[str, Any],
     *,
-    today: str,
     logger: logging.Logger,
 ) -> None:
     manifest = require_object(spool["manifest"], "spool.manifest")
-    logger.info("Uploading validated memory")
-    cloud.request("PUT", "/api/cloud/memory", body=spool["memory"], expected={200})
-    logger.info("Uploading validated briefing")
-    cloud.request(
+    date = require_string(manifest.get("date"), "spool.manifest.date")
+    publish_id = require_string(manifest.get("runId"), "spool.manifest.runId")
+    expected_revision = manifest.get("expectedMemoryRevision")
+    if (
+        not isinstance(expected_revision, int)
+        or isinstance(expected_revision, bool)
+        or expected_revision < 0
+        or expected_revision >= MAX_SAFE_INTEGER
+    ):
+        raise ConfigError("Spool has an invalid expected memory revision")
+    logger.info("Atomically uploading validated memory and briefing")
+    status, publish_response = cloud.request(
         "PUT",
-        f"/api/cloud/briefing/{today}",
-        body=spool["briefing"],
-        expected={200, 201},
+        f"/api/cloud/publish/{date}",
+        body={
+            "publishId": publish_id,
+            "expectedSnapshotUpdatedAt": manifest.get("snapshotUpdatedAt"),
+            "expectedMemoryRevision": expected_revision,
+            "memory": spool["memory"],
+            "briefing": spool["briefing"],
+        },
+        expected={200, 409},
+    )
+    if status == 409:
+        raise StalePublishError(
+            "Cloud snapshot or memory changed while the insight was generated"
+        )
+    published = require_object(publish_response, "atomic publish response")
+    next_revision = expected_revision + 1
+    if published.get("publishId") != publish_id:
+        raise TransientError("Atomic publish response is not bound to the publish ID")
+    if published.get("memoryRevision") != next_revision:
+        raise TransientError("Atomic publish returned the wrong memory revision")
+
+    expected_briefing = require_object(spool.get("briefing"), "spool.briefing")
+    expected_state = require_object(
+        require_object(spool.get("memory"), "spool.memory").get("state"),
+        "spool.memory.state",
+    )
+    # The endpoint returns a committed read selected through publishId replay
+    # semantics. Validate that response before consulting global state that a
+    # later legitimate memory mutation may already have advanced.
+    verify_committed_briefing(
+        published.get("briefing"),
+        expected_briefing,
+        date=date,
+        field="atomic publish response.briefing",
+    )
+    verify_committed_memory_state(
+        published.get("memoryState"),
+        expected_state,
+        field="atomic publish response.memoryState",
     )
 
     _, briefing_response = cloud.request(
-        "GET", f"/api/cloud/briefing/{today}", expected={200}
+        "GET", f"/api/cloud/briefing/{date}", expected={200}
     )
-    remote_briefing = require_object(
+    verify_committed_briefing(
         require_object(briefing_response, "briefing verification").get("briefing"),
-        "briefing verification.briefing",
+        expected_briefing,
+        date=date,
+        field="briefing verification.briefing",
     )
-    if remote_briefing.get("briefingDate") != today:
-        raise TransientError("Remote briefing verification returned the wrong date")
-    if remote_briefing.get("snapshotUpdatedAt") != manifest.get("snapshotUpdatedAt"):
-        raise TransientError("Remote briefing verification returned the wrong snapshot")
-    if remote_briefing.get("headline") != spool["briefing"].get("headline"):
-        raise TransientError("Remote briefing verification returned the wrong headline")
 
     _, memory_response = cloud.request("GET", "/api/cloud/memory", expected={200})
     remote_memory = require_object(memory_response, "memory verification")
-    remote_state = require_object(remote_memory.get("state"), "memory verification.state")
-    if remote_state.get("sourceSnapshotUpdatedAt") != manifest.get("snapshotUpdatedAt"):
-        raise TransientError("Remote memory verification returned the wrong snapshot")
+    remote_revision = remote_memory.get("revision")
+    if (
+        not isinstance(remote_revision, int)
+        or isinstance(remote_revision, bool)
+        or remote_revision < next_revision
+    ):
+        raise TransientError("Remote memory verification returned an older revision")
+    if remote_revision == next_revision:
+        verify_committed_memory_state(
+            remote_memory.get("state"),
+            expected_state,
+            field="memory verification.state",
+        )
     remote_items = remote_memory.get("items")
     if not isinstance(remote_items, list):
         raise TransientError("Remote memory verification returned invalid items")
@@ -1065,6 +1995,66 @@ def publish_spool(
     missing = set(manifest.get("newMemoryItemIds") or []) - remote_ids
     if missing:
         raise TransientError("Remote memory verification is missing new items")
+
+
+def quarantine_spool(path: Path, *, run_id: str, reason: str) -> Path:
+    target = path.with_name(f"{path.stem}.{reason}-{run_id}.quarantine")
+    os.replace(path, target)
+    return target
+
+
+def retry_prior_spools(
+    config: Config,
+    cloud: CloudClient,
+    *,
+    today: str,
+    run_id: str,
+    prompt_hash: str,
+    logger: logging.Logger,
+) -> None:
+    spool_dir = config.state_dir / "spool"
+    if not spool_dir.is_dir():
+        return
+    for path in sorted(spool_dir.glob("*.json")):
+        if path.stem == today:
+            continue
+        try:
+            spool = validate_spool(
+                read_json(path, max_bytes=8 * 1024 * 1024),
+                today=None,
+                snapshot_updated_at=None,
+                memory_revision=None,
+                prompt_hash=prompt_hash,
+                model=config.codex_model,
+                reasoning_effort=config.codex_effort,
+            )
+        except ConfigError:
+            quarantine_spool(path, run_id=run_id, reason="obsolete")
+            logger.warning("Quarantined an incompatible prior-day pending upload")
+            continue
+        try:
+            publish_spool(cloud, spool, logger=logger)
+        except StalePublishError:
+            quarantine_spool(path, run_id=run_id, reason="stale")
+            logger.warning("Quarantined a stale prior-day pending upload")
+            continue
+        except ConfigError as exc:
+            # The current-day pipeline must not be held hostage by a legacy
+            # artifact or a temporarily incompatible server response. Preserve
+            # it for a later retry/update rather than deleting trusted output.
+            logger.warning(
+                "Deferred a rejected prior-day pending upload without blocking today: %s",
+                exc,
+            )
+            continue
+        except TransientError as exc:
+            logger.warning(
+                "Deferred a transient prior-day pending upload without blocking today: %s",
+                exc,
+            )
+            continue
+        path.unlink()
+        logger.info("Published and verified prior-day pending result %s", path.stem)
 
 
 @contextlib.contextmanager
@@ -1121,16 +2111,10 @@ def configure_logging(config: Config, stamp: str) -> tuple[logging.Logger, Path]
 
 
 def update_status(config: Config, **values: Any) -> None:
-    current: dict[str, Any] = {}
     status_path = config.state_dir / "status.json"
-    if status_path.is_file():
-        with contextlib.suppress(ConfigError):
-            loaded = read_json(status_path, max_bytes=256 * 1024)
-            if isinstance(loaded, dict):
-                current.update(loaded)
-    current.update(values)
-    current["updatedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
-    atomic_write_json(status_path, current)
+    status = dict(values)
+    status["updatedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    atomic_write_json(status_path, status)
 
 
 def doctor(config: Config) -> int:
@@ -1140,6 +2124,7 @@ def doctor(config: Config) -> int:
         "reasoningEffort": config.codex_effort,
         "releaseRoot": str(config.release_root),
         "automationRoot": str(config.automation_root),
+        "codexHome": str(config.codex_home),
         "prompt": config.prompt_file.is_file(),
         "schema": config.schema_file.is_file(),
         "credentialFile": config.credential_file.is_file(),
@@ -1155,11 +2140,13 @@ def doctor(config: Config) -> int:
     try:
         codex = resolve_codex_binary(config.codex_override)
         checks["codexBinary"] = str(codex)
-        check_codex_login(codex)
+        validate_codex_home(config.codex_home)
+        checks["isolatedCodexHome"] = True
+        check_codex_login(config, codex)
         checks["chatgptLogin"] = True
         version = subprocess.run(
             [str(codex), "--version"],
-            env=clean_child_env(),
+            env=clean_codex_env(config),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -1169,6 +2156,7 @@ def doctor(config: Config) -> int:
         checks["codexVersion"] = version.stdout.strip()
     except RunnerError as exc:
         checks["codexBinary"] = False
+        checks["isolatedCodexHome"] = False
         checks["chatgptLogin"] = False
         checks["codexError"] = str(exc)
     checks["ok"] = all(
@@ -1181,6 +2169,7 @@ def doctor(config: Config) -> int:
             "ouraCredentialFile",
             "ouraDatabase",
             "cloudCredential",
+            "isolatedCodexHome",
             "chatgptLogin",
         )
     )
@@ -1230,6 +2219,20 @@ def run(config: Config, args: argparse.Namespace) -> int:
         )
         secret = parse_env_value(config.credential_file, "CLOUD_AUTOMATION_SECRET")
         cloud = CloudClient(config, secret, logger)
+        prompt_hash = prompt_fingerprint(config)
+
+        # A failed late-day upload remains retryable after midnight. The
+        # server-side CAS prevents an old artifact from overwriting any newer
+        # phone snapshot or memory state.
+        if not args.dry_run:
+            retry_prior_spools(
+                config,
+                cloud,
+                today=today,
+                run_id=run_id,
+                prompt_hash=prompt_hash,
+                logger=logger,
+            )
 
         existing_status, existing_body = cloud.request(
             "GET", f"/api/cloud/briefing/{today}", expected={200, 404}
@@ -1244,6 +2247,7 @@ def run(config: Config, args: argparse.Namespace) -> int:
             update_status(
                 config,
                 date=today,
+                runId=run_id,
                 stage="complete",
                 outcome="exists",
                 message="A verified same-day briefing already exists",
@@ -1257,6 +2261,19 @@ def run(config: Config, args: argparse.Namespace) -> int:
         facts = validate_snapshot(snapshot_body, now.date())
         logger.info("Cloud snapshot is usable; source date %s", facts.updated_date)
 
+        _, memory_body = cloud.request("GET", "/api/cloud/memory", expected={200})
+        memory_object = require_object(memory_body, "cloud memory response")
+        if not isinstance(memory_object.get("items"), list):
+            raise ConfigError("Cloud memory response has invalid items")
+        memory_revision = memory_object.get("revision")
+        if (
+            not isinstance(memory_revision, int)
+            or isinstance(memory_revision, bool)
+            or memory_revision < 0
+            or memory_revision >= MAX_SAFE_INTEGER
+        ):
+            raise ConfigError("Cloud memory response has an invalid revision")
+
         spool_dir = config.state_dir / "spool"
         spool_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         spool_path = spool_dir / f"{today}.json"
@@ -1266,12 +2283,13 @@ def run(config: Config, args: argparse.Namespace) -> int:
                     read_json(spool_path, max_bytes=8 * 1024 * 1024),
                     today=today,
                     snapshot_updated_at=facts.updated_at,
+                    memory_revision=memory_revision,
+                    prompt_hash=prompt_hash,
                     model=config.codex_model,
                     reasoning_effort=config.codex_effort,
                 )
             except ConfigError:
-                obsolete = spool_dir / f"{today}.obsolete-{run_id}.json"
-                os.replace(spool_path, obsolete)
+                quarantine_spool(spool_path, run_id=run_id, reason="obsolete")
                 logger.warning("Discarded an obsolete pending upload")
             else:
                 if args.dry_run:
@@ -1296,28 +2314,50 @@ def run(config: Config, args: argparse.Namespace) -> int:
                     snapshotUpdatedAt=facts.updated_at,
                     log=str(log_path),
                 )
-                publish_spool(cloud, spool, today=today, logger=logger)
-                spool_path.unlink()
-                update_status(
-                    config,
-                    date=today,
-                    runId=run_id,
-                    stage="complete",
-                    outcome="published",
-                    message="Published and verified the pending daily briefing",
-                    snapshotUpdatedAt=facts.updated_at,
-                    recoveryStatus=spool["manifest"].get("recoveryStatus"),
-                    model=spool["manifest"].get("model"),
-                    reasoningEffort=spool["manifest"].get("reasoningEffort"),
-                    log=str(log_path),
-                )
-                logger.info("Published and verified a pending result")
-                return EXIT_OK
-
-        _, memory_body = cloud.request("GET", "/api/cloud/memory", expected={200})
-        memory_object = require_object(memory_body, "cloud memory response")
-        if not isinstance(memory_object.get("items"), list):
-            raise ConfigError("Cloud memory response has invalid items")
+                try:
+                    publish_spool(cloud, spool, logger=logger)
+                except StalePublishError:
+                    quarantine_spool(spool_path, run_id=run_id, reason="stale")
+                    logger.warning("Pending upload became stale; regenerating")
+                    _, snapshot_body = cloud.request(
+                        "GET", "/api/cloud/snapshot", expected={200}
+                    )
+                    facts = validate_snapshot(snapshot_body, now.date())
+                    _, memory_body = cloud.request(
+                        "GET", "/api/cloud/memory", expected={200}
+                    )
+                    memory_object = require_object(
+                        memory_body, "cloud memory response"
+                    )
+                    if not isinstance(memory_object.get("items"), list):
+                        raise ConfigError("Cloud memory response has invalid items")
+                    memory_revision = memory_object.get("revision")
+                    if (
+                        not isinstance(memory_revision, int)
+                        or isinstance(memory_revision, bool)
+                        or memory_revision < 0
+                        or memory_revision >= MAX_SAFE_INTEGER
+                    ):
+                        raise ConfigError(
+                            "Cloud memory response has an invalid revision"
+                        )
+                else:
+                    spool_path.unlink()
+                    update_status(
+                        config,
+                        date=today,
+                        runId=run_id,
+                        stage="complete",
+                        outcome="published",
+                        message="Published and verified the pending daily briefing",
+                        snapshotUpdatedAt=facts.updated_at,
+                        recoveryStatus=spool["manifest"].get("recoveryStatus"),
+                        model=spool["manifest"].get("model"),
+                        reasoningEffort=spool["manifest"].get("reasoningEffort"),
+                        log=str(log_path),
+                    )
+                    logger.info("Published and verified a pending result")
+                    return EXIT_OK
 
         run_dir = config.state_dir / "runs" / today / run_id
         run_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
@@ -1355,8 +2395,7 @@ def run(config: Config, args: argparse.Namespace) -> int:
             return EXIT_OK
 
         codex = resolve_codex_binary(config.codex_override)
-        check_codex_login(codex)
-        prompt_hash = prompt_fingerprint(config)
+        check_codex_login(config, codex)
         prompt = build_model_prompt(
             config,
             today=today,
@@ -1392,6 +2431,7 @@ def run(config: Config, args: argparse.Namespace) -> int:
             model=config.codex_model,
             reasoning_effort=config.codex_effort,
             codex_version=codex_version,
+            generated_at=int(now.timestamp() * 1000),
         )
         atomic_write_json(run_dir / "validated-result.json", validated)
         with contextlib.suppress(FileNotFoundError):
@@ -1429,7 +2469,24 @@ def run(config: Config, args: argparse.Namespace) -> int:
             reasoningEffort=config.codex_effort,
             log=str(log_path),
         )
-        publish_spool(cloud, validated, today=today, logger=logger)
+        try:
+            publish_spool(cloud, validated, logger=logger)
+        except StalePublishError:
+            quarantine_spool(spool_path, run_id=run_id, reason="stale")
+            update_status(
+                config,
+                date=today,
+                runId=run_id,
+                stage="stale_inputs",
+                outcome="retry_needed",
+                message="Cloud data changed during generation; a fresh run is required",
+                snapshotUpdatedAt=facts.updated_at,
+                recoveryStatus=recovery_status,
+                model=config.codex_model,
+                reasoningEffort=config.codex_effort,
+                log=str(log_path),
+            )
+            return EXIT_TRANSIENT
         spool_path.unlink()
         update_status(
             config,
@@ -1462,6 +2519,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     os.umask(0o077)
+    signal.signal(signal.SIGTERM, handle_termination_signal)
+    signal.signal(signal.SIGINT, handle_termination_signal)
     args = parse_args(argv or sys.argv[1:])
     try:
         config = Config.from_env()
@@ -1474,6 +2533,7 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(config, Config) and not isinstance(exc, AlreadyRunning):
                 update_status(
                     config,
+                    date=dt.datetime.now(PACIFIC).date().isoformat(),
                     stage="failed" if exc.exit_code else exc.kind,
                     outcome=exc.kind,
                     message=str(exc)[:500],
@@ -1487,6 +2547,7 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(config, Config):
                 update_status(
                     config,
+                    date=dt.datetime.now(PACIFIC).date().isoformat(),
                     stage="failed",
                     outcome="software_error",
                     message=str(exc)[:500],

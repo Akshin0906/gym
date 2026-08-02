@@ -7,20 +7,12 @@
     "briefing": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "headline",
-        "mode",
-        "sections",
-        "source",
-        "model",
-        "snapshotUpdatedAt",
-        "inputSummary"
-      ],
+      "required": ["headline", "mode", "sections"],
       "properties": {
         "headline": { "type": "string" },
         "mode": {
           "type": "string",
-          "enum": ["push", "normal", "light", "deload"]
+          "enum": ["push", "normal", "light", "deload", "rest"]
         },
         "sections": {
           "type": "object",
@@ -50,59 +42,14 @@
               "items": { "type": "string" }
             }
           }
-        },
-        "source": { "type": "string" },
-        "model": { "type": "string" },
-        "snapshotUpdatedAt": { "type": "number" },
-        "inputSummary": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "snapshotUpdatedAt",
-            "latestCompletedWorkoutAt",
-            "workoutCount",
-            "loggedSetCount",
-            "usedOura",
-            "memoryItemCount",
-            "newMemoryItemCount"
-          ],
-          "properties": {
-            "snapshotUpdatedAt": { "type": "number" },
-            "latestCompletedWorkoutAt": {
-              "anyOf": [{ "type": "number" }, { "type": "null" }]
-            },
-            "workoutCount": { "type": "integer" },
-            "loggedSetCount": { "type": "integer" },
-            "usedOura": { "type": "boolean" },
-            "memoryItemCount": { "type": "integer" },
-            "newMemoryItemCount": { "type": "integer" }
-          }
         }
       }
     },
     "memory": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["state", "newItems"],
+      "required": ["newItems"],
       "properties": {
-        "state": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "currentContext",
-            "paused",
-            "windowStartedAt",
-            "fourMonthStartedAt",
-            "sourceSnapshotUpdatedAt"
-          ],
-          "properties": {
-            "currentContext": { "type": "string" },
-            "paused": { "type": "boolean" },
-            "windowStartedAt": { "type": "number" },
-            "fourMonthStartedAt": { "type": "number" },
-            "sourceSnapshotUpdatedAt": { "type": "number" }
-          }
-        },
         "newItems": {
           "type": "array",
           "items": {
@@ -117,11 +64,7 @@
               "bullets",
               "sourceSessionIds",
               "sourceNoteIds",
-              "sourceSummaryIds",
-              "model",
-              "createdAt",
-              "updatedAt",
-              "snapshotUpdatedAt"
+              "sourceSummaryIds"
             ],
             "properties": {
               "id": { "type": "string" },
@@ -149,11 +92,7 @@
               "sourceSummaryIds": {
                 "type": "array",
                 "items": { "type": "string" }
-              },
-              "model": { "type": "string" },
-              "createdAt": { "type": "number" },
-              "updatedAt": { "type": "number" },
-              "snapshotUpdatedAt": { "type": "number" }
+              }
             }
           }
         }

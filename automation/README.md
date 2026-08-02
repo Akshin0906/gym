@@ -13,23 +13,28 @@ while plugged in; the display can still sleep.
 The job deliberately separates trusted operations from model reasoning:
 
 1. A Python supervisor acquires an OS-released file lock.
-2. It checks for an existing same-day briefing and validates the cloud snapshot.
+2. It retries compatible pending uploads, checks for an existing same-day briefing, and validates the cloud snapshot.
 3. It refreshes Oura through the local OAuth companion and sanitizes recovery data.
 4. It fetches the existing Codex-owned training memory.
 5. It invokes `codex exec` with ChatGPT subscription authentication.
-6. Codex receives the data through stdin with no tools, plugins, network, writable filesystem, app secrets, or Oura tokens.
+6. Codex runs from an automation-only `CODEX_HOME` with web search and every currently exposed tool-bearing feature disabled, and receives no app secrets or Oura tokens.
 7. Codex returns one JSON object constrained by `codex_daily_briefing_output_schema.json`.
-8. The supervisor independently validates and annotates that object, spools it, uploads memory and briefing, and verifies both reads from production.
+8. The supervisor deterministically owns memory state/provenance and trusted metadata, audits the Codex JSONL stream for tool use, then spools the result.
+9. One server-side transaction compare-and-sets both the snapshot timestamp and memory revision before writing memory plus the briefing; the supervisor verifies the committed reads.
 
-If upload fails after generation, the next run reuses the validated spool rather
-than consuming another Codex turn. Runs are ephemeral and do not create hidden
-Codex conversation history.
+If upload fails after generation, later same-day or next-day launches retry the
+version-bound spool rather than consuming another Codex turn. A changed cloud
+snapshot or memory revision quarantines the artifact instead of publishing it.
+A transient or server-contract failure on an older spool leaves that artifact
+pending but never blocks today's check or generation. Runs are ephemeral and do
+not create hidden Codex conversation history.
 
 ## Schedule
 
-The launch agent tries at 10:30 AM Pacific, then at 11:00 AM, noon, and 3:00 PM.
-It also checks once after login. All attempts are idempotent and stop before
-Codex when a verified briefing already exists.
+The launch agent tries at 10:30 AM Pacific, then at 11:00 AM, noon, 3:00 PM,
+4:00 PM, 6:00 PM, and 9:00 PM. It also checks once after login. The later
+launches provide bounded upload retries; all attempts are idempotent and stop
+before Codex when a verified briefing already exists.
 
 When Oura is stale or unavailable before noon, the early runs wait for the next
 catch-up instead of permanently publishing a recovery-blind briefing. At noon
@@ -42,9 +47,10 @@ insight.
 /Users/Apple/Documents/gym/automation/manage_daily_briefing.sh install
 ```
 
-The same command with `update` atomically deploys a new version and reloads both
-launch agents. Mutable Oura credentials, its rotating OAuth database, and
-reports are never overwritten during updates.
+The same command with `update` stages and validates a new release, coordinates
+with the runner lock, reloads both launch agents with `bootout --wait`, and
+rolls back a failed doctor/reload. Mutable Oura credentials, its rotating OAuth
+database, and reports are preserved across updates.
 
 Useful commands:
 
@@ -72,15 +78,28 @@ Useful commands:
 Private runtime data lives under `~/.workout-tracker-codex-daily`:
 
 - `current`: atomic symlink to the active immutable release.
+- `codex-home`: automation-only ChatGPT authentication and allowlisted Codex runtime state. Codex necessarily materializes its bundled `skills/.system` descriptions and private SQLite/cache files even for ephemeral runs; personal instructions, user skills, plugins, memory folders, config, symlinks, and unknown top-level state remain forbidden.
 - `credentials.env`: only `CLOUD_AUTOMATION_SECRET`, mode `0600`.
-- `oura-codex-health`: private Oura code plus persistent OAuth/database state.
+- `oura-codex-health`: symlink to immutable Oura code; `.env`, database, and reports resolve to the private mutable store.
+- `rollback-bundles`: retained prior release/plist metadata for recovery.
 - `state/status.json`: sanitized operational status.
 - `state/spool`: validated results awaiting upload.
 - `state/runs`: private per-run diagnostics and validated artifacts.
 - `logs`: short supervisor and launchd logs.
 
 The runtime tree is restricted to the current macOS user. Successful Codex
-event streams are deleted, and old logs/run artifacts are pruned automatically.
+event streams are summarized into a content-free audit record before deletion,
+and old logs/run artifacts are pruned automatically.
+
+The audited bundled system skills are disabled individually by path, and the
+accepted bundle directory names are exact rather than open-ended. They are not
+copied from the personal Codex home. If a later Codex build changes that bundle,
+the run fails closed until the automation is reviewed. Tool-bearing feature
+paths—including image generation, skill search/install, app/browser/computer
+access, shell/unified execution, workspace dependencies, hooks, goals,
+subagents, and memories—are also explicitly disabled. The JSONL audit remains
+the final fail-closed check if a future CLI version nevertheless emits a tool
+item.
 
 ## Configuration overrides
 

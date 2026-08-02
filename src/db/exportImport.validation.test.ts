@@ -148,6 +148,31 @@ describe('import semantic validation', () => {
     )
   })
 
+  it('accepts the explicit rest safety mode', async () => {
+    const value = payload()
+    value.data.dailyBriefings.push({
+      briefingDate: '2026-08-01',
+      createdAt: 1,
+      source: 'codex-local',
+      snapshotUpdatedAt: 1,
+      headline: 'Rest today and get the pain assessed',
+      mode: 'rest',
+      sections: {
+        todaysCall: 'Do not train today.',
+        why: ['Recent context reports severe unexplained pain.'],
+        recoveryStatus: 'unavailable',
+        ouraRecovery: 'Oura unavailable; use workout history only.',
+        trainingTrend: 'Training history does not override the safety flag.',
+        watchOuts: ['Seek urgent care if symptoms are severe or worsening.'],
+      },
+      model: 'gpt-5.6-sol',
+      inputSummary: null,
+    })
+
+    await expect(importPayload(JSON.stringify(value))).resolves.toBeDefined()
+    expect((await db.dailyBriefings.get('2026-08-01'))?.mode).toBe('rest')
+  })
+
   it('validates fully before clearing existing data', async () => {
     await db.exercises.add(exercise('existing'))
     const value = payload()

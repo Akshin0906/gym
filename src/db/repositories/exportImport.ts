@@ -113,7 +113,13 @@ const MUSCLE_GROUPS = new Set([
   'abs',
   'traps',
 ])
-const RECOMMENDATION_MODES = new Set(['push', 'normal', 'light', 'deload'])
+const RECOMMENDATION_MODES = new Set([
+  'push',
+  'normal',
+  'light',
+  'deload',
+  'rest',
+])
 const RECOVERY_STATUSES = new Set(['fresh', 'stale', 'unavailable'])
 const SUMMARY_TYPES = new Set(['two_week', 'four_month'])
 

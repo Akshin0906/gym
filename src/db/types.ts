@@ -79,7 +79,7 @@ export interface WorkoutSession {
   doneExerciseIds?: string[]
 }
 
-export type RecommendationMode = 'push' | 'normal' | 'light' | 'deload'
+export type RecommendationMode = 'push' | 'normal' | 'light' | 'deload' | 'rest'
 export type RecoveryStatus = 'fresh' | 'stale' | 'unavailable'
 
 export interface Recommendation {

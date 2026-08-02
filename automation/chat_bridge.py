@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-BRIDGE_VERSION = "1.1"
+BRIDGE_VERSION = "1.3"
 MODEL = "gpt-5.6-sol"
 ALLOWED_EFFORTS = {"medium", "xhigh"}
 DEFAULT_EFFORT = "medium"
@@ -117,6 +117,21 @@ class CloudHTTPError(BridgeError):
         error = body.get("error") if isinstance(body, dict) else None
         suffix = f" ({error})" if isinstance(error, str) else ""
         super().__init__(f"Cloud request {path} failed with HTTP {status}{suffix}")
+
+
+class RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Expose redirects as HTTP responses instead of following them."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
 
 
 class RpcError(TransientError):
@@ -529,6 +544,7 @@ class CloudClient:
         self.retries = config.http_retries
         self.retry_delay = config.retry_delay_seconds
         self.logger = logger
+        self.opener = urllib.request.build_opener(RejectRedirectHandler())
 
     def request(
         self,
@@ -557,7 +573,7 @@ class CloudClient:
                 url, data=payload, method=method, headers=headers
             )
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                with self.opener.open(request, timeout=self.timeout) as response:
                     status = int(response.status)
                     raw = response.read(MAX_HTTP_BYTES + 1)
                 if len(raw) > MAX_HTTP_BYTES:
@@ -819,7 +835,15 @@ class AppServerClient:
             "--disable",
             "apps",
             "--disable",
+            "auth_elicitation",
+            "--disable",
             "browser_use",
+            "--disable",
+            "browser_use_external",
+            "--disable",
+            "browser_use_full_cdp_access",
+            "--disable",
+            "code_mode_host",
             "--disable",
             "computer_use",
             "--disable",
@@ -827,13 +851,33 @@ class AppServerClient:
             "--disable",
             "hooks",
             "--disable",
+            "image_generation",
+            "--disable",
+            "in_app_browser",
+            "--disable",
+            "memories",
+            "--disable",
             "multi_agent",
             "--disable",
             "plugins",
             "--disable",
             "remote_plugin",
             "--disable",
+            "shell_snapshot",
+            "--disable",
             "shell_tool",
+            "--disable",
+            "skill_mcp_dependency_install",
+            "--disable",
+            "skill_search",
+            "--disable",
+            "tool_call_mcp_elicitation",
+            "--disable",
+            "tool_suggest",
+            "--disable",
+            "unified_exec",
+            "--disable",
+            "workspace_dependencies",
             "-c",
             'approval_policy="never"',
             "-c",

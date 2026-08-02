@@ -260,7 +260,6 @@
         "secondaryMuscles": {
           "type": "array",
           "maxItems": 11,
-          "uniqueItems": true,
           "items": {
             "type": "string",
             "enum": [

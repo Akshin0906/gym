@@ -20,6 +20,7 @@ const MODE_COLOR: Record<RecommendationMode, string> = {
   normal: 'oklch(0.68 0.02 250)',
   light: 'oklch(0.72 0.10 220)',
   deload: 'oklch(0.55 0.04 250)',
+  rest: 'oklch(0.66 0.17 25)',
 }
 
 // The system prompt forbids markdown, but the model occasionally leaks

@@ -63,6 +63,298 @@ const failDb: D1Database = {
   },
 }
 
+class AtomicPublishStatement implements D1PreparedStatement {
+  readonly values: unknown[] = []
+
+  constructor(
+    readonly db: AtomicPublishDb,
+    readonly query: string,
+  ) {}
+
+  bind(...values: unknown[]): D1PreparedStatement {
+    this.values.splice(0, this.values.length, ...values)
+    return this
+  }
+
+  async first<T = unknown>(): Promise<T | null> {
+    return this.db.first(this.query, this.values) as T | null
+  }
+
+  async all<T = unknown>(): Promise<{ results?: T[] }> {
+    return { results: this.db.all(this.query) as T[] }
+  }
+
+  async run(): Promise<D1Result> {
+    throw new Error('atomic publish test unexpectedly called run()')
+  }
+}
+
+class AtomicPublishDb implements D1Database {
+  readonly writes: string[] = []
+  batchCalls = 0
+  memoryState: Record<string, unknown> | null = null
+  readonly memoryItems = new Map<string, Record<string, unknown>>()
+  readonly briefings = new Map<string, Record<string, unknown>>()
+  readonly receipts = new Map<string, Record<string, unknown>>()
+  publishToken = 'initial'
+  publishFingerprint = 'initial'
+  writeToken = 'initial'
+
+  constructor(
+    readonly snapshotUpdatedAt = 5,
+    public revision = 0,
+  ) {}
+
+  prepare(query: string): D1PreparedStatement {
+    return new AtomicPublishStatement(this, query)
+  }
+
+  first(query: string, values: unknown[]): unknown | null {
+    if (query.includes('FROM codex_publish_receipts')) {
+      const receipt = this.receipts.get(String(values[0]))
+      if (
+        !receipt ||
+        receipt.publish_fingerprint !== values[1] ||
+        receipt.briefing_date !== values[2] ||
+        receipt.expected_snapshot_updated_at !== values[3] ||
+        receipt.base_memory_revision !== values[4]
+      ) {
+        return null
+      }
+      return receipt
+    }
+    if (query.includes('JOIN daily_briefings AS briefing')) {
+      const briefing = this.briefings.get(String(values[0]))
+      if (
+        !briefing ||
+        !this.memoryState ||
+        values[3] !== this.publishToken ||
+        values[4] !== this.publishFingerprint ||
+        values[5] !== this.revision ||
+        values[6] !== briefing.snapshot_updated_at ||
+        values[7] !== this.memoryState.source_snapshot_updated_at
+      ) {
+        return null
+      }
+      return {
+        revision: this.revision,
+        publish_token: this.publishToken,
+        publish_fingerprint: this.publishFingerprint,
+        briefing_date: briefing.briefing_date,
+        briefing_created_at: briefing.created_at,
+        briefing_source: briefing.source,
+        briefing_snapshot_updated_at: briefing.snapshot_updated_at,
+        headline: briefing.headline,
+        mode: briefing.mode,
+        sections_json: briefing.sections_json,
+        model: briefing.model,
+        input_summary_json: briefing.input_summary_json,
+        memory_updated_at: this.memoryState.updated_at,
+        current_context: this.memoryState.current_context,
+        paused: this.memoryState.paused,
+        window_started_at: this.memoryState.window_started_at,
+        four_month_started_at: this.memoryState.four_month_started_at,
+        memory_snapshot_updated_at:
+          this.memoryState.source_snapshot_updated_at,
+      }
+    }
+    if (query.includes('FROM daily_briefings')) {
+      return this.briefings.get(String(values[0])) ?? null
+    }
+    if (query.includes('FROM codex_memory_state')) return this.memoryState
+    if (query.includes('FROM codex_publish_revision')) {
+      return {
+        revision: this.revision,
+        publish_token: this.publishToken,
+        write_token: this.writeToken,
+      }
+    }
+    throw new Error(`unexpected atomic publish query: ${query}`)
+  }
+
+  all(query: string): unknown[] {
+    if (query.includes('FROM codex_memory_items')) {
+      return [...this.memoryItems.values()]
+    }
+    throw new Error(`unexpected atomic publish query: ${query}`)
+  }
+
+  async batch<T = unknown>(
+    rawStatements: D1PreparedStatement[],
+  ): Promise<D1Result<T>[]> {
+    this.batchCalls += 1
+    const statements = rawStatements as AtomicPublishStatement[]
+    const firstStatement = statements[0]
+    if (
+      statements.length === 3 &&
+      firstStatement?.query.includes('FROM codex_memory_state')
+    ) {
+      return [
+        { success: true, results: this.memoryState ? [this.memoryState] : [] },
+        { success: true, results: [...this.memoryItems.values()] },
+        {
+          success: true,
+          results: [
+            {
+              revision: this.revision,
+              publish_token: this.publishToken,
+              write_token: this.writeToken,
+            },
+          ],
+        },
+      ] as D1Result<T>[]
+    }
+    if (firstStatement?.query.includes('INSERT INTO codex_publish_revision')) {
+      if (!firstStatement.query.includes('revision + 1')) {
+        throw new Error('legacy memory mutation does not advance the revision')
+      }
+      this.publishToken = String(firstStatement.values[1])
+      this.publishFingerprint = String(firstStatement.values[2])
+      this.writeToken = String(firstStatement.values[3])
+      this.revision += 1
+      this.writes.push('revision')
+      return statements.map(() => ({
+        success: true,
+        meta: { changes: 1 },
+      }))
+    }
+    if (statements.length !== 6) {
+      throw new Error(`expected six atomic statements, received ${statements.length}`)
+    }
+    const [revision, state, items, briefing, receipt, verification] = statements
+    if (
+      !revision.query.includes('revision = ?') ||
+      !revision.query.includes('workout_snapshots')
+    ) {
+      throw new Error('revision compare-and-set guard is missing')
+    }
+    for (const statement of [state, items, briefing]) {
+      if (
+        !statement.query.includes('write_token = ?') ||
+        !statement.query.includes('workout_snapshots')
+      ) {
+        throw new Error('atomic write guard is missing')
+      }
+    }
+    const expectedRevision = revision.values[4]
+    const expectedSnapshotUpdatedAt = revision.values[6]
+    if (
+      expectedRevision !== this.revision ||
+      expectedSnapshotUpdatedAt !== this.snapshotUpdatedAt ||
+      this.receipts.has(String(revision.values[7]))
+    ) {
+      const committed = this.first(verification.query, verification.values)
+      return [
+        ...statements.slice(0, 5).map(() => ({
+          success: true,
+          meta: { changes: 0 },
+        })),
+        { success: true, results: committed ? [committed] : [] },
+      ] as D1Result<T>[]
+    }
+
+    const parsedItems = JSON.parse(String(items.values[0])) as Array<
+      Record<string, unknown>
+    >
+    const nextState = {
+      id: state.values[0],
+      updated_at: state.values[1],
+      current_context: state.values[2],
+      paused: state.values[3],
+      window_started_at: state.values[4],
+      four_month_started_at: state.values[5],
+      source_snapshot_updated_at: state.values[6],
+    }
+    const nextBriefing = {
+      briefing_date: briefing.values[0],
+      created_at: briefing.values[1],
+      source: briefing.values[2],
+      snapshot_updated_at: briefing.values[3],
+      headline: briefing.values[4],
+      mode: briefing.values[5],
+      sections_json: briefing.values[6],
+      model: briefing.values[7],
+      input_summary_json: briefing.values[8],
+    }
+
+    this.publishToken = String(revision.values[0])
+    this.publishFingerprint = String(revision.values[1])
+    this.writeToken = String(revision.values[2])
+    this.revision += 1
+    this.memoryState = nextState
+    for (const item of parsedItems) {
+      this.memoryItems.set(String(item.id), item)
+    }
+    this.briefings.set(String(nextBriefing.briefing_date), nextBriefing)
+    this.receipts.set(String(receipt.values[0]), {
+      publish_id: receipt.values[0],
+      publish_fingerprint: receipt.values[1],
+      briefing_date: nextBriefing.briefing_date,
+      expected_snapshot_updated_at: receipt.values[3],
+      base_memory_revision: receipt.values[4],
+      revision: this.revision,
+      briefing_created_at: nextBriefing.created_at,
+      briefing_source: nextBriefing.source,
+      briefing_snapshot_updated_at: nextBriefing.snapshot_updated_at,
+      headline: nextBriefing.headline,
+      mode: nextBriefing.mode,
+      sections_json: nextBriefing.sections_json,
+      model: nextBriefing.model,
+      input_summary_json: nextBriefing.input_summary_json,
+      memory_updated_at: nextState.updated_at,
+      current_context: nextState.current_context,
+      paused: nextState.paused,
+      window_started_at: nextState.window_started_at,
+      four_month_started_at: nextState.four_month_started_at,
+      memory_snapshot_updated_at: nextState.source_snapshot_updated_at,
+    })
+    this.writes.push(
+      'revision',
+      'memory-state',
+      ...parsedItems.map((item) => `memory-item:${String(item.id)}`),
+      'briefing',
+      'receipt',
+    )
+
+    return [
+      { success: true, meta: { changes: 1 } },
+      { success: true, meta: { changes: 1 } },
+      { success: true, meta: { changes: parsedItems.length } },
+      { success: true, meta: { changes: 1 } },
+      { success: true, meta: { changes: 1 } },
+      {
+        success: true,
+        results: [this.first(verification.query, verification.values)],
+      },
+    ] as D1Result<T>[]
+  }
+}
+
+class ConcurrentReplayDb extends AtomicPublishDb {
+  override async batch<T = unknown>(
+    statements: D1PreparedStatement[],
+  ): Promise<D1Result<T>[]> {
+    const committedByOtherRequest = await super.batch<T>(statements)
+    return committedByOtherRequest.map((result, index) =>
+      index === 5
+        ? result
+        : { success: true, meta: { changes: 0 } },
+    )
+  }
+}
+
+class ImmediatelySupersededPublishDb extends AtomicPublishDb {
+  override async batch<T = unknown>(
+    statements: D1PreparedStatement[],
+  ): Promise<D1Result<T>[]> {
+    const committedResult = await super.batch<T>(statements)
+    this.revision += 1
+    this.publishToken = 'newer-publish'
+    this.publishFingerprint = 'newer-fingerprint'
+    return committedResult
+  }
+}
+
 function automationRequest(path: string, payload: unknown): Request {
   return new Request(`https://gym.test/api/cloud/${path}`, {
     method: 'PUT',
@@ -89,6 +381,50 @@ function validMemoryItem(): Record<string, unknown> {
     createdAt: 3,
     updatedAt: 4,
     snapshotUpdatedAt: 5,
+  }
+}
+
+function atomicPublishPayload(options: {
+  stateSnapshotUpdatedAt?: number
+  itemSnapshotUpdatedAt?: number
+  briefingSnapshotUpdatedAt?: number
+  mode?: string
+} = {}): Record<string, unknown> {
+  return {
+    publishId: 'run-2026-08-01-1',
+    expectedSnapshotUpdatedAt: 5,
+    expectedMemoryRevision: 0,
+    memory: {
+      state: {
+        currentContext: 'Current training block',
+        paused: false,
+        windowStartedAt: 1,
+        fourMonthStartedAt: 2,
+        sourceSnapshotUpdatedAt: options.stateSnapshotUpdatedAt ?? 5,
+      },
+      items: [
+        {
+          ...validMemoryItem(),
+          snapshotUpdatedAt: options.itemSnapshotUpdatedAt ?? 5,
+        },
+      ],
+    },
+    briefing: {
+      headline: 'Recover today',
+      mode: options.mode ?? 'rest',
+      snapshotUpdatedAt: options.briefingSnapshotUpdatedAt ?? 5,
+      source: 'codex-local',
+      sections: {
+        todaysCall: 'Rest and recover.',
+        why: ['Acute symptoms make training inappropriate.'],
+        recoveryStatus: 'fresh',
+        ouraRecovery: 'Recovery metrics are suppressed by symptoms.',
+        trainingTrend: 'Training can resume after symptoms resolve.',
+        watchOuts: ['Seek medical help for severe symptoms.'],
+      },
+      model: 'gpt-test',
+      inputSummary: { recoveryStatus: 'fresh' },
+    },
   }
 }
 
@@ -238,6 +574,50 @@ describe('briefing validation', () => {
 })
 
 describe('memory validation', () => {
+  it('reads state, items, and revision from one transactional batch', async () => {
+    const db = new AtomicPublishDb(5, 7)
+    db.memoryState = {
+      id: 'primary',
+      updated_at: 9,
+      current_context: 'Consistent context',
+      paused: 0,
+      window_started_at: 1,
+      four_month_started_at: 2,
+      source_snapshot_updated_at: 5,
+    }
+    db.memoryItems.set('workout:1', {
+      id: 'workout:1',
+      memory_type: 'workout',
+      period_start_at: 1,
+      period_end_at: 2,
+      source_workout_session_id: 'session-1',
+      bullets_json: '["Completed three sets."]',
+      source_session_ids_json: '["session-1"]',
+      source_note_ids_json: '[]',
+      source_summary_ids_json: '[]',
+      model: 'gpt-test',
+      created_at: 3,
+      updated_at: 4,
+      snapshot_updated_at: 5,
+    })
+    const response = await cloudOnRequest({
+      request: new Request('https://gym.test/api/cloud/memory', {
+        headers: { 'X-Cloud-Automation-Secret': 'test-secret' },
+      }),
+      env: { CLOUD_AUTOMATION_SECRET: 'test-secret', WORKOUT_DB: db },
+      params: { path: 'memory' },
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({
+      revision: 7,
+      state: { currentContext: 'Consistent context' },
+      items: [{ id: 'workout:1' }],
+    })
+    expect(db.batchCalls).toBe(1)
+    expect(db.writes).toEqual([])
+  })
+
   it('accepts and trims a complete valid item and state', () => {
     expect(assertMemoryItem(validMemoryItem())).toMatchObject({
       id: 'workout:1',
@@ -266,10 +646,19 @@ describe('memory validation', () => {
   it('rejects malformed present values rather than coercing or filtering', () => {
     expect(() =>
       assertMemoryItem({ ...validMemoryItem(), createdAt: 'now' }),
-    ).toThrow('createdAt must be a finite number')
+    ).toThrow('createdAt must be a non-negative safe integer')
+    expect(() =>
+      assertMemoryItem({
+        ...validMemoryItem(),
+        periodStartAt: Number.MAX_SAFE_INTEGER + 1,
+      }),
+    ).toThrow('periodStartAt must be a non-negative safe integer')
+    expect(() =>
+      assertMemoryItem({ ...validMemoryItem(), updatedAt: 1.5 }),
+    ).toThrow('updatedAt must be a non-negative safe integer')
     expect(() =>
       assertMemoryItem({ ...validMemoryItem(), snapshotUpdatedAt: '5' }),
-    ).toThrow('snapshotUpdatedAt must be a finite number')
+    ).toThrow('snapshotUpdatedAt must be a non-negative safe integer')
     expect(() =>
       assertMemoryItem({
         ...validMemoryItem(),
@@ -309,6 +698,277 @@ describe('memory validation', () => {
       expect(response.status).toBe(400)
       expect(await response.json()).toMatchObject({ error: 'invalid_memory' })
     }
+  })
+
+  it('advances the memory revision in the same batch as a legacy mutation', async () => {
+    const db = new AtomicPublishDb()
+    const response = await cloudOnRequest({
+      request: automationRequest('memory', { items: [] }),
+      env: { CLOUD_AUTOMATION_SECRET: 'test-secret', WORKOUT_DB: db },
+      params: { path: 'memory' },
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ revision: 1 })
+    expect(db.batchCalls).toBe(1)
+    expect(db.writes).toEqual(['revision'])
+  })
+})
+
+describe('atomic briefing publish', () => {
+  it('accepts rest and stores memory plus briefing in one batch', async () => {
+    const db = new AtomicPublishDb()
+    const response = await cloudOnRequest({
+      request: automationRequest(
+        'publish/2026-08-01',
+        atomicPublishPayload(),
+      ),
+      env: { CLOUD_AUTOMATION_SECRET: 'test-secret', WORKOUT_DB: db },
+      params: { path: ['publish', '2026-08-01'] },
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({
+      briefing: {
+        briefingDate: '2026-08-01',
+        headline: 'Recover today',
+        mode: 'rest',
+        snapshotUpdatedAt: 5,
+      },
+      memoryState: {
+        currentContext: 'Current training block',
+        sourceSnapshotUpdatedAt: 5,
+      },
+      memoryRevision: 1,
+    })
+    expect(db.batchCalls).toBe(1)
+    expect(db.writes).toContain('revision')
+    expect(db.writes).toContain('memory-state')
+    expect(db.writes).toContain('memory-item:workout:1')
+    expect(db.writes).toContain('briefing')
+    expect(db.memoryItems.has('workout:1')).toBe(true)
+  })
+
+  it('returns an already committed publishId without writing again', async () => {
+    const db = new AtomicPublishDb()
+    const payload = atomicPublishPayload()
+    const context = {
+      env: { CLOUD_AUTOMATION_SECRET: 'test-secret', WORKOUT_DB: db },
+      params: { path: ['publish', '2026-08-01'] },
+    }
+
+    const first = await cloudOnRequest({
+      request: automationRequest('publish/2026-08-01', payload),
+      ...context,
+    })
+    expect(first.status).toBe(200)
+    const firstBody = await first.json()
+    const writesAfterFirstPublish = [...db.writes]
+
+    const replay = await cloudOnRequest({
+      request: automationRequest('publish/2026-08-01', payload),
+      ...context,
+    })
+
+    expect(replay.status).toBe(200)
+    expect(await replay.json()).toEqual(firstBody)
+    expect(db.batchCalls).toBe(1)
+    expect(db.revision).toBe(1)
+    expect(db.writes).toEqual(writesAfterFirstPublish)
+  })
+
+  it('replays a receipt after a later legacy memory PUT', async () => {
+    const db = new AtomicPublishDb()
+    const payload = atomicPublishPayload()
+    const context = {
+      env: { CLOUD_AUTOMATION_SECRET: 'test-secret', WORKOUT_DB: db },
+      params: { path: ['publish', '2026-08-01'] },
+    }
+    const first = await cloudOnRequest({
+      request: automationRequest('publish/2026-08-01', payload),
+      ...context,
+    })
+    const firstBody = await first.json()
+
+    const memoryPut = await cloudOnRequest({
+      request: automationRequest('memory', { items: [] }),
+      env: context.env,
+      params: { path: 'memory' },
+    })
+    expect(memoryPut.status).toBe(200)
+    expect(db.revision).toBe(2)
+
+    const replay = await cloudOnRequest({
+      request: automationRequest('publish/2026-08-01', payload),
+      ...context,
+    })
+    expect(replay.status).toBe(200)
+    expect(await replay.json()).toEqual(firstBody)
+    expect(db.batchCalls).toBe(2)
+  })
+
+  it('rejects a publishId replay with different validated content', async () => {
+    const db = new AtomicPublishDb()
+    const firstPayload = atomicPublishPayload()
+    const conflictingPayload = atomicPublishPayload()
+    conflictingPayload.expectedMemoryRevision = 1
+    ;(conflictingPayload.briefing as Record<string, unknown>).headline =
+      'Different content under the same publish ID'
+    const context = {
+      env: { CLOUD_AUTOMATION_SECRET: 'test-secret', WORKOUT_DB: db },
+      params: { path: ['publish', '2026-08-01'] },
+    }
+
+    const first = await cloudOnRequest({
+      request: automationRequest('publish/2026-08-01', firstPayload),
+      ...context,
+    })
+    expect(first.status).toBe(200)
+    const writesAfterFirstPublish = [...db.writes]
+
+    const conflict = await cloudOnRequest({
+      request: automationRequest('publish/2026-08-01', conflictingPayload),
+      ...context,
+    })
+
+    expect(conflict.status).toBe(409)
+    expect(await conflict.json()).toEqual({ error: 'stale_publish_state' })
+    expect(db.revision).toBe(1)
+    expect(db.writes).toEqual(writesAfterFirstPublish)
+  })
+
+  it('returns and durably replays its receipt after a newer mutation', async () => {
+    const db = new ImmediatelySupersededPublishDb()
+    const payload = atomicPublishPayload()
+    const context = {
+      env: { CLOUD_AUTOMATION_SECRET: 'test-secret', WORKOUT_DB: db },
+      params: { path: ['publish', '2026-08-01'] },
+    }
+    const response = await cloudOnRequest({
+      request: automationRequest('publish/2026-08-01', payload),
+      ...context,
+    })
+
+    expect(response.status).toBe(200)
+    const firstBody = await response.json()
+    expect(firstBody).toMatchObject({
+      publishId: 'run-2026-08-01-1',
+      briefing: { headline: 'Recover today' },
+      memoryRevision: 1,
+    })
+    expect(db.publishToken).toBe('newer-publish')
+    expect(db.revision).toBe(2)
+
+    const replay = await cloudOnRequest({
+      request: automationRequest('publish/2026-08-01', payload),
+      ...context,
+    })
+    expect(replay.status).toBe(200)
+    expect(await replay.json()).toEqual(firstBody)
+    expect(db.batchCalls).toBe(1)
+  })
+
+  it('returns the committed result when an identical request wins the CAS race', async () => {
+    const db = new ConcurrentReplayDb()
+    const response = await cloudOnRequest({
+      request: automationRequest(
+        'publish/2026-08-01',
+        atomicPublishPayload(),
+      ),
+      env: { CLOUD_AUTOMATION_SECRET: 'test-secret', WORKOUT_DB: db },
+      params: { path: ['publish', '2026-08-01'] },
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({
+      briefing: { headline: 'Recover today', mode: 'rest' },
+      memoryRevision: 1,
+    })
+    expect(db.batchCalls).toBe(1)
+    expect(db.revision).toBe(1)
+  })
+
+  it('rejects malformed envelopes before preparing a batch', async () => {
+    const malformedMemory = atomicPublishPayload()
+    malformedMemory.memory = {
+      ...(malformedMemory.memory as Record<string, unknown>),
+      items: 'not-an-array',
+    }
+    const oversizedId = atomicPublishPayload()
+    oversizedId.publishId = 'x'.repeat(201)
+
+    for (const payload of [malformedMemory, oversizedId]) {
+      const response = await cloudOnRequest({
+        request: automationRequest('publish/2026-08-01', payload),
+        env: { CLOUD_AUTOMATION_SECRET: 'test-secret', WORKOUT_DB: failDb },
+        params: { path: ['publish', '2026-08-01'] },
+      })
+
+      expect(response.status).toBe(400)
+      expect(await response.json()).toMatchObject({ error: 'invalid_publish' })
+    }
+  })
+
+  it('rejects every internal snapshot timestamp mismatch before D1', async () => {
+    const mismatches = [
+      atomicPublishPayload({ stateSnapshotUpdatedAt: 6 }),
+      atomicPublishPayload({ itemSnapshotUpdatedAt: 6 }),
+      atomicPublishPayload({ briefingSnapshotUpdatedAt: 6 }),
+    ]
+
+    for (const payload of mismatches) {
+      const response = await cloudOnRequest({
+        request: automationRequest('publish/2026-08-01', payload),
+        env: { CLOUD_AUTOMATION_SECRET: 'test-secret', WORKOUT_DB: failDb },
+        params: { path: ['publish', '2026-08-01'] },
+      })
+      expect(response.status).toBe(400)
+      expect(await response.json()).toEqual({
+        error: 'publish_snapshot_mismatch',
+      })
+    }
+  })
+
+  it('makes zero writes when the cloud snapshot is stale', async () => {
+    const db = new AtomicPublishDb(6, 0)
+    const response = await cloudOnRequest({
+      request: automationRequest(
+        'publish/2026-08-01',
+        atomicPublishPayload(),
+      ),
+      env: { CLOUD_AUTOMATION_SECRET: 'test-secret', WORKOUT_DB: db },
+      params: { path: ['publish', '2026-08-01'] },
+    })
+
+    expect(response.status).toBe(409)
+    expect(await response.json()).toEqual({ error: 'stale_publish_state' })
+    expect(db.batchCalls).toBe(1)
+    expect(db.writes).toEqual([])
+    expect(db.memoryState).toBeNull()
+    expect(db.memoryItems.size).toBe(0)
+    expect(db.briefings.size).toBe(0)
+    expect(db.revision).toBe(0)
+  })
+
+  it('makes zero writes when the memory revision is stale', async () => {
+    const db = new AtomicPublishDb(5, 1)
+    const response = await cloudOnRequest({
+      request: automationRequest(
+        'publish/2026-08-01',
+        atomicPublishPayload(),
+      ),
+      env: { CLOUD_AUTOMATION_SECRET: 'test-secret', WORKOUT_DB: db },
+      params: { path: ['publish', '2026-08-01'] },
+    })
+
+    expect(response.status).toBe(409)
+    expect(await response.json()).toEqual({ error: 'stale_publish_state' })
+    expect(db.batchCalls).toBe(1)
+    expect(db.writes).toEqual([])
+    expect(db.memoryState).toBeNull()
+    expect(db.memoryItems.size).toBe(0)
+    expect(db.briefings.size).toBe(0)
+    expect(db.revision).toBe(1)
   })
 })
 

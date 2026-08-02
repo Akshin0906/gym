@@ -6,10 +6,12 @@ import {
   requireAutomationSecret,
   requireCloudAuth,
   requireDeviceSession,
+  sha256Hex,
   type D1Database,
+  type D1PreparedStatement,
 } from '../../lib/cloudAuth'
 
-type Mode = 'push' | 'normal' | 'light' | 'deload'
+type Mode = 'push' | 'normal' | 'light' | 'deload' | 'rest'
 type MemoryType = 'workout' | 'two_week' | 'four_month'
 
 interface Env {
@@ -70,6 +72,46 @@ interface MemoryItemRow {
   snapshot_updated_at: number | null
 }
 
+interface PublishRevisionRow {
+  revision: number
+  publish_token: string
+  write_token: string
+}
+
+interface PublishReceiptRow {
+  publish_id: string
+  revision: number
+  publish_fingerprint: string
+  briefing_date: string
+  briefing_created_at: number
+  briefing_source: string
+  briefing_snapshot_updated_at: number
+  headline: string
+  mode: Mode
+  sections_json: string
+  model: string
+  input_summary_json: string | null
+  memory_updated_at: number
+  current_context: string
+  paused: 0 | 1
+  window_started_at: number
+  four_month_started_at: number
+  memory_snapshot_updated_at: number | null
+}
+
+const PUBLISH_RECEIPT_SELECT = `
+  SELECT publish_id, committed_memory_revision AS revision, publish_fingerprint,
+         briefing_date, briefing_created_at, briefing_source,
+         briefing_snapshot_updated_at, headline, mode, sections_json, model,
+         input_summary_json, memory_updated_at, current_context, paused,
+         window_started_at, four_month_started_at, memory_snapshot_updated_at
+  FROM codex_publish_receipts
+  WHERE publish_id = ?
+    AND publish_fingerprint = ?
+    AND briefing_date = ?
+    AND expected_snapshot_updated_at = ?
+    AND base_memory_revision = ?`
+
 const SNAPSHOT_ID = 'primary'
 const MEMORY_STATE_ID = 'primary'
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
@@ -100,7 +142,13 @@ function isObject(v: unknown): v is Record<string, unknown> {
 }
 
 function isMode(v: unknown): v is Mode {
-  return v === 'push' || v === 'normal' || v === 'light' || v === 'deload'
+  return (
+    v === 'push' ||
+    v === 'normal' ||
+    v === 'light' ||
+    v === 'deload' ||
+    v === 'rest'
+  )
 }
 
 function isMemoryType(v: unknown): v is MemoryType {
@@ -350,7 +398,11 @@ async function handlePutSnapshot(ctx: PagesContext): Promise<Response> {
        (id, created_at, updated_at, source_device, schema_version, payload_json)
      VALUES (?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
-       updated_at = excluded.updated_at,
+       updated_at = CASE
+         WHEN workout_snapshots.updated_at >= excluded.updated_at
+           THEN workout_snapshots.updated_at + 1
+         ELSE excluded.updated_at
+       END,
        source_device = excluded.source_device,
        schema_version = excluded.schema_version,
        payload_json = excluded.payload_json`,
@@ -578,21 +630,59 @@ async function readMemoryItems(db: D1Database): Promise<MemoryItemRow[]> {
 }
 
 async function handleGetMemory(db: D1Database): Promise<Response> {
-  const [state, items] = await Promise.all([
-    readMemoryState(db),
-    readMemoryItems(db),
+  // Keep the state, items, and revision on one transactional read snapshot.
+  // Separate concurrent reads could otherwise pair a new revision with old
+  // state and let a later compare-and-set publish from a torn base.
+  const [stateResult, itemsResult, revisionResult] = await db.batch([
+    db.prepare(
+      `SELECT id, updated_at, current_context, paused, window_started_at,
+              four_month_started_at, source_snapshot_updated_at
+       FROM codex_memory_state
+       WHERE id = ?`,
+    ).bind(MEMORY_STATE_ID),
+    db.prepare(
+      `SELECT id, memory_type, period_start_at, period_end_at,
+              source_workout_session_id, bullets_json, source_session_ids_json,
+              source_note_ids_json, source_summary_ids_json, model, created_at,
+              updated_at, snapshot_updated_at
+       FROM codex_memory_items
+       ORDER BY period_start_at ASC, created_at ASC`,
+    ),
+    db.prepare(
+      `SELECT revision, publish_token, write_token
+       FROM codex_publish_revision
+       WHERE id = ?`,
+    ).bind(MEMORY_STATE_ID),
   ])
+  const state = (stateResult?.results?.[0] as MemoryStateRow | undefined) ?? null
+  const items = (itemsResult?.results ?? []) as MemoryItemRow[]
+  const publishRevision =
+    (revisionResult?.results?.[0] as PublishRevisionRow | undefined) ?? null
   return json(200, {
+    revision: publishRevision?.revision ?? 0,
     state: state ? memoryStateResponse(state) : null,
     items: items.map(memoryItemResponse),
   })
 }
 
+async function readPublishRevision(
+  db: D1Database,
+): Promise<PublishRevisionRow | null> {
+  return db
+    .prepare(
+      `SELECT revision, publish_token, write_token
+       FROM codex_publish_revision
+       WHERE id = ?`,
+    )
+    .bind(MEMORY_STATE_ID)
+    .first<PublishRevisionRow>()
+}
+
 function assertNumber(v: unknown, field: string): number {
-  if (typeof v !== 'number' || !Number.isFinite(v)) {
-    throw new Error(`${field} must be a finite number`)
+  if (!Number.isSafeInteger(v) || (v as number) < 0) {
+    throw new Error(`${field} must be a non-negative safe integer`)
   }
-  return v
+  return v as number
 }
 
 function assertMemoryBullets(
@@ -682,6 +772,18 @@ export function assertMemoryItem(raw: unknown): {
   }
 }
 
+function assertUniqueMemoryItemIds(
+  items: ReturnType<typeof assertMemoryItem>[],
+): void {
+  const seen = new Set<string>()
+  for (const item of items) {
+    if (seen.has(item.id)) {
+      throw new Error(`duplicate memory item id: ${item.id}`)
+    }
+    seen.add(item.id)
+  }
+}
+
 function assertNullableNumber(value: unknown, field: string): number | null {
   if (value === null) return null
   return assertNumber(value, field)
@@ -751,6 +853,7 @@ async function handlePutMemory(ctx: PagesContext): Promise<Response> {
     if (body.items !== undefined) {
       if (!Array.isArray(body.items)) throw new Error('items must be an array')
       items = body.items.map(assertMemoryItem)
+      assertUniqueMemoryItemIds(items)
     }
   } catch (err) {
     return json(400, {
@@ -760,9 +863,24 @@ async function handlePutMemory(ctx: PagesContext): Promise<Response> {
   }
 
   const now = Date.now()
+  const mutationToken = crypto.randomUUID()
+  const statements: D1PreparedStatement[] = [
+    ctx.env.WORKOUT_DB.prepare(
+      `INSERT INTO codex_publish_revision
+         (id, revision, publish_token, publish_fingerprint, write_token)
+       VALUES (?, 1, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         revision = codex_publish_revision.revision + 1,
+         publish_token = excluded.publish_token,
+         publish_fingerprint = excluded.publish_fingerprint,
+         write_token = excluded.write_token`,
+    ).bind(MEMORY_STATE_ID, mutationToken, mutationToken, mutationToken),
+  ]
+
   if (state) {
-    await ctx.env.WORKOUT_DB.prepare(
-      `INSERT INTO codex_memory_state
+    statements.push(
+      ctx.env.WORKOUT_DB.prepare(
+        `INSERT INTO codex_memory_state
          (id, updated_at, current_context, paused, window_started_at,
           four_month_started_at, source_snapshot_updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -773,8 +891,7 @@ async function handlePutMemory(ctx: PagesContext): Promise<Response> {
          window_started_at = excluded.window_started_at,
          four_month_started_at = excluded.four_month_started_at,
          source_snapshot_updated_at = excluded.source_snapshot_updated_at`,
-    )
-      .bind(
+      ).bind(
         MEMORY_STATE_ID,
         now,
         state.currentContext,
@@ -782,18 +899,34 @@ async function handlePutMemory(ctx: PagesContext): Promise<Response> {
         state.windowStartedAt,
         state.fourMonthStartedAt,
         state.sourceSnapshotUpdatedAt,
-      )
-      .run()
+      ),
+    )
   }
 
-  for (const item of items) {
-    await ctx.env.WORKOUT_DB.prepare(
-      `INSERT INTO codex_memory_items
+  if (items.length > 0) {
+    statements.push(
+      ctx.env.WORKOUT_DB.prepare(
+        `INSERT INTO codex_memory_items
          (id, memory_type, period_start_at, period_end_at,
           source_workout_session_id, bullets_json, source_session_ids_json,
           source_note_ids_json, source_summary_ids_json, model, created_at,
           updated_at, snapshot_updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       SELECT
+         json_extract(value, '$.id'),
+         json_extract(value, '$.memoryType'),
+         json_extract(value, '$.periodStartAt'),
+         json_extract(value, '$.periodEndAt'),
+         json_extract(value, '$.sourceWorkoutSessionId'),
+         json_extract(value, '$.bullets'),
+         json_extract(value, '$.sourceSessionIds'),
+         json_extract(value, '$.sourceNoteIds'),
+         json_extract(value, '$.sourceSummaryIds'),
+         json_extract(value, '$.model'),
+         json_extract(value, '$.createdAt'),
+         json_extract(value, '$.updatedAt'),
+         json_extract(value, '$.snapshotUpdatedAt')
+       FROM json_each(?)
+       WHERE 1
        ON CONFLICT(id) DO UPDATE SET
          memory_type = excluded.memory_type,
          period_start_at = excluded.period_start_at,
@@ -806,33 +939,400 @@ async function handlePutMemory(ctx: PagesContext): Promise<Response> {
          model = excluded.model,
          updated_at = excluded.updated_at,
          snapshot_updated_at = excluded.snapshot_updated_at`,
+      ).bind(JSON.stringify(items)),
     )
-      .bind(
-        item.id,
-        item.memoryType,
-        item.periodStartAt,
-        item.periodEndAt,
-        item.sourceWorkoutSessionId,
-        JSON.stringify(item.bullets),
-        JSON.stringify(item.sourceSessionIds),
-        JSON.stringify(item.sourceNoteIds),
-        JSON.stringify(item.sourceSummaryIds),
-        item.model,
-        item.createdAt,
-        item.updatedAt,
-        item.snapshotUpdatedAt,
-      )
-      .run()
   }
 
-  const [nextState, nextItems] = await Promise.all([
+  await ctx.env.WORKOUT_DB.batch(statements)
+
+  const [nextState, nextItems, nextRevision] = await Promise.all([
     readMemoryState(ctx.env.WORKOUT_DB),
     readMemoryItems(ctx.env.WORKOUT_DB),
+    readPublishRevision(ctx.env.WORKOUT_DB),
   ])
   return json(200, {
+    revision: nextRevision?.revision ?? null,
     state: nextState ? memoryStateResponse(nextState) : null,
     items: nextItems.map(memoryItemResponse),
   })
+}
+
+interface ValidatedAtomicBriefing {
+  headline: string
+  mode: Mode
+  snapshotUpdatedAt: number
+  source: string
+  sectionsJson: string
+  model: string
+  inputSummaryJson: string | null
+}
+
+function validateAtomicBriefing(raw: unknown): ValidatedAtomicBriefing {
+  if (!isObject(raw)) throw new Error('briefing must be an object')
+  const mode = raw.mode
+  if (!isMode(mode)) throw new Error('briefing.mode is invalid')
+  const snapshotUpdatedAt = assertNumber(
+    raw.snapshotUpdatedAt,
+    'briefing.snapshotUpdatedAt',
+  )
+  if (
+    raw.inputSummary !== undefined &&
+    raw.inputSummary !== null &&
+    !isObject(raw.inputSummary)
+  ) {
+    throw new Error('briefing.inputSummary must be an object or null')
+  }
+  return {
+    headline: assertTrimmedString(raw.headline, 'briefing.headline', 200),
+    mode,
+    snapshotUpdatedAt,
+    source:
+      raw.source === undefined
+        ? 'codex'
+        : assertTrimmedString(raw.source, 'briefing.source', 80),
+    sectionsJson: assertBriefingSections(raw.sections),
+    model: assertTrimmedString(raw.model, 'briefing.model', 120),
+    inputSummaryJson:
+      raw.inputSummary === undefined || raw.inputSummary === null
+        ? null
+        : JSON.stringify(raw.inputSummary),
+  }
+}
+
+async function readCommittedPublish(
+  db: D1Database,
+  date: string,
+  publishId: string,
+  publishFingerprint: string,
+  expectedSnapshotUpdatedAt: number,
+  expectedMemoryRevision: number,
+): Promise<{
+  publishId: string
+  briefing: unknown
+  memoryState: unknown
+  memoryRevision: number
+} | null> {
+  const row = await db
+    .prepare(PUBLISH_RECEIPT_SELECT)
+    .bind(
+      publishId,
+      publishFingerprint,
+      date,
+      expectedSnapshotUpdatedAt,
+      expectedMemoryRevision,
+    )
+    .first<PublishReceiptRow>()
+  return row ? committedPublishResponse(row) : null
+}
+
+function committedPublishResponse(row: PublishReceiptRow): {
+  publishId: string
+  briefing: unknown
+  memoryState: unknown
+  memoryRevision: number
+} {
+  return {
+    publishId: row.publish_id,
+    briefing: briefingResponse({
+      briefing_date: row.briefing_date,
+      created_at: row.briefing_created_at,
+      source: row.briefing_source,
+      snapshot_updated_at: row.briefing_snapshot_updated_at,
+      headline: row.headline,
+      mode: row.mode,
+      sections_json: row.sections_json,
+      model: row.model,
+      input_summary_json: row.input_summary_json,
+    }),
+    memoryState: memoryStateResponse({
+      id: MEMORY_STATE_ID,
+      updated_at: row.memory_updated_at,
+      current_context: row.current_context,
+      paused: row.paused,
+      window_started_at: row.window_started_at,
+      four_month_started_at: row.four_month_started_at,
+      source_snapshot_updated_at: row.memory_snapshot_updated_at,
+    }),
+    memoryRevision: row.revision,
+  }
+}
+
+async function handleAtomicPublish(
+  ctx: PagesContext,
+  date: string,
+): Promise<Response> {
+  if (!isCalendarDate(date)) return json(400, { error: 'invalid_date' })
+
+  let body: unknown
+  try {
+    body = await readJsonBodyWithLimit(ctx.request)
+  } catch (err) {
+    if (err instanceof PayloadTooLargeError) {
+      return json(413, { error: 'payload_too_large' })
+    }
+    return json(400, { error: 'invalid_json' })
+  }
+  if (!isObject(body)) return json(400, { error: 'invalid_publish' })
+
+  const expectedSnapshotUpdatedAt = body.expectedSnapshotUpdatedAt
+  const expectedMemoryRevision = body.expectedMemoryRevision
+  if (
+    !Number.isSafeInteger(expectedSnapshotUpdatedAt) ||
+    (expectedSnapshotUpdatedAt as number) < 0
+  ) {
+    return json(400, { error: 'expectedSnapshotUpdatedAt_required' })
+  }
+  if (
+    !Number.isSafeInteger(expectedMemoryRevision) ||
+    (expectedMemoryRevision as number) < 0 ||
+    (expectedMemoryRevision as number) >= Number.MAX_SAFE_INTEGER
+  ) {
+    return json(400, { error: 'expectedMemoryRevision_required' })
+  }
+  if (!isObject(body.memory)) return json(400, { error: 'invalid_memory' })
+
+  let state: ReturnType<typeof assertMemoryState>
+  let items: ReturnType<typeof assertMemoryItem>[]
+  let briefing: ValidatedAtomicBriefing
+  let publishId: string
+  try {
+    publishId = assertTrimmedString(body.publishId, 'publishId', 200)
+    state = assertMemoryState(body.memory.state)
+    if (!Array.isArray(body.memory.items)) {
+      throw new Error('memory.items must be an array')
+    }
+    items = body.memory.items.map(assertMemoryItem)
+    assertUniqueMemoryItemIds(items)
+    briefing = validateAtomicBriefing(body.briefing)
+  } catch (err) {
+    return json(400, {
+      error: 'invalid_publish',
+      detail: err instanceof Error ? err.message : String(err),
+    })
+  }
+
+  if (
+    state.sourceSnapshotUpdatedAt !== expectedSnapshotUpdatedAt ||
+    briefing.snapshotUpdatedAt !== expectedSnapshotUpdatedAt ||
+    items.some((item) => item.snapshotUpdatedAt !== expectedSnapshotUpdatedAt)
+  ) {
+    return json(400, { error: 'publish_snapshot_mismatch' })
+  }
+
+  const memoryRevision = expectedMemoryRevision as number
+  const publishFingerprint = await sha256Hex(
+    JSON.stringify({
+      date,
+      expectedSnapshotUpdatedAt,
+      expectedMemoryRevision: memoryRevision,
+      memory: { state, items },
+      briefing,
+    }),
+  )
+  const replay = await readCommittedPublish(
+    ctx.env.WORKOUT_DB,
+    date,
+    publishId,
+    publishFingerprint,
+    expectedSnapshotUpdatedAt,
+    memoryRevision,
+  )
+  if (replay) return json(200, replay)
+
+  const now = Date.now()
+  const writeToken = crypto.randomUUID()
+  const guard = `
+    EXISTS (
+      SELECT 1 FROM codex_publish_revision
+      WHERE id = ? AND write_token = ?
+    )
+    AND EXISTS (
+      SELECT 1 FROM workout_snapshots
+      WHERE id = ? AND updated_at = ?
+    )`
+
+  const statements = [
+    ctx.env.WORKOUT_DB.prepare(
+      `UPDATE codex_publish_revision
+       SET revision = revision + 1, publish_token = ?,
+           publish_fingerprint = ?, write_token = ?
+       WHERE id = ? AND revision = ?
+         AND EXISTS (
+           SELECT 1 FROM workout_snapshots
+           WHERE id = ? AND updated_at = ?
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM codex_publish_receipts
+           WHERE publish_id = ?
+         )`,
+    ).bind(
+      publishId,
+      publishFingerprint,
+      writeToken,
+      MEMORY_STATE_ID,
+      memoryRevision,
+      SNAPSHOT_ID,
+      expectedSnapshotUpdatedAt,
+      publishId,
+    ),
+    ctx.env.WORKOUT_DB.prepare(
+      `INSERT INTO codex_memory_state
+         (id, updated_at, current_context, paused, window_started_at,
+          four_month_started_at, source_snapshot_updated_at)
+       SELECT ?, ?, ?, ?, ?, ?, ?
+       WHERE ${guard}
+       ON CONFLICT(id) DO UPDATE SET
+         updated_at = excluded.updated_at,
+         current_context = excluded.current_context,
+         paused = excluded.paused,
+         window_started_at = excluded.window_started_at,
+         four_month_started_at = excluded.four_month_started_at,
+         source_snapshot_updated_at = excluded.source_snapshot_updated_at`,
+    ).bind(
+      MEMORY_STATE_ID,
+      now,
+      state.currentContext,
+      state.paused ? 1 : 0,
+      state.windowStartedAt,
+      state.fourMonthStartedAt,
+      state.sourceSnapshotUpdatedAt,
+      MEMORY_STATE_ID,
+      writeToken,
+      SNAPSHOT_ID,
+      expectedSnapshotUpdatedAt,
+    ),
+    ctx.env.WORKOUT_DB.prepare(
+      `INSERT INTO codex_memory_items
+         (id, memory_type, period_start_at, period_end_at,
+          source_workout_session_id, bullets_json, source_session_ids_json,
+          source_note_ids_json, source_summary_ids_json, model, created_at,
+          updated_at, snapshot_updated_at)
+       SELECT
+         json_extract(value, '$.id'),
+         json_extract(value, '$.memoryType'),
+         json_extract(value, '$.periodStartAt'),
+         json_extract(value, '$.periodEndAt'),
+         json_extract(value, '$.sourceWorkoutSessionId'),
+         json_extract(value, '$.bullets'),
+         json_extract(value, '$.sourceSessionIds'),
+         json_extract(value, '$.sourceNoteIds'),
+         json_extract(value, '$.sourceSummaryIds'),
+         json_extract(value, '$.model'),
+         json_extract(value, '$.createdAt'),
+         json_extract(value, '$.updatedAt'),
+         json_extract(value, '$.snapshotUpdatedAt')
+       FROM json_each(?)
+       WHERE ${guard}
+       ON CONFLICT(id) DO UPDATE SET
+         memory_type = excluded.memory_type,
+         period_start_at = excluded.period_start_at,
+         period_end_at = excluded.period_end_at,
+         source_workout_session_id = excluded.source_workout_session_id,
+         bullets_json = excluded.bullets_json,
+         source_session_ids_json = excluded.source_session_ids_json,
+         source_note_ids_json = excluded.source_note_ids_json,
+         source_summary_ids_json = excluded.source_summary_ids_json,
+         model = excluded.model,
+         updated_at = excluded.updated_at,
+         snapshot_updated_at = excluded.snapshot_updated_at`,
+    ).bind(
+      JSON.stringify(items),
+      MEMORY_STATE_ID,
+      writeToken,
+      SNAPSHOT_ID,
+      expectedSnapshotUpdatedAt,
+    ),
+    ctx.env.WORKOUT_DB.prepare(
+      `INSERT INTO daily_briefings
+         (briefing_date, created_at, source, snapshot_updated_at, headline,
+          mode, sections_json, model, input_summary_json)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+       WHERE ${guard}
+       ON CONFLICT(briefing_date) DO UPDATE SET
+         source = excluded.source,
+         snapshot_updated_at = excluded.snapshot_updated_at,
+         headline = excluded.headline,
+         mode = excluded.mode,
+         sections_json = excluded.sections_json,
+         model = excluded.model,
+         input_summary_json = excluded.input_summary_json`,
+    ).bind(
+      date,
+      now,
+      briefing.source,
+      briefing.snapshotUpdatedAt,
+      briefing.headline,
+      briefing.mode,
+      briefing.sectionsJson,
+      briefing.model,
+      briefing.inputSummaryJson,
+      MEMORY_STATE_ID,
+      writeToken,
+      SNAPSHOT_ID,
+      expectedSnapshotUpdatedAt,
+    ),
+    ctx.env.WORKOUT_DB.prepare(
+      `INSERT INTO codex_publish_receipts
+         (publish_id, publish_fingerprint, briefing_date,
+          expected_snapshot_updated_at, base_memory_revision,
+          committed_memory_revision, briefing_created_at, briefing_source,
+          briefing_snapshot_updated_at, headline, mode, sections_json, model,
+          input_summary_json, memory_updated_at, current_context, paused,
+          window_started_at, four_month_started_at, memory_snapshot_updated_at,
+          receipt_created_at)
+       SELECT ?, ?, ?, ?, ?, revision.revision, briefing.created_at,
+              briefing.source, briefing.snapshot_updated_at,
+              briefing.headline, briefing.mode, briefing.sections_json,
+              briefing.model, briefing.input_summary_json, memory.updated_at,
+              memory.current_context, memory.paused, memory.window_started_at,
+              memory.four_month_started_at, memory.source_snapshot_updated_at,
+              ?
+       FROM codex_publish_revision AS revision
+       JOIN daily_briefings AS briefing ON briefing.briefing_date = ?
+       JOIN codex_memory_state AS memory ON memory.id = ?
+       WHERE revision.id = ?
+         AND revision.write_token = ?
+         AND revision.publish_token = ?
+         AND revision.publish_fingerprint = ?
+         AND revision.revision = ?
+         AND briefing.snapshot_updated_at = ?
+         AND memory.source_snapshot_updated_at = ?
+       ON CONFLICT(publish_id) DO NOTHING`,
+    ).bind(
+      publishId,
+      publishFingerprint,
+      date,
+      expectedSnapshotUpdatedAt,
+      memoryRevision,
+      now,
+      date,
+      MEMORY_STATE_ID,
+      MEMORY_STATE_ID,
+      writeToken,
+      publishId,
+      publishFingerprint,
+      memoryRevision + 1,
+      expectedSnapshotUpdatedAt,
+      expectedSnapshotUpdatedAt,
+    ),
+    ctx.env.WORKOUT_DB.prepare(PUBLISH_RECEIPT_SELECT).bind(
+      publishId,
+      publishFingerprint,
+      date,
+      expectedSnapshotUpdatedAt,
+      memoryRevision,
+    ),
+  ]
+
+  const results = await ctx.env.WORKOUT_DB.batch(statements)
+  const committedRow = results[5]?.results?.[0] as
+    | PublishReceiptRow
+    | undefined
+  if (committedRow) return json(200, committedPublishResponse(committedRow))
+  if (results[0]?.meta?.changes !== 1) {
+    return json(409, { error: 'stale_publish_state' })
+  }
+  throw new Error('atomic publish verification failed')
 }
 
 export const onRequest = async (ctx: PagesContext): Promise<Response> => {
@@ -847,7 +1347,8 @@ export const onRequest = async (ctx: PagesContext): Promise<Response> => {
       if (authError) return authError
     } else if (
       (path === 'memory' && method === 'PUT') ||
-      (path.match(/^briefing\/[^/]+$/) && method === 'PUT')
+      (path.match(/^briefing\/[^/]+$/) && method === 'PUT') ||
+      (path.match(/^publish\/[^/]+$/) && method === 'PUT')
     ) {
       const authError = requireAutomationSecret(ctx.request, ctx.env)
       if (authError) return authError
@@ -872,6 +1373,11 @@ export const onRequest = async (ctx: PagesContext): Promise<Response> => {
     }
     if (path === 'memory' && method === 'PUT') {
       return await handlePutMemory(ctx)
+    }
+
+    const publishMatch = path.match(/^publish\/([^/]+)$/)
+    if (publishMatch && method === 'PUT') {
+      return await handleAtomicPublish(ctx, publishMatch[1])
     }
 
     const briefingMatch = path.match(/^briefing\/([^/]+)$/)

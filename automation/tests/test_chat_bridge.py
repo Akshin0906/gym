@@ -7,8 +7,12 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Iterator
 from unittest import mock
 
 
@@ -18,6 +22,40 @@ assert SPEC and SPEC.loader
 bridge = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = bridge
 SPEC.loader.exec_module(bridge)
+
+
+@contextmanager
+def loopback_server(
+    handler: type[BaseHTTPRequestHandler],
+) -> Iterator[ThreadingHTTPServer]:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def cloud_client(base_url: str, *, retries: int = 3) -> bridge.CloudClient:
+    config = type(
+        "CloudConfigStub",
+        (),
+        {
+            "app_url": base_url,
+            "http_timeout_seconds": 2,
+            "http_retries": retries,
+            "retry_delay_seconds": 0,
+        },
+    )()
+    return bridge.CloudClient(
+        config,
+        "synthetic-automation-secret",
+        logging.getLogger("chat-bridge-cloud-test"),
+    )
 
 
 def claim_envelope(effort: str | None = "medium") -> dict:
@@ -542,7 +580,7 @@ class SchemaTests(unittest.TestCase):
             "create_custom_exercise",
         )
         self.assertEqual(definition["properties"]["notes"]["maxLength"], 2000)
-        self.assertTrue(definition["properties"]["secondaryMuscles"]["uniqueItems"])
+        self.assertNotIn("uniqueItems", definition["properties"]["secondaryMuscles"])
         self.assertIn(
             "exercise_library",
             schema["definitions"]["actionPlan"]["properties"]["scope"]["enum"],
@@ -607,6 +645,121 @@ class CloudContractTests(unittest.TestCase):
         action_scopes = backend[backend.index("const ACTION_SCOPES") :]
         action_scopes = action_scopes[: action_scopes.index("] as const")]
         self.assertIn("'exercise_library'", action_scopes)
+
+
+class CloudTransportTests(unittest.TestCase):
+    def test_cross_origin_redirect_never_receives_automation_secret(self) -> None:
+        redirect_requests: list[str | None] = []
+        target_requests: list[str | None] = []
+
+        class TargetHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                target_requests.append(
+                    self.headers.get("X-Cloud-Automation-Secret")
+                )
+                body = b"{}"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *args: object) -> None:
+                pass
+
+        with loopback_server(TargetHandler) as target:
+            target_url = f"http://127.0.0.1:{target.server_port}/capture"
+
+            class RedirectHandler(BaseHTTPRequestHandler):
+                def do_POST(self) -> None:
+                    content_length = int(self.headers.get("Content-Length", "0"))
+                    self.rfile.read(content_length)
+                    redirect_requests.append(
+                        self.headers.get("X-Cloud-Automation-Secret")
+                    )
+                    self.send_response(302)
+                    self.send_header("Location", target_url)
+                    self.end_headers()
+
+                def log_message(self, _format: str, *args: object) -> None:
+                    pass
+
+            with loopback_server(RedirectHandler) as redirect:
+                client = cloud_client(
+                    f"http://127.0.0.1:{redirect.server_port}", retries=3
+                )
+                with self.assertRaises(bridge.CloudHTTPError) as raised:
+                    client.request("POST", "/start", body={"probe": True})
+
+        self.assertEqual(raised.exception.status, 302)
+        self.assertEqual(
+            redirect_requests, ["synthetic-automation-secret"]
+        )
+        self.assertEqual(target_requests, [])
+
+    def test_same_origin_redirect_is_not_followed_and_status_can_be_expected(
+        self,
+    ) -> None:
+        requested_paths: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                requested_paths.append(self.path)
+                if self.path == "/start":
+                    body = b'{"redirect":"blocked"}'
+                    self.send_response(307)
+                    self.send_header("Location", "/target")
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                body = b"{}"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *args: object) -> None:
+                pass
+
+        with loopback_server(Handler) as server:
+            client = cloud_client(f"http://127.0.0.1:{server.server_port}")
+            status, body = client.request("GET", "/start", expected={307})
+
+        self.assertEqual(status, 307)
+        self.assertEqual(body, {"redirect": "blocked"})
+        self.assertEqual(requested_paths, ["/start"])
+
+    def test_retryable_http_status_still_retries(self) -> None:
+        request_count = 0
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                nonlocal request_count
+                request_count += 1
+                if request_count < 3:
+                    body = b'{"error":"temporary"}'
+                    self.send_response(503)
+                else:
+                    body = b'{"ok":true}'
+                    self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *args: object) -> None:
+                pass
+
+        with loopback_server(Handler) as server:
+            client = cloud_client(f"http://127.0.0.1:{server.server_port}")
+            status, body = client.request("GET", "/retry")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"ok": True})
+        self.assertEqual(request_count, 3)
 
 
 class IdleBackoffTests(unittest.TestCase):
