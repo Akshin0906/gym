@@ -4,7 +4,7 @@ import { db } from '../schema'
 import type { Exercise, WorkoutSession } from '../types'
 import { buildLiveCoachContext } from '../../lib/chatContext'
 import {
-  applyCoachActionPlan,
+  applyCoachActionPlan as applyCoachActionPlanToDb,
   getAppliedCoachActionResult,
   listPendingCoachActionResults,
   markCoachActionSynced,
@@ -14,6 +14,18 @@ import {
 
 const HASH = 'a'.repeat(64)
 const ACTION_HASH = 'c'.repeat(64)
+
+type TestActionScope = keyof ReturnType<typeof actionStateHashes>
+
+const TEST_ACTION_SCOPES: readonly TestActionScope[] = [
+  'active_workout',
+  'one_time_workout',
+  'program',
+  'exercise_library',
+  'ai_memory',
+]
+
+const resolvedPlaceholderHashes = new Map<string, string>()
 
 function actionStateHashes(
   overrides: Partial<
@@ -35,6 +47,61 @@ function actionStateHashes(
     ai_memory: ACTION_HASH,
     ...overrides,
   }
+}
+
+function isTestActionScope(value: unknown): value is TestActionScope {
+  return TEST_ACTION_SCOPES.includes(value as TestActionScope)
+}
+
+async function applyCoachActionPlan(
+  args: Parameters<typeof applyCoachActionPlanToDb>[0],
+): ReturnType<typeof applyCoachActionPlanToDb> {
+  const rawPlan = args.rawPlan
+  if (
+    rawPlan === null ||
+    typeof rawPlan !== 'object' ||
+    Array.isArray(rawPlan) ||
+    !isTestActionScope((rawPlan as { scope?: unknown }).scope) ||
+    (rawPlan as { sourceActionStateHash?: unknown }).sourceActionStateHash !==
+      ACTION_HASH
+  ) {
+    return applyCoachActionPlanToDb(args)
+  }
+
+  const typedPlan = rawPlan as {
+    scope: TestActionScope
+    sourceActionStateHash: string
+    actions?: unknown[]
+  }
+  let sourceActionStateHash = resolvedPlaceholderHashes.get(args.proposalId)
+  if (!sourceActionStateHash) {
+    const firstAction = typedPlan.actions?.[0]
+    const preferredSessionId =
+      typedPlan.scope === 'active_workout' &&
+      firstAction !== null &&
+      typeof firstAction === 'object' &&
+      !Array.isArray(firstAction) &&
+      typeof (firstAction as { sessionId?: unknown }).sessionId === 'string'
+        ? (firstAction as { sessionId: string }).sessionId
+        : undefined
+    sourceActionStateHash = (
+      await buildLiveCoachContext(preferredSessionId)
+    ).context.actionStateHashes[typedPlan.scope]
+    resolvedPlaceholderHashes.set(args.proposalId, sourceActionStateHash)
+  }
+
+  const currentActionStateHashes =
+    args.currentActionStateHashes[typedPlan.scope] === ACTION_HASH
+      ? {
+          ...args.currentActionStateHashes,
+          [typedPlan.scope]: sourceActionStateHash,
+        }
+      : args.currentActionStateHashes
+  return applyCoachActionPlanToDb({
+    ...args,
+    rawPlan: { ...typedPlan, sourceActionStateHash },
+    currentActionStateHashes,
+  })
 }
 
 function exercise(id: string, name = id): Exercise {
@@ -102,6 +169,7 @@ async function programApplyInput(action: unknown) {
 }
 
 beforeEach(async () => {
+  resolvedPlaceholderHashes.clear()
   await Promise.all(db.tables.map((table) => table.clear()))
 })
 
@@ -354,7 +422,9 @@ describe('active workout Coach actions', () => {
     ])
     expect(first.replayed).toBe(false)
     expect(first.sourceStateHash).toBe(HASH)
-    expect(first.sourceActionStateHash).toBe(ACTION_HASH)
+    expect(first.sourceActionStateHash).toBe(
+      resolvedPlaceholderHashes.get('proposal-add'),
+    )
     expect(replay.replayed).toBe(true)
     expect(await db.chatActionReceipts.count()).toBe(1)
     expect(
@@ -1288,6 +1358,358 @@ describe('custom exercise Coach actions', () => {
       }),
     ).rejects.toBeInstanceOf(StaleCoachActionError)
     expect(await db.exercises.count()).toBe(0)
+  })
+})
+
+describe('transaction-time scoped action-state revalidation', () => {
+  it('rejects an active-workout edit changed after the caller snapshot', async () => {
+    await db.exercises.bulkAdd([exercise('a'), exercise('b'), exercise('c')])
+    await db.workoutSessions.add(activeSession())
+    const live = await buildLiveCoachContext('session')
+    await db.workoutSessions.update('session', { name: 'Concurrent rename' })
+
+    await expect(
+      applyCoachActionPlanToDb({
+        proposalId: 'proposal-active-race',
+        rawPlan: plan(
+          {
+            type: 'add_active_exercise',
+            sessionId: 'session',
+            exerciseId: 'c',
+            position: 2,
+            targetSets: 2,
+            repRange: '12-15',
+          },
+          'active_workout',
+          live.context.actionStateHashes.active_workout,
+        ),
+        currentStateHash: live.stateHash,
+        currentActionStateHashes: live.context.actionStateHashes,
+      }),
+    ).rejects.toBeInstanceOf(StaleCoachActionError)
+
+    expect((await db.workoutSessions.get('session'))?.name).toBe(
+      'Concurrent rename',
+    )
+    expect(
+      (await db.workoutSessions.get('session'))?.exerciseSnapshot,
+    ).toHaveLength(2)
+    expect(await db.chatActionReceipts.get('proposal-active-race')).toBeUndefined()
+  })
+
+  it('rejects an active-workout edit after a set is logged', async () => {
+    await db.exercises.bulkAdd([exercise('a'), exercise('b')])
+    await db.workoutSessions.add(activeSession())
+    const live = await buildLiveCoachContext('session')
+    await db.loggedSets.add({
+      id: 'concurrent-set',
+      workoutSessionId: 'session',
+      exerciseId: 'a',
+      setNumber: 1,
+      weightLbs: 100,
+      reps: 8,
+      rpe: null,
+      loggedAt: 2,
+    })
+
+    await expect(
+      applyCoachActionPlanToDb({
+        proposalId: 'proposal-active-set-race',
+        rawPlan: plan(
+          {
+            type: 'update_active_exercise_targets',
+            sessionId: 'session',
+            exerciseId: 'a',
+            targetSets: 4,
+            repRange: '6-8',
+          },
+          'active_workout',
+          live.context.actionStateHashes.active_workout,
+        ),
+        currentStateHash: live.stateHash,
+        currentActionStateHashes: live.context.actionStateHashes,
+      }),
+    ).rejects.toBeInstanceOf(StaleCoachActionError)
+
+    expect(
+      (await db.workoutSessions.get('session'))?.exerciseSnapshot[0],
+    ).toMatchObject({ targetSets: 3, targetRepRange: '8-10' })
+    expect(
+      await db.chatActionReceipts.get('proposal-active-set-race'),
+    ).toBeUndefined()
+  })
+
+  it('rejects an active-workout edit after its done markers change', async () => {
+    await db.exercises.bulkAdd([
+      exercise('a'),
+      exercise('b'),
+      exercise('c'),
+    ])
+    await db.workoutSessions.add(activeSession())
+    const live = await buildLiveCoachContext('session')
+    await db.workoutSessions.update('session', { doneExerciseIds: ['a'] })
+
+    await expect(
+      applyCoachActionPlanToDb({
+        proposalId: 'proposal-active-done-race',
+        rawPlan: plan(
+          {
+            type: 'add_active_exercise',
+            sessionId: 'session',
+            exerciseId: 'c',
+            position: 2,
+            targetSets: 2,
+            repRange: '12-15',
+          },
+          'active_workout',
+          live.context.actionStateHashes.active_workout,
+        ),
+        currentStateHash: live.stateHash,
+        currentActionStateHashes: live.context.actionStateHashes,
+      }),
+    ).rejects.toBeInstanceOf(StaleCoachActionError)
+
+    expect((await db.workoutSessions.get('session'))?.doneExerciseIds).toEqual([
+      'a',
+    ])
+    expect(
+      (await db.workoutSessions.get('session'))?.exerciseSnapshot,
+    ).toHaveLength(2)
+    expect(
+      await db.chatActionReceipts.get('proposal-active-done-race'),
+    ).toBeUndefined()
+  })
+
+  it('rejects creating a one-time workout after another workout starts', async () => {
+    await db.exercises.add(exercise('a'))
+    const live = await buildLiveCoachContext()
+    await db.workoutSessions.add({
+      id: 'concurrent-session',
+      sessionTemplateId: null,
+      programId: null,
+      name: 'Concurrent workout',
+      programName: null,
+      exerciseSnapshot: [
+        {
+          exerciseId: 'a',
+          order: 0,
+          targetSets: 3,
+          targetRepRange: '8-10',
+        },
+      ],
+      startedAt: 2,
+      completedAt: null,
+    })
+
+    await expect(
+      applyCoachActionPlanToDb({
+        proposalId: 'proposal-one-time-race',
+        rawPlan: plan(
+          {
+            type: 'create_one_time_workout',
+            name: 'Stale workout',
+            exercises: [
+              { exerciseId: 'a', targetSets: 2, repRange: '10-12' },
+            ],
+          },
+          'one_time_workout',
+          live.context.actionStateHashes.one_time_workout,
+        ),
+        currentStateHash: live.stateHash,
+        currentActionStateHashes: live.context.actionStateHashes,
+      }),
+    ).rejects.toBeInstanceOf(StaleCoachActionError)
+
+    expect(await db.workoutSessions.toArray()).toEqual([
+      expect.objectContaining({ id: 'concurrent-session' }),
+    ])
+    expect(
+      await db.chatActionReceipts.get('proposal-one-time-race'),
+    ).toBeUndefined()
+  })
+
+  it('rejects a custom exercise after the library changes', async () => {
+    const live = await buildLiveCoachContext()
+    await db.exercises.add(exercise('concurrent', 'Concurrent exercise'))
+
+    await expect(
+      applyCoachActionPlanToDb({
+        proposalId: 'proposal-library-race',
+        rawPlan: plan(
+          {
+            type: 'create_custom_exercise',
+            name: 'Cable Y Raise',
+            primaryMuscle: 'shoulders',
+            secondaryMuscles: [],
+            notes: '',
+            defaultRestSeconds: 90,
+          },
+          'exercise_library',
+          live.context.actionStateHashes.exercise_library,
+        ),
+        currentStateHash: live.stateHash,
+        currentActionStateHashes: live.context.actionStateHashes,
+      }),
+    ).rejects.toBeInstanceOf(StaleCoachActionError)
+
+    expect(await db.exercises.toArray()).toEqual([
+      expect.objectContaining({ id: 'concurrent' }),
+    ])
+    expect(await db.chatActionReceipts.get('proposal-library-race')).toBeUndefined()
+  })
+
+  it('rejects saving a note after AI Memory is paused', async () => {
+    const live = await buildLiveCoachContext()
+    await db.aiMemorySettings.add({
+      id: 'default',
+      currentContext: '',
+      paused: true,
+      windowStartedAt: 1,
+      fourMonthStartedAt: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    })
+
+    await expect(
+      applyCoachActionPlanToDb({
+        proposalId: 'proposal-memory-race',
+        rawPlan: plan(
+          { type: 'save_ai_note', body: 'Remember this.' },
+          'ai_memory',
+          live.context.actionStateHashes.ai_memory,
+        ),
+        currentStateHash: live.stateHash,
+        currentActionStateHashes: live.context.actionStateHashes,
+      }),
+    ).rejects.toBeInstanceOf(StaleCoachActionError)
+
+    expect(await db.aiNotes.count()).toBe(0)
+    expect(await db.chatActionReceipts.get('proposal-memory-race')).toBeUndefined()
+  })
+})
+
+describe('stored Coach action receipts', () => {
+  it('accepts a legacy receipt and upgrades its scoped hash on replay', async () => {
+    const live = await buildLiveCoachContext()
+    const sourceActionStateHash =
+      live.context.actionStateHashes.exercise_library
+    const legacyResult = {
+      proposalId: 'proposal-legacy',
+      appliedAt: 120,
+      sourceStateHash: HASH,
+      replayed: false,
+      syncPending: false,
+      changes: [
+        {
+          type: 'create_custom_exercise' as const,
+          label: 'Created Legacy Exercise',
+          entityId: 'legacy-exercise',
+        },
+      ],
+    }
+    await db.chatActionReceipts.add({
+      proposalId: legacyResult.proposalId,
+      appliedAt: legacyResult.appliedAt,
+      sourceStateHash: legacyResult.sourceStateHash,
+      resultJson: JSON.stringify(legacyResult),
+    })
+
+    await expect(
+      getAppliedCoachActionResult('proposal-legacy'),
+    ).resolves.toEqual(legacyResult)
+    await expect(
+      applyCoachActionPlanToDb({
+        proposalId: 'proposal-legacy',
+        rawPlan: plan(
+          {
+            type: 'create_custom_exercise',
+            name: 'Legacy Exercise',
+            primaryMuscle: 'chest',
+            secondaryMuscles: [],
+            notes: '',
+            defaultRestSeconds: 90,
+          },
+          'exercise_library',
+          sourceActionStateHash,
+        ),
+        currentStateHash: live.stateHash,
+        currentActionStateHashes: live.context.actionStateHashes,
+      }),
+    ).resolves.toMatchObject({
+      proposalId: 'proposal-legacy',
+      replayed: true,
+      sourceActionStateHash,
+    })
+    expect(await db.exercises.count()).toBe(0)
+  })
+
+  it('skips a corrupt legacy row while returning a good pending receipt', async () => {
+    const goodResult = {
+      proposalId: 'proposal-good',
+      appliedAt: 123,
+      sourceStateHash: HASH,
+      sourceActionStateHash: ACTION_HASH,
+      replayed: false,
+      syncPending: true,
+      changes: [
+        {
+          type: 'save_ai_note' as const,
+          label: 'Saved a note for AI Insights',
+          entityId: 'note-1',
+        },
+      ],
+    }
+    await db.chatActionReceipts.bulkAdd([
+      {
+        proposalId: 'proposal-bad',
+        appliedAt: 122,
+        sourceStateHash: HASH,
+        resultJson: '{',
+      },
+      {
+        proposalId: 'proposal-empty',
+        appliedAt: 121,
+        sourceStateHash: HASH,
+        resultJson: JSON.stringify({
+          ...goodResult,
+          proposalId: 'proposal-empty',
+          appliedAt: 121,
+          changes: [],
+        }),
+      },
+      {
+        proposalId: 'proposal-uppercase',
+        appliedAt: 120,
+        sourceStateHash: HASH,
+        resultJson: JSON.stringify({
+          ...goodResult,
+          proposalId: 'proposal-uppercase',
+          appliedAt: 120,
+          sourceActionStateHash: ACTION_HASH.toUpperCase(),
+        }),
+      },
+      {
+        proposalId: goodResult.proposalId,
+        appliedAt: goodResult.appliedAt,
+        sourceStateHash: goodResult.sourceStateHash,
+        resultJson: JSON.stringify(goodResult),
+      },
+    ])
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+
+    await expect(getAppliedCoachActionResult('proposal-bad')).resolves.toBeNull()
+    await expect(getAppliedCoachActionResult('proposal-empty')).resolves.toBeNull()
+    await expect(
+      getAppliedCoachActionResult('proposal-uppercase'),
+    ).resolves.toBeNull()
+    await expect(listPendingCoachActionResults()).resolves.toEqual([goodResult])
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('proposal-bad'),
+      expect.any(Error),
+    )
+    expect(await db.chatActionReceipts.count()).toBe(4)
+
+    warn.mockRestore()
   })
 })
 

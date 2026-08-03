@@ -20,10 +20,12 @@ export function CoachComposer({
   hasActiveWorkout,
   disabled,
   onSend,
+  onDraftChange,
 }: {
   hasActiveWorkout: boolean
   disabled: boolean
   onSend: (text: string, effort: CoachReasoningEffort) => Promise<void>
+  onDraftChange: () => void
 }) {
   const [text, setText] = useState('')
   const [deepThink, setDeepThink] = useState(false)
@@ -57,10 +59,12 @@ export function CoachComposer({
               key={prompt}
               type="button"
               onClick={() => {
+                onDraftChange()
                 setText(prompt)
                 requestAnimationFrame(() => textareaRef.current?.focus())
               }}
-              className="shrink-0 rounded-full px-3 py-1.5 text-xs text-[var(--color-fg-dim)] bg-[var(--color-surface)] border border-[var(--color-border)] hover:text-[var(--color-fg)]"
+              disabled={disabled}
+              className="shrink-0 rounded-full px-3 py-1.5 text-xs text-[var(--color-fg-dim)] bg-[var(--color-surface)] border border-[var(--color-border)] hover:text-[var(--color-fg)] disabled:opacity-50"
             >
               {prompt}
             </button>
@@ -72,7 +76,10 @@ export function CoachComposer({
         <textarea
           ref={textareaRef}
           value={text}
-          onChange={(event) => setText(event.target.value)}
+          onChange={(event) => {
+            onDraftChange()
+            setText(event.target.value)
+          }}
           onKeyDown={(event) => {
             if (event.key === 'Enter' && !event.shiftKey) {
               event.preventDefault()
@@ -89,7 +96,10 @@ export function CoachComposer({
           <button
             type="button"
             aria-pressed={deepThink}
-            onClick={() => setDeepThink((value) => !value)}
+            onClick={() => {
+              onDraftChange()
+              setDeepThink((value) => !value)
+            }}
             disabled={disabled}
             className="min-h-11 inline-flex items-center gap-1.5 rounded-full px-3 py-2 text-xs font-semibold border"
             style={{

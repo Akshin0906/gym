@@ -2,7 +2,13 @@ import Dexie from 'dexie'
 import { db } from '../schema'
 import { addAiNote } from './aiMemory'
 import { createCustomExercise } from './exercises'
-import { hashProgramActionState } from '../../lib/chatContext'
+import {
+  hashActiveWorkoutActionState,
+  hashAiMemoryActionState,
+  hashExerciseLibraryActionState,
+  hashOneTimeWorkoutActionState,
+  hashProgramActionState,
+} from '../../lib/chatContext'
 import type {
   Exercise,
   MuscleGroup,
@@ -19,6 +25,8 @@ import type {
   PlannedExercise,
   PlannedProgramSession,
 } from '../../lib/chatTypes'
+import { parseCoachActionResultJson } from '../../lib/coachActionResult'
+import type { ChatActionReceipt } from '../types'
 
 const MUSCLE_GROUPS: readonly MuscleGroup[] = [
   'chest',
@@ -691,21 +699,70 @@ async function compactProgramSessionOrder(programId: string): Promise<void> {
   }
 }
 
-async function programActionStateHashInTransaction(): Promise<string> {
-  const [exercises, programs, templates, templateExercises] = await Promise.all([
-    db.exercises.toArray(),
-    db.programs.toArray(),
-    db.sessionTemplates.toArray(),
-    db.templateExercises.toArray(),
-  ])
-  return Dexie.waitFor(
-    hashProgramActionState({
-      exercises,
-      programs,
-      templates,
-      templateExercises,
-    }),
-  )
+async function actionStateHashInTransaction(
+  plan: CoachActionPlan,
+): Promise<string> {
+  switch (plan.scope) {
+    case 'active_workout': {
+      const [exercises, inProgress, loggedSets] = await Promise.all([
+        db.exercises.toArray(),
+        db.workoutSessions
+          .filter((session) => session.completedAt === null)
+          .toArray(),
+        db.loggedSets.toArray(),
+      ])
+      const action = plan.actions[0]
+      const preferredSessionId =
+        action && 'sessionId' in action ? action.sessionId : undefined
+      return Dexie.waitFor(
+        hashActiveWorkoutActionState(
+          { exercises, inProgress, loggedSets },
+          preferredSessionId,
+        ),
+      )
+    }
+    case 'one_time_workout': {
+      const [exercises, inProgress, loggedSets] = await Promise.all([
+        db.exercises.toArray(),
+        db.workoutSessions
+          .filter((session) => session.completedAt === null)
+          .toArray(),
+        db.loggedSets.toArray(),
+      ])
+      return Dexie.waitFor(
+        hashOneTimeWorkoutActionState({
+          exercises,
+          inProgress,
+          loggedSets,
+        }),
+      )
+    }
+    case 'program': {
+      const [exercises, programs, templates, templateExercises] =
+        await Promise.all([
+          db.exercises.toArray(),
+          db.programs.toArray(),
+          db.sessionTemplates.toArray(),
+          db.templateExercises.toArray(),
+        ])
+      return Dexie.waitFor(
+        hashProgramActionState({
+          exercises,
+          programs,
+          templates,
+          templateExercises,
+        }),
+      )
+    }
+    case 'exercise_library': {
+      const exercises = await db.exercises.toArray()
+      return Dexie.waitFor(hashExerciseLibraryActionState(exercises))
+    }
+    case 'ai_memory': {
+      const memorySettings = await db.aiMemorySettings.get('default')
+      return Dexie.waitFor(hashAiMemoryActionState(memorySettings))
+    }
+  }
 }
 
 function snapshotFromPlan(exercises: PlannedExercise[]): SessionExerciseSnapshot[] {
@@ -717,11 +774,33 @@ function snapshotFromPlan(exercises: PlannedExercise[]): SessionExerciseSnapshot
   }))
 }
 
-function parseStoredResult(raw: string): CoachActionResult {
+function parseStoredResult(receipt: ChatActionReceipt): CoachActionResult {
   try {
-    return JSON.parse(raw) as CoachActionResult
+    const result = parseCoachActionResultJson(receipt.resultJson)
+    if (
+      result.proposalId !== receipt.proposalId ||
+      result.appliedAt !== receipt.appliedAt ||
+      result.sourceStateHash !== receipt.sourceStateHash
+    ) {
+      throw new Error('Saved Coach action receipt does not match its result')
+    }
+    return result
   } catch {
     throw new CoachActionValidationError('Saved Coach action receipt is malformed')
+  }
+}
+
+function safelyParseStoredResult(
+  receipt: ChatActionReceipt,
+): CoachActionResult | null {
+  try {
+    return parseStoredResult(receipt)
+  } catch (error) {
+    console.warn(
+      `[coach] Ignoring corrupt action receipt ${receipt.proposalId}`,
+      error,
+    )
+    return null
   }
 }
 
@@ -729,7 +808,7 @@ export async function getAppliedCoachActionResult(
   proposalId: string,
 ): Promise<CoachActionResult | null> {
   const receipt = await db.chatActionReceipts.get(proposalId)
-  return receipt ? parseStoredResult(receipt.resultJson) : null
+  return receipt ? safelyParseStoredResult(receipt) : null
 }
 
 export async function listPendingCoachActionResults(): Promise<
@@ -737,7 +816,8 @@ export async function listPendingCoachActionResults(): Promise<
 > {
   const receipts = await db.chatActionReceipts.toArray()
   return receipts
-    .map((receipt) => parseStoredResult(receipt.resultJson))
+    .map(safelyParseStoredResult)
+    .filter((result): result is CoachActionResult => result !== null)
     .filter((result) => result.syncPending === true)
 }
 
@@ -750,7 +830,7 @@ export async function markCoachActionSynced(
     if (!receipt) {
       throw new CoachActionValidationError('Saved Coach action receipt is missing')
     }
-    const result = { ...parseStoredResult(receipt.resultJson), syncPending: false }
+    const result = { ...parseStoredResult(receipt), syncPending: false }
     const updated = await db.chatActionReceipts.update(id, {
       resultJson: JSON.stringify(result),
     })
@@ -780,7 +860,7 @@ export async function applyCoachActionPlan(args: {
     if (prior.sourceStateHash !== plan.sourceStateHash) {
       throw new CoachActionValidationError('Proposal ID conflicts with an applied action')
     }
-    const stored = parseStoredResult(prior.resultJson)
+    const stored = parseStoredResult(prior)
     if (
       stored.sourceActionStateHash &&
       stored.sourceActionStateHash !== plan.sourceActionStateHash
@@ -819,7 +899,7 @@ export async function applyCoachActionPlan(args: {
             'Proposal ID conflicts with an applied action',
           )
         }
-        const stored = parseStoredResult(raced.resultJson)
+        const stored = parseStoredResult(raced)
         if (
           stored.sourceActionStateHash &&
           stored.sourceActionStateHash !== plan.sourceActionStateHash
@@ -836,12 +916,10 @@ export async function applyCoachActionPlan(args: {
         }
       }
 
-      if (plan.scope === 'program') {
-        const transactionActionStateHash =
-          await programActionStateHashInTransaction()
-        if (transactionActionStateHash !== plan.sourceActionStateHash) {
-          throw new StaleCoachActionError()
-        }
+      const transactionActionStateHash =
+        await actionStateHashInTransaction(plan)
+      if (transactionActionStateHash !== plan.sourceActionStateHash) {
+        throw new StaleCoachActionError()
       }
 
       const now = Date.now()

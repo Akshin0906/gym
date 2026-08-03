@@ -29,6 +29,7 @@ import type {
 } from '../db/types'
 import { isCloudConfigured, uploadCloudSnapshot } from '../lib/cloud'
 import { shouldCompleteExerciseAfterRest } from '../lib/workoutFlow'
+import { useUnsavedChangesWarning } from '../lib/useUnsavedChangesWarning'
 import { useActiveWorkout } from '../store/activeWorkout'
 import { useTimer } from '../store/timer'
 
@@ -50,6 +51,9 @@ export function ActiveWorkoutScreen() {
     string | null
   >(null)
   const [detailExerciseId, setDetailExerciseId] = useState<string | null>(null)
+  const [dirtySetDrafts, setDirtySetDrafts] = useState<Set<string>>(
+    () => new Set(),
+  )
   // Done exercises reopened in place (ephemeral). Membership in the bottom
   // stack persists via session.doneExerciseIds; this is just which of those
   // are currently expanded. A fresh load/Resume shows them all collapsed.
@@ -103,6 +107,21 @@ export function ActiveWorkoutScreen() {
   // screen was opened without an active session (direct nav).
   const hadSessionRef = useRef(false)
   const completionSyncRef = useRef<Promise<unknown> | null>(null)
+  useUnsavedChangesWarning(
+    dirtySetDrafts.size > 0 && feedbackForSessionId === null,
+    'You have an unlogged set. Leave this workout and discard it?',
+  )
+
+  const reportSetDraft = useCallback((draftId: string, dirty: boolean) => {
+    setDirtySetDrafts((current) => {
+      const has = current.has(draftId)
+      if (has === dirty) return current
+      const next = new Set(current)
+      if (dirty) next.add(draftId)
+      else next.delete(draftId)
+      return next
+    })
+  }, [])
   useEffect(() => {
     if (sessionId) {
       hadSessionRef.current = true
@@ -334,6 +353,7 @@ export function ActiveWorkoutScreen() {
           previousSets={prev}
           defaultRestSeconds={ex.defaultRestSeconds}
           onChange={() => void refreshSets(session.id)}
+          onDraftChange={reportSetDraft}
           onStartRest={(secs, committedSetCount) => {
             startRest(secs, ex.id)
             // The spec's final-set flow is Log set → Start Rest → next

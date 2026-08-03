@@ -2,6 +2,7 @@ import 'fake-indexeddb/auto'
 import { beforeEach, describe, expect, it } from 'vitest'
 import { db } from './schema'
 import {
+  assertExportTableCoverage,
   buildExportPayload,
   importPayload,
 } from './repositories/exportImport'
@@ -11,11 +12,30 @@ import {
   restoreSet,
 } from './repositories/sessions'
 import type {
+  ChatActionReceipt,
   DailyBriefing,
   Exercise,
   LoggedSet,
   ProgramRow,
 } from './types'
+import type { CoachActionResult } from '../lib/chatTypes'
+
+const HASH = 'a'.repeat(64)
+const ACTION_HASH = 'b'.repeat(64)
+const CURRENT_EXPORT_TABLES = [
+  'exercises',
+  'programs',
+  'sessionTemplates',
+  'templateExercises',
+  'workoutSessions',
+  'loggedSets',
+  'recommendations',
+  'dailyBriefings',
+  'aiMemorySettings',
+  'aiNotes',
+  'aiMemorySummaries',
+  'chatActionReceipts',
+] as const
 
 function exercise(id: string): Exercise {
   return {
@@ -72,6 +92,41 @@ function loggedSet(
   }
 }
 
+function actionResult(
+  proposalId = 'proposal-1',
+  overrides: Partial<CoachActionResult> = {},
+): CoachActionResult {
+  return {
+    proposalId,
+    appliedAt: 123,
+    sourceStateHash: HASH,
+    sourceActionStateHash: ACTION_HASH,
+    replayed: false,
+    syncPending: true,
+    changes: [
+      {
+        type: 'save_ai_note',
+        label: 'Saved a note for AI Insights',
+        entityId: 'note-1',
+      },
+    ],
+    ...overrides,
+  }
+}
+
+function actionReceipt(
+  result = actionResult(),
+  overrides: Partial<ChatActionReceipt> = {},
+): ChatActionReceipt {
+  return {
+    proposalId: result.proposalId,
+    appliedAt: result.appliedAt,
+    sourceStateHash: result.sourceStateHash,
+    resultJson: JSON.stringify(result),
+    ...overrides,
+  }
+}
+
 async function clearAll() {
   await Promise.all(db.tables.map((t) => t.clear()))
 }
@@ -85,6 +140,28 @@ describe('export/import round-trip', () => {
     for (const table of db.tables) {
       expect(exportedTables).toContain(table.name)
     }
+  })
+
+  it('throws when a Dexie table is not wired into the export payload', () => {
+    expect(() =>
+      assertExportTableCoverage(
+        ['exercises', 'futureTable'],
+        { exercises: [] },
+      ),
+    ).toThrow('futureTable')
+  })
+
+  it('refuses to produce a backup containing a corrupt local receipt', async () => {
+    await db.chatActionReceipts.add({
+      proposalId: 'proposal-corrupt',
+      appliedAt: 123,
+      sourceStateHash: HASH,
+      resultJson: '{',
+    })
+
+    await expect(buildExportPayload()).rejects.toThrow(
+      'Import table "chatActionReceipts" is malformed',
+    )
   })
 
   it('preserves dailyBriefings across a backup → restore round-trip', async () => {
@@ -121,6 +198,10 @@ describe('export/import round-trip', () => {
         templateExercises: [],
         workoutSessions: [],
         loggedSets: [],
+        recommendations: [],
+        aiMemorySettings: [],
+        aiNotes: [],
+        aiMemorySummaries: [],
       },
     }
     await importPayload(JSON.stringify(legacy))
@@ -128,22 +209,93 @@ describe('export/import round-trip', () => {
     expect(await db.dailyBriefings.count()).toBe(0)
   })
 
+  it('allows a v3 backup to omit receipts that were introduced in v4', async () => {
+    const payload = await buildExportPayload()
+    payload.schemaVersion = 3
+    Reflect.deleteProperty(payload.data, 'chatActionReceipts')
+
+    await expect(importPayload(JSON.stringify(payload))).resolves.toBeDefined()
+    expect(await db.chatActionReceipts.count()).toBe(0)
+  })
+
+  it.each(CURRENT_EXPORT_TABLES)(
+    'rejects a current backup missing %s before clearing local data',
+    async (table) => {
+      await db.exercises.add(exercise('keep'))
+      const payload = await buildExportPayload()
+      Reflect.deleteProperty(payload.data, table)
+
+      await expect(importPayload(JSON.stringify(payload))).rejects.toThrow(
+        `Import table "${table}" is missing for schemaVersion 4`,
+      )
+      expect(await db.exercises.get('keep')).toBeDefined()
+    },
+  )
+
   it('preserves Coach action receipts so retries stay idempotent', async () => {
-    await db.chatActionReceipts.add({
-      proposalId: 'proposal-1',
-      appliedAt: 123,
-      sourceStateHash: 'state-hash',
-      resultJson: '{"sessionId":"session-1"}',
-    })
+    await db.chatActionReceipts.add(actionReceipt())
 
     const payload = await buildExportPayload()
     expect(payload.data.chatActionReceipts).toHaveLength(1)
 
     await importPayload(JSON.stringify(payload))
     expect(await db.chatActionReceipts.get('proposal-1')).toMatchObject({
-      sourceStateHash: 'state-hash',
-      resultJson: '{"sessionId":"session-1"}',
+      sourceStateHash: HASH,
+      resultJson: JSON.stringify(actionResult()),
     })
+  })
+
+  it('accepts a validated legacy Coach receipt without a scoped hash', async () => {
+    const legacyResult = actionResult('proposal-legacy')
+    delete legacyResult.sourceActionStateHash
+    const payload = await buildExportPayload()
+    payload.data.chatActionReceipts = [actionReceipt(legacyResult)]
+
+    await importPayload(JSON.stringify(payload))
+
+    expect(await db.chatActionReceipts.get('proposal-legacy')).toMatchObject({
+      proposalId: 'proposal-legacy',
+      resultJson: JSON.stringify(legacyResult),
+    })
+  })
+
+  it.each([
+    ['malformed JSON', '{'],
+    ['valid JSON with the wrong shape', JSON.stringify({ proposalId: 'proposal-1' })],
+    ['an empty changes list', JSON.stringify(actionResult('proposal-1', { changes: [] }))],
+    [
+      'an uppercase action hash',
+      JSON.stringify(
+        actionResult('proposal-1', {
+          sourceActionStateHash: ACTION_HASH.toUpperCase(),
+        }),
+      ),
+    ],
+    ['an oversized result', 'x'.repeat(70_000)],
+  ])('rejects %s in a Coach receipt before replacing local data', async (_, resultJson) => {
+    await db.exercises.add(exercise('keep'))
+    const payload = await buildExportPayload()
+    payload.data.exercises = [exercise('replacement')]
+    payload.data.chatActionReceipts = [actionReceipt(actionResult(), { resultJson })]
+
+    await expect(importPayload(JSON.stringify(payload))).rejects.toThrow(
+      'Import table "chatActionReceipts" is malformed',
+    )
+    expect(await db.exercises.toArray()).toEqual([exercise('keep')])
+  })
+
+  it('rejects a Coach receipt whose row metadata does not match its result', async () => {
+    await db.exercises.add(exercise('keep'))
+    const payload = await buildExportPayload()
+    payload.data.exercises = [exercise('replacement')]
+    payload.data.chatActionReceipts = [
+      actionReceipt(actionResult(), { proposalId: 'different-proposal' }),
+    ]
+
+    await expect(importPayload(JSON.stringify(payload))).rejects.toThrow(
+      'Import table "chatActionReceipts" is malformed',
+    )
+    expect(await db.exercises.toArray()).toEqual([exercise('keep')])
   })
 })
 

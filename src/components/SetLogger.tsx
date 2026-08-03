@@ -18,6 +18,17 @@ interface Props {
   defaultRestSeconds: number
   onChange: () => void
   onStartRest?: (seconds: number, loggedSetCount: number) => void
+  onDraftChange?: (draftId: string, dirty: boolean) => void
+}
+
+export function shouldStartSetRowSwipe(target: EventTarget | null): boolean {
+  const closest = (
+    target as { closest?: (selector: string) => Element | null } | null
+  )?.closest
+  return (
+    typeof closest !== 'function' ||
+    closest.call(target, 'button, input, select, textarea, a') === null
+  )
 }
 
 export function SetLogger({
@@ -28,6 +39,7 @@ export function SetLogger({
   defaultRestSeconds,
   onChange,
   onStartRest,
+  onDraftChange,
 }: Props) {
   // Holds the just-deleted set so the Undo toast can re-insert it.
   const [undo, setUndo] = useState<{ notice: ToastNotice; set: LoggedSet } | null>(
@@ -84,6 +96,7 @@ export function SetLogger({
               set={s}
               onChange={onChange}
               onDelete={() => void handleDelete(s)}
+              onDraftChange={onDraftChange}
             />
           ))}
         </ul>
@@ -103,6 +116,7 @@ export function SetLogger({
           onChange()
         }}
         onStartRest={onStartRest}
+        onDraftChange={onDraftChange}
       />
 
       <Toast
@@ -127,16 +141,29 @@ function SetRow({
   set,
   onChange,
   onDelete,
+  onDraftChange,
 }: {
   set: LoggedSet
   onChange: () => void
   onDelete: () => void
+  onDraftChange?: (draftId: string, dirty: boolean) => void
 }) {
   const [editing, setEditing] = useState(false)
   const [w, setW] = useState(String(set.weightLbs))
   const [r, setR] = useState(String(set.reps))
   const [rpe, setRpe] = useState(set.rpe === null ? '' : String(set.rpe))
   const [error, setError] = useState<string | null>(null)
+  const editDirty =
+    editing &&
+    (w !== String(set.weightLbs) ||
+      r !== String(set.reps) ||
+      rpe !== (set.rpe === null ? '' : String(set.rpe)))
+
+  useEffect(() => {
+    const draftId = `edit:${set.id}`
+    onDraftChange?.(draftId, editDirty)
+    return () => onDraftChange?.(draftId, false)
+  }, [editDirty, onDraftChange, set.id])
 
   // Swipe-to-delete state
   const [dragX, setDragX] = useState(0)
@@ -148,6 +175,10 @@ function SetRow({
 
   const onPointerDown = (e: React.PointerEvent) => {
     if (editing) return
+    // Action controls live inside the swipe surface. Capturing their pointer on
+    // the parent retargets the eventual click on touch devices, making Edit
+    // appear to focus without opening. Leave interactive descendants alone.
+    if (!shouldStartSetRowSwipe(e.target)) return
     startX.current = e.clientX
     moved.current = false
     ;(e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId)
@@ -327,6 +358,7 @@ function NewSetRow({
   defaultRestSeconds,
   onLogged,
   onStartRest,
+  onDraftChange,
 }: {
   sessionId: string
   exerciseId: string
@@ -335,6 +367,7 @@ function NewSetRow({
   defaultRestSeconds: number
   onLogged: () => void
   onStartRest?: (seconds: number, loggedSetCount: number) => void
+  onDraftChange?: (draftId: string, dirty: boolean) => void
 }) {
   const [w, setW] = useState(previousSet ? String(previousSet.weightLbs) : '')
   const [r, setR] = useState(previousSet ? String(previousSet.reps) : '')
@@ -342,10 +375,18 @@ function NewSetRow({
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const committedSetCountRef = useRef(nextSetNumber - 1)
+  const committedDraftRef = useRef({ w, r, rpe })
+  const draftDirty = isNewSetDraftDirty({ w, r, rpe }, committedDraftRef.current)
 
   useEffect(() => {
     committedSetCountRef.current = nextSetNumber - 1
   }, [nextSetNumber])
+
+  useEffect(() => {
+    const draftId = `new:${exerciseId}`
+    onDraftChange?.(draftId, draftDirty)
+    return () => onDraftChange?.(draftId, false)
+  }, [draftDirty, exerciseId, onDraftChange])
 
   async function submit() {
     if (busy) return
@@ -362,6 +403,7 @@ function NewSetRow({
       // Light tactile confirmation that the set committed — the most frequent
       // in-gym action, otherwise silent.
       vibrate(10)
+      committedDraftRef.current = { w, r, rpe: '' }
       setRpe('')
       // Update synchronously before the IndexedDB refresh/rerender. A fast tap
       // on Start Rest must see the just-committed final set.
@@ -431,6 +473,17 @@ function NewSetRow({
         )}
       </div>
     </form>
+  )
+}
+
+export function isNewSetDraftDirty(
+  current: { w: string; r: string; rpe: string },
+  committed: { w: string; r: string; rpe: string },
+): boolean {
+  return (
+    current.w !== committed.w ||
+    current.r !== committed.r ||
+    current.rpe !== committed.rpe
   )
 }
 

@@ -122,6 +122,14 @@ export interface ProgramActionStateRows {
   templateExercises: TemplateExercise[]
 }
 
+export interface ActiveWorkoutActionStateRows {
+  exercises: Exercise[]
+  inProgress: WorkoutSession[]
+  loggedSets: LoggedSet[]
+}
+
+export type OneTimeWorkoutActionStateRows = ActiveWorkoutActionStateRows
+
 function byId<T extends { id: string }>(a: T, b: T): number {
   return a.id.localeCompare(b.id)
 }
@@ -171,20 +179,128 @@ async function sha256(value: unknown): Promise<string> {
   ).join('')
 }
 
-export async function hashProgramActionState(
-  rows: ProgramActionStateRows,
-): Promise<string> {
-  const exerciseCatalog = rows.exercises.slice().sort(byId).map((exercise) => ({
+function exerciseCatalogActionState(exercises: Exercise[]) {
+  return exercises.slice().sort(byId).map((exercise) => ({
     id: exercise.id,
     name: exercise.name,
     hiddenFromLibrary: exercise.hiddenFromLibrary,
   }))
+}
+
+function sortedInProgressSessions(
+  sessions: WorkoutSession[],
+): WorkoutSession[] {
+  return sessions
+    .slice()
+    .sort((a, b) => b.startedAt - a.startedAt || a.id.localeCompare(b.id))
+}
+
+export async function hashActiveWorkoutActionState(
+  rows: ActiveWorkoutActionStateRows,
+  preferredSessionId?: string,
+): Promise<string> {
+  const inProgress = sortedInProgressSessions(rows.inProgress)
+  const preferred = preferredSessionId
+    ? inProgress.find((session) => session.id === preferredSessionId)
+    : undefined
+  const active = preferred ?? inProgress[0] ?? null
+  const loggedSetCounts = new Map<string, number>()
+  if (active) {
+    for (const snapshot of active.exerciseSnapshot) {
+      loggedSetCounts.set(snapshot.exerciseId, 0)
+    }
+    for (const set of rows.loggedSets) {
+      if (
+        set.workoutSessionId === active.id &&
+        loggedSetCounts.has(set.exerciseId)
+      ) {
+        loggedSetCounts.set(
+          set.exerciseId,
+          (loggedSetCounts.get(set.exerciseId) ?? 0) + 1,
+        )
+      }
+    }
+  }
   return sha256({
-    exerciseCatalog,
+    exerciseAvailability: exerciseCatalogActionState(rows.exercises),
+    activeWorkout: active
+      ? {
+          id: active.id,
+          sessionTemplateId: active.sessionTemplateId,
+          programId: active.programId,
+          name: active.name,
+          programName: active.programName,
+          doneExerciseIds: (active.doneExerciseIds ?? [])
+            .slice()
+            .sort((a, b) => a.localeCompare(b)),
+          exerciseSnapshot: active.exerciseSnapshot
+            .slice()
+            .sort((a, b) => a.order - b.order),
+          loggedSetCounts: Array.from(loggedSetCounts.entries())
+            .sort(([left], [right]) => left.localeCompare(right))
+            .map(([exerciseId, count]) => ({ exerciseId, count })),
+        }
+      : null,
+  })
+}
+
+export async function hashOneTimeWorkoutActionState(
+  rows: OneTimeWorkoutActionStateRows,
+): Promise<string> {
+  const sessionsWithWork = new Set(
+    rows.loggedSets.map((set) => set.workoutSessionId),
+  )
+  return sha256({
+    exerciseCatalog: exerciseCatalogActionState(rows.exercises),
+    inProgress: rows.inProgress.slice().sort(byId).map((session) => ({
+      id: session.id,
+      sessionTemplateId: session.sessionTemplateId,
+      programId: session.programId,
+      name: session.name,
+      programName: session.programName,
+      exerciseSnapshot: session.exerciseSnapshot
+        .slice()
+        .sort((a, b) => a.order - b.order),
+      hasLoggedWork: sessionsWithWork.has(session.id),
+    })),
+  })
+}
+
+export async function hashProgramActionState(
+  rows: ProgramActionStateRows,
+): Promise<string> {
+  return sha256({
+    exerciseCatalog: exerciseCatalogActionState(rows.exercises),
     programs: rows.programs.slice().sort(byId),
     templates: rows.templates.slice().sort(byId),
     templateExercises: rows.templateExercises.slice().sort(byId),
   })
+}
+
+export async function hashExerciseLibraryActionState(
+  exercises: Exercise[],
+): Promise<string> {
+  return sha256(
+    exercises.slice().sort(byId).map((exercise) => ({
+      id: exercise.id,
+      name: exercise.name,
+      primaryMuscle: exercise.primaryMuscle,
+      secondaryMuscles: exercise.secondaryMuscles,
+      notes: exercise.notes,
+      defaultRestSeconds: exercise.defaultRestSeconds,
+      isCustom: exercise.isCustom,
+      hiddenFromLibrary: exercise.hiddenFromLibrary,
+      createdAt: exercise.createdAt,
+    })),
+  )
+}
+
+export async function hashAiMemoryActionState(
+  memorySettings: AiMemorySettings | undefined,
+): Promise<string> {
+  // Saving a note is append-only. Only availability should invalidate a
+  // pending proposal; unrelated notes or summaries can safely change.
+  return sha256({ paused: memorySettings?.paused ?? false })
 }
 
 async function readContextRows(): Promise<ContextRows> {
@@ -225,7 +341,7 @@ async function readContextRows(): Promise<ContextRows> {
       programs,
       templates,
       templateExercises,
-      inProgress: allInProgress.sort((a, b) => b.startedAt - a.startedAt),
+      inProgress: sortedInProgressSessions(allInProgress),
       recentSessions,
       relevantSets,
       latestBriefing,
@@ -240,6 +356,7 @@ export async function buildLiveCoachContext(
   preferredSessionId?: string,
 ): Promise<{ context: CoachLiveContext; stateHash: string }> {
   const rows = await readContextRows()
+  const inProgress = sortedInProgressSessions(rows.inProgress)
   const exerciseById = new Map(rows.exercises.map((exercise) => [exercise.id, exercise]))
   const setsBySession = new Map<string, LoggedSet[]>()
   for (const set of rows.relevantSets) {
@@ -249,9 +366,9 @@ export async function buildLiveCoachContext(
   }
 
   const preferred = preferredSessionId
-    ? rows.inProgress.find((session) => session.id === preferredSessionId)
+    ? inProgress.find((session) => session.id === preferredSessionId)
     : undefined
-  const active = preferred ?? rows.inProgress[0] ?? null
+  const active = preferred ?? inProgress[0] ?? null
   const activeSets = active ? setsBySession.get(active.id) ?? [] : []
   const activeSetsByExercise = new Map<string, LoggedSet[]>()
   for (const set of activeSets) {
@@ -273,48 +390,7 @@ export async function buildLiveCoachContext(
     templateExercisesByTemplate.set(row.sessionTemplateId, list)
   }
 
-  const exerciseCatalogState = rows.exercises.slice().sort(byId).map((exercise) => ({
-    id: exercise.id,
-    name: exercise.name,
-    hiddenFromLibrary: exercise.hiddenFromLibrary,
-  }))
-  const exerciseLibraryState = rows.exercises.slice().sort(byId).map((exercise) => ({
-    id: exercise.id,
-    name: exercise.name,
-    primaryMuscle: exercise.primaryMuscle,
-    secondaryMuscles: exercise.secondaryMuscles,
-    notes: exercise.notes,
-    defaultRestSeconds: exercise.defaultRestSeconds,
-    isCustom: exercise.isCustom,
-    hiddenFromLibrary: exercise.hiddenFromLibrary,
-    createdAt: exercise.createdAt,
-  }))
-  const activeWorkoutState = {
-    exerciseAvailability: exerciseCatalogState,
-    activeWorkout: active
-      ? {
-          id: active.id,
-          sessionTemplateId: active.sessionTemplateId,
-          programId: active.programId,
-          name: active.name,
-          programName: active.programName,
-          exerciseSnapshot: active.exerciseSnapshot
-            .slice()
-            .sort((a, b) => a.order - b.order),
-        }
-      : null,
-  }
-  const inProgressStructure = rows.inProgress.slice().sort(byId).map((session) => ({
-    id: session.id,
-    sessionTemplateId: session.sessionTemplateId,
-    programId: session.programId,
-    name: session.name,
-    programName: session.programName,
-    exerciseSnapshot: session.exerciseSnapshot
-      .slice()
-      .sort((a, b) => a.order - b.order),
-    hasLoggedWork: (setsBySession.get(session.id) ?? []).length > 0,
-  }))
+  const exerciseCatalogState = exerciseCatalogActionState(rows.exercises)
   const [
     activeWorkoutHash,
     oneTimeWorkoutHash,
@@ -323,16 +399,22 @@ export async function buildLiveCoachContext(
     aiMemoryHash,
   ] =
     await Promise.all([
-      sha256(activeWorkoutState),
-      sha256({
-        exerciseCatalog: exerciseCatalogState,
-        inProgress: inProgressStructure,
+      hashActiveWorkoutActionState(
+        {
+          exercises: rows.exercises,
+          inProgress,
+          loggedSets: rows.relevantSets,
+        },
+        preferredSessionId,
+      ),
+      hashOneTimeWorkoutActionState({
+        exercises: rows.exercises,
+        inProgress,
+        loggedSets: rows.relevantSets,
       }),
       hashProgramActionState(rows),
-      sha256(exerciseLibraryState),
-      // Saving a note is append-only. Only availability should invalidate a
-      // pending proposal; unrelated notes or summaries can safely change.
-      sha256({ paused: rows.memorySettings?.paused ?? false }),
+      hashExerciseLibraryActionState(rows.exercises),
+      hashAiMemoryActionState(rows.memorySettings),
     ])
   const actionStateHashes: CoachActionStateHashes = {
     active_workout: activeWorkoutHash,
@@ -466,7 +548,7 @@ export async function buildLiveCoachContext(
     programs: rows.programs.slice().sort(byId),
     templates: rows.templates.slice().sort(byId),
     templateExercises: rows.templateExercises.slice().sort(byId),
-    inProgress: rows.inProgress.slice().sort(byId).map((session) => ({
+    inProgress: inProgress.slice().sort(byId).map((session) => ({
       ...session,
       exerciseSnapshot: session.exerciseSnapshot
         .slice()

@@ -59,6 +59,9 @@ function renderAction(args: {
   scope: CoachActionScope
   status: CoachProposal['status']
   liveContext: CoachLiveContext
+  reserved?: boolean
+  busy?: boolean
+  interactionLocked?: boolean
 }): string {
   const plan: CoachActionPlan = {
     title: 'Model-authored title',
@@ -77,12 +80,14 @@ function renderAction(args: {
     createdAt: 1,
     updatedAt: 1,
     result: null,
+    reserved: args.reserved,
   }
   return renderToStaticMarkup(
     createElement(CoachActionCard, {
       proposal,
       context: args.liveContext,
-      busy: false,
+      busy: args.busy ?? false,
+      interactionLocked: args.interactionLocked ?? false,
       error: null,
       onApply: () => undefined,
       onDismiss: () => undefined,
@@ -237,5 +242,87 @@ describe('CoachActionCard lifecycle previews', () => {
     expect(html).toContain('New')
     expect(html).toContain('Links to omitted saved workouts will be detached')
     expect(html).toContain('next-workout rotation')
+  })
+
+  it('labels a reservation and disables dismissal while leaving recovery Apply available', () => {
+    const html = renderAction({
+      action: {
+        type: 'rename_program',
+        programId: 'program',
+        name: 'New Program',
+      },
+      scope: 'program',
+      status: 'proposed',
+      reserved: true,
+      liveContext: context({
+        programs: [
+          {
+            id: 'program',
+            name: 'Old Program',
+            active: false,
+            archived: false,
+            sessions: [],
+          },
+        ],
+      }),
+    })
+    const buttons = html.match(/<button[^>]*>[\s\S]*?<\/button>/g) ?? []
+    const dismiss = buttons.find((button) => button.includes('Dismiss')) ?? ''
+    const apply = buttons.find((button) => button.includes('Rename program')) ?? ''
+
+    expect(html).toContain('aria-label="Coach reserved action"')
+    expect(html).toContain('Reserved for application')
+    expect(dismiss).toContain('disabled=""')
+    expect(apply).not.toContain('disabled=""')
+  })
+
+  it('visually locks every proposal control without showing a spinner on inactive cards', () => {
+    const html = renderAction({
+      action: {
+        type: 'rename_program',
+        programId: 'program',
+        name: 'New Program',
+      },
+      scope: 'program',
+      status: 'proposed',
+      interactionLocked: true,
+      liveContext: context({
+        programs: [
+          {
+            id: 'program',
+            name: 'Old Program',
+            active: false,
+            archived: false,
+            sessions: [],
+          },
+        ],
+      }),
+    })
+    const buttons = html.match(/<button[^>]*>[\s\S]*?<\/button>/g) ?? []
+
+    expect(buttons).toHaveLength(2)
+    expect(buttons.every((button) => button.includes('disabled=""'))).toBe(true)
+    expect(html).toContain('aria-disabled="true"')
+    expect(html).toContain('opacity-60')
+    expect(html).not.toContain('animate-spin')
+  })
+
+  it('uses status-specific accessible labels for terminal cards', () => {
+    const base = {
+      action: {
+        type: 'rename_program' as const,
+        programId: 'program',
+        name: 'New Program',
+      },
+      scope: 'program' as const,
+      liveContext: context(),
+    }
+
+    expect(renderAction({ ...base, status: 'failed' })).toContain(
+      'aria-label="Coach failed action"',
+    )
+    expect(renderAction({ ...base, status: 'dismissed' })).toContain(
+      'aria-label="Coach dismissed action"',
+    )
   })
 })

@@ -3,6 +3,7 @@
 // and writes one fixed daily briefing per America/Los_Angeles date.
 
 import {
+  readCloudSession,
   requireAutomationSecret,
   requireCloudAuth,
   requireDeviceSession,
@@ -115,6 +116,15 @@ const PUBLISH_RECEIPT_SELECT = `
 const SNAPSHOT_ID = 'primary'
 const MEMORY_STATE_ID = 'primary'
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
+const COACH_PROTOCOL_HEADER = 'X-Coach-Protocol'
+const COACH_PROTOCOL = 'proposal-reservation-v1'
+const SNAPSHOT_TRIGGER_HEADER = 'X-Snapshot-Trigger'
+const CHAT_ACTION_SNAPSHOT_TRIGGER = 'chat_action_applied'
+const SNAPSHOT_BASE_UPDATED_AT_HEADER = 'X-Snapshot-Base-Updated-At'
+const SNAPSHOT_BASE_MISSING = 'none'
+const COACH_RESERVATION_KIND = 'coach_apply_reservation_v1'
+const MAX_ACTIVE_COACH_RESERVATIONS = 100
+const MAX_COACH_RESERVATION_JSON_BYTES = 2_048
 // D1 caps a string/BLOB/row at 2,000,000 bytes. Leave room for the row's other
 // columns so every body accepted here can be persisted instead of failing with
 // SQLITE_TOOBIG. A normal single-user export is far below this threshold.
@@ -230,6 +240,290 @@ function parseJson(raw: string): unknown | null {
   }
 }
 
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(',')}]`
+  }
+  if (isObject(value)) {
+    return `{${Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`)
+      .join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'undefined'
+}
+
+function comparableSnapshotReceiptResult(
+  result: Record<string, unknown>,
+): string {
+  const comparable = { ...result }
+  // These fields describe transport/idempotent replay, not the mutation that
+  // the durable receipt proves. All other result fields must remain immutable.
+  delete comparable.syncPending
+  delete comparable.replayed
+  return canonicalJson(comparable)
+}
+
+interface CoachReservationRow {
+  id: string
+  result_json: string
+  action_plan_json: string
+}
+
+interface CoachReservation {
+  id: string
+  ownerSessionId: string
+  sourceStateHash: string
+  sourceActionStateHash: string
+}
+
+type SnapshotUploadMode = 'normal' | 'chat_action'
+
+class CoachReservationStateError extends Error {
+  constructor(readonly code: string) {
+    super(code)
+    this.name = 'CoachReservationStateError'
+  }
+}
+
+function snapshotUploadMode(request: Request): SnapshotUploadMode {
+  const protocol = request.headers.get(COACH_PROTOCOL_HEADER)
+  const trigger = request.headers.get(SNAPSHOT_TRIGGER_HEADER)
+  if (protocol === null && trigger === null) return 'normal'
+  if (
+    protocol?.trim() === COACH_PROTOCOL &&
+    trigger?.trim() === CHAT_ACTION_SNAPSHOT_TRIGGER
+  ) {
+    return 'chat_action'
+  }
+  throw new CoachReservationStateError('coach_snapshot_protocol_invalid')
+}
+
+function parseCoachReservation(row: CoachReservationRow): CoachReservation {
+  if (
+    typeof row.id !== 'string' ||
+    !row.id ||
+    row.id.length > 200 ||
+    typeof row.result_json !== 'string' ||
+    typeof row.action_plan_json !== 'string' ||
+    new TextEncoder().encode(row.result_json).byteLength >
+      MAX_COACH_RESERVATION_JSON_BYTES
+  ) {
+    throw new CoachReservationStateError(
+      'coach_action_reservation_state_invalid',
+    )
+  }
+  const parsed = parseJson(row.result_json)
+  const actionPlan = parseJson(row.action_plan_json)
+  if (
+    !isObject(parsed) ||
+    parsed._kind !== COACH_RESERVATION_KIND ||
+    typeof parsed.ownerSessionId !== 'string' ||
+    !parsed.ownerSessionId ||
+    parsed.ownerSessionId.length > 200 ||
+    typeof parsed.reservedAt !== 'number' ||
+    !Number.isSafeInteger(parsed.reservedAt) ||
+    parsed.reservedAt < 0 ||
+    !isObject(actionPlan) ||
+    typeof actionPlan.sourceStateHash !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(actionPlan.sourceStateHash) ||
+    typeof actionPlan.sourceActionStateHash !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(actionPlan.sourceActionStateHash)
+  ) {
+    throw new CoachReservationStateError(
+      'coach_action_reservation_state_invalid',
+    )
+  }
+  return {
+    id: row.id,
+    ownerSessionId: parsed.ownerSessionId,
+    sourceStateHash: actionPlan.sourceStateHash,
+    sourceActionStateHash: actionPlan.sourceActionStateHash,
+  }
+}
+
+async function readActiveCoachReservations(
+  db: D1Database,
+): Promise<CoachReservation[]> {
+  const result = await db
+    .prepare(
+      `SELECT id, result_json, action_plan_json
+       FROM codex_chat_action_proposals
+       WHERE status = 'proposed' AND result_json IS NOT NULL
+       ORDER BY created_at, id
+       LIMIT ?`,
+    )
+    .bind(MAX_ACTIVE_COACH_RESERVATIONS + 1)
+    .all<CoachReservationRow>()
+  const rows = result.results ?? []
+  if (rows.length > MAX_ACTIVE_COACH_RESERVATIONS) {
+    throw new CoachReservationStateError(
+      'coach_action_reservation_state_unavailable',
+    )
+  }
+  return rows.map(parseCoachReservation)
+}
+
+function snapshotBaseUpdatedAt(request: Request): number | null {
+  const raw = request.headers.get(SNAPSHOT_BASE_UPDATED_AT_HEADER)?.trim()
+  if (!raw) {
+    throw new CoachReservationStateError('snapshot_version_required')
+  }
+  if (raw === SNAPSHOT_BASE_MISSING) return null
+  if (!/^\d+$/.test(raw)) {
+    throw new CoachReservationStateError('snapshot_version_invalid')
+  }
+  const parsed = Number(raw)
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new CoachReservationStateError('snapshot_version_invalid')
+  }
+  return parsed
+}
+
+function readSnapshotReceiptProofs(
+  raw: unknown,
+  required: boolean,
+): Map<
+  string,
+  {
+    sourceStateHash: string
+    sourceActionStateHash?: string
+    comparableResult: string
+  }
+> {
+  if (!isObject(raw) || !isObject(raw.data)) {
+    throw new CoachReservationStateError(
+      'coach_action_snapshot_receipt_invalid',
+    )
+  }
+  const rawReceipts = raw.data.chatActionReceipts
+  if (!Array.isArray(rawReceipts)) {
+    if (!required && rawReceipts === undefined) return new Map()
+    throw new CoachReservationStateError(
+      'coach_action_snapshot_receipt_missing',
+    )
+  }
+  const receipts = new Map<
+    string,
+    {
+      sourceStateHash: string
+      sourceActionStateHash?: string
+      comparableResult: string
+    }
+  >()
+  for (const rawReceipt of rawReceipts) {
+    if (
+      !isObject(rawReceipt) ||
+      typeof rawReceipt.proposalId !== 'string' ||
+      !rawReceipt.proposalId ||
+      rawReceipt.proposalId.length > 200 ||
+      typeof rawReceipt.appliedAt !== 'number' ||
+      !Number.isSafeInteger(rawReceipt.appliedAt) ||
+      rawReceipt.appliedAt < 0 ||
+      typeof rawReceipt.sourceStateHash !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(rawReceipt.sourceStateHash) ||
+      typeof rawReceipt.resultJson !== 'string' ||
+      rawReceipt.resultJson.length > 100_000 ||
+      receipts.has(rawReceipt.proposalId)
+    ) {
+      throw new CoachReservationStateError(
+        'coach_action_snapshot_receipt_invalid',
+      )
+    }
+    const result = parseJson(rawReceipt.resultJson)
+    if (
+      !isObject(result) ||
+      result.proposalId !== rawReceipt.proposalId ||
+      result.appliedAt !== rawReceipt.appliedAt ||
+      result.sourceStateHash !== rawReceipt.sourceStateHash ||
+      (result.sourceActionStateHash !== undefined &&
+        (typeof result.sourceActionStateHash !== 'string' ||
+          !/^[a-f0-9]{64}$/.test(result.sourceActionStateHash)))
+    ) {
+      throw new CoachReservationStateError(
+        'coach_action_snapshot_receipt_invalid',
+      )
+    }
+    receipts.set(rawReceipt.proposalId, {
+      sourceStateHash: rawReceipt.sourceStateHash,
+      comparableResult: comparableSnapshotReceiptResult(result),
+      ...(typeof result.sourceActionStateHash === 'string'
+        ? { sourceActionStateHash: result.sourceActionStateHash }
+        : {}),
+    })
+  }
+  return receipts
+}
+
+function assertChatActionSnapshotReceipts(
+  raw: unknown,
+  reservations: CoachReservation[],
+): void {
+  const receipts = readSnapshotReceiptProofs(raw, true)
+  for (const reservation of reservations) {
+    const receipt = receipts.get(reservation.id)
+    if (!receipt) {
+      throw new CoachReservationStateError(
+        'coach_action_snapshot_receipt_missing',
+      )
+    }
+    if (
+      receipt.sourceStateHash !== reservation.sourceStateHash ||
+      (receipt.sourceActionStateHash !== undefined &&
+        receipt.sourceActionStateHash !== reservation.sourceActionStateHash)
+    ) {
+      throw new CoachReservationStateError(
+        'coach_action_snapshot_receipt_mismatch',
+      )
+    }
+  }
+}
+
+function assertSnapshotReceiptHistoryPreserved(
+  previous: unknown | null,
+  next: unknown,
+): void {
+  if (previous === null) return
+  let previousReceipts: Map<
+    string,
+    {
+      sourceStateHash: string
+      sourceActionStateHash?: string
+      comparableResult: string
+    }
+  >
+  let nextReceipts: Map<
+    string,
+    {
+      sourceStateHash: string
+      sourceActionStateHash?: string
+      comparableResult: string
+    }
+  >
+  try {
+    previousReceipts = readSnapshotReceiptProofs(previous, false)
+    nextReceipts = readSnapshotReceiptProofs(next, false)
+  } catch {
+    throw new CoachReservationStateError('snapshot_receipt_history_invalid')
+  }
+  for (const [proposalId, previousReceipt] of previousReceipts) {
+    const nextReceipt = nextReceipts.get(proposalId)
+    if (
+      !nextReceipt ||
+      nextReceipt.sourceStateHash !== previousReceipt.sourceStateHash ||
+      nextReceipt.comparableResult !== previousReceipt.comparableResult ||
+      (previousReceipt.sourceActionStateHash !== undefined &&
+        nextReceipt.sourceActionStateHash !== previousReceipt.sourceActionStateHash)
+    ) {
+      throw new CoachReservationStateError('snapshot_receipt_history_changed')
+    }
+  }
+}
+
+function reservationConflict(code: string): Response {
+  return json(409, { error: code })
+}
+
 function assertExportPayload(raw: unknown): { schemaVersion: number } {
   if (!isObject(raw)) throw new Error('payload must be an object')
   if (typeof raw.schemaVersion !== 'number') {
@@ -319,6 +613,18 @@ async function readSnapshot(db: D1Database): Promise<SnapshotRow | null> {
     .first<SnapshotRow>()
 }
 
+async function readSnapshotUpdatedAt(db: D1Database): Promise<number | null> {
+  const row = await db
+    .prepare(
+      `SELECT updated_at
+       FROM workout_snapshots
+       WHERE id = ?`,
+    )
+    .bind(SNAPSHOT_ID)
+    .first<{ updated_at: number }>()
+  return row?.updated_at ?? null
+}
+
 async function handleGetSnapshot(db: D1Database): Promise<Response> {
   const row = await readSnapshot(db)
   if (!row) return json(404, { error: 'snapshot_not_found' })
@@ -370,6 +676,48 @@ export async function readJsonBodyWithLimit(
 }
 
 async function handlePutSnapshot(ctx: PagesContext): Promise<Response> {
+  const session = await readCloudSession(ctx.request, ctx.env)
+  if (!session) return json(401, { error: 'unauthorized' })
+
+  let uploadMode: SnapshotUploadMode
+  let reservations: CoachReservation[]
+  let expectedSnapshotUpdatedAt: number | null
+  let currentSnapshot: SnapshotRow | null
+  try {
+    uploadMode = snapshotUploadMode(ctx.request)
+    expectedSnapshotUpdatedAt = snapshotBaseUpdatedAt(ctx.request)
+    ;[reservations, currentSnapshot] = await Promise.all([
+      readActiveCoachReservations(ctx.env.WORKOUT_DB),
+      readSnapshot(ctx.env.WORKOUT_DB),
+    ])
+  } catch (err) {
+    if (err instanceof CoachReservationStateError) {
+      return reservationConflict(err.code)
+    }
+    throw err
+  }
+  if ((currentSnapshot?.updated_at ?? null) !== expectedSnapshotUpdatedAt) {
+    return reservationConflict('snapshot_version_changed')
+  }
+
+  if (uploadMode === 'normal' && reservations.length > 0) {
+    return reservationConflict('coach_action_reservation_required')
+  }
+  if (uploadMode === 'chat_action') {
+    if (reservations.length === 0) {
+      return reservationConflict('coach_action_reservation_required')
+    }
+    if (
+      reservations.some(
+        (reservation) => reservation.ownerSessionId !== session.id,
+      )
+    ) {
+      return reservationConflict(
+        'coach_action_reservation_owned_by_another_device',
+      )
+    }
+  }
+
   let body: unknown
   try {
     body = await readJsonBodyWithLimit(ctx.request)
@@ -389,14 +737,101 @@ async function handlePutSnapshot(ctx: PagesContext): Promise<Response> {
       detail: err instanceof Error ? err.message : String(err),
     })
   }
+  if (uploadMode === 'chat_action') {
+    try {
+      assertChatActionSnapshotReceipts(body, reservations)
+    } catch (err) {
+      if (err instanceof CoachReservationStateError) {
+        return reservationConflict(err.code)
+      }
+      throw err
+    }
+  }
+  try {
+    const previousPayload = currentSnapshot
+      ? parseJson(currentSnapshot.payload_json)
+      : null
+    if (currentSnapshot && previousPayload === null) {
+      throw new CoachReservationStateError('snapshot_receipt_history_invalid')
+    }
+    assertSnapshotReceiptHistoryPreserved(
+      previousPayload,
+      body,
+    )
+  } catch (err) {
+    if (err instanceof CoachReservationStateError) {
+      return reservationConflict(err.code)
+    }
+    throw err
+  }
 
   const now = Date.now()
   const sourceDevice =
     ctx.request.headers.get('X-Source-Device')?.trim().slice(0, 80) || 'phone'
-  await ctx.env.WORKOUT_DB.prepare(
+  const reservationWriteGuard =
+    uploadMode === 'chat_action'
+      ? `(SELECT COUNT(*)
+           FROM codex_chat_action_proposals reserved
+           WHERE reserved.status = 'proposed'
+             AND reserved.result_json IS NOT NULL
+         ) = ?
+         AND NOT EXISTS (
+           SELECT 1
+           FROM codex_chat_action_proposals reserved
+           WHERE reserved.status = 'proposed'
+             AND reserved.result_json IS NOT NULL
+             AND reserved.id NOT IN (${reservations.map(() => '?').join(', ')})
+         )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM codex_chat_action_proposals reserved
+           WHERE reserved.status = 'proposed'
+             AND reserved.result_json IS NOT NULL
+             AND CASE
+               WHEN json_valid(reserved.result_json) THEN
+                 json_extract(reserved.result_json, '$._kind') = ?
+                 AND json_type(reserved.result_json, '$.ownerSessionId') = 'text'
+                 AND json_extract(reserved.result_json, '$.ownerSessionId') = ?
+                 AND json_type(reserved.result_json, '$.reservedAt') = 'integer'
+                 AND json_extract(reserved.result_json, '$.reservedAt') >= 0
+               ELSE 0
+             END = 0
+         )`
+      : `NOT EXISTS (
+           SELECT 1
+           FROM codex_chat_action_proposals reserved
+           WHERE reserved.status = 'proposed'
+             AND reserved.result_json IS NOT NULL
+         )`
+  const reservationWriteValues =
+    uploadMode === 'chat_action'
+      ? ([
+          reservations.length,
+          ...reservations.map((reservation) => reservation.id),
+          COACH_RESERVATION_KIND,
+          session.id,
+        ] as const)
+      : ([] as const)
+  const snapshotVersionWriteGuard =
+    expectedSnapshotUpdatedAt === null
+      ? `NOT EXISTS (
+           SELECT 1 FROM workout_snapshots current_snapshot WHERE current_snapshot.id = ?
+         )`
+      : `EXISTS (
+           SELECT 1
+           FROM workout_snapshots current_snapshot
+           WHERE current_snapshot.id = ? AND current_snapshot.updated_at = ?
+         )`
+  const snapshotVersionWriteValues =
+    expectedSnapshotUpdatedAt === null
+      ? ([SNAPSHOT_ID] as const)
+      : ([SNAPSHOT_ID, expectedSnapshotUpdatedAt] as const)
+  const writeResult = await ctx.env.WORKOUT_DB.prepare(
     `INSERT INTO workout_snapshots
        (id, created_at, updated_at, source_device, schema_version, payload_json)
-     VALUES (?, ?, ?, ?, ?, ?)
+     SELECT ?, ?, ?, ?, ?, ?
+     WHERE (${reservationWriteGuard})
+       AND (${snapshotVersionWriteGuard})
      ON CONFLICT(id) DO UPDATE SET
        updated_at = CASE
          WHEN workout_snapshots.updated_at >= excluded.updated_at
@@ -414,8 +849,23 @@ async function handlePutSnapshot(ctx: PagesContext): Promise<Response> {
       sourceDevice,
       schemaVersion,
       JSON.stringify(body),
+      ...reservationWriteValues,
+      ...snapshotVersionWriteValues,
     )
     .run()
+
+  // The conditional write closes the check/write race: if a reservation was
+  // created, finalized, corrupted, or transferred after preflight, this upload
+  // must be retried from fresh Coach state instead of publishing stale data.
+  if ((writeResult.meta?.changes ?? 0) !== 1) {
+    const latestSnapshotUpdatedAt = await readSnapshotUpdatedAt(
+      ctx.env.WORKOUT_DB,
+    )
+    if (latestSnapshotUpdatedAt !== expectedSnapshotUpdatedAt) {
+      return reservationConflict('snapshot_version_changed')
+    }
+    return reservationConflict('coach_action_reservation_changed')
+  }
 
   const row = await readSnapshot(ctx.env.WORKOUT_DB)
   return json(200, { snapshot: row ? snapshotResponse(row) : null })

@@ -13,6 +13,7 @@ import type {
 const STATUS_KEY = 'workout-tracker:cloudSyncStatus'
 const AUTH_PAIRED_KEY = 'workout-tracker:cloudAuthPaired'
 const STATUS_EVENT = 'workout-tracker:cloudSyncStatusChanged'
+const MAX_SNAPSHOT_UPLOAD_ATTEMPTS = 3
 
 export type CloudSnapshotTrigger =
   | 'workout_completed'
@@ -251,13 +252,13 @@ export async function unpairCloudDevice(): Promise<void> {
     method: 'DELETE',
     credentials: 'include',
   })
-  setCloudAuthPaired(false)
   if (!res.ok) {
     const detail = await responseDetail(res)
     throw new Error(
       `Cloud sign-out failed (${res.status})${detail ? `: ${detail}` : ''}`,
     )
   }
+  setCloudAuthPaired(false)
 }
 
 async function responseDetail(res: Response): Promise<string> {
@@ -403,41 +404,98 @@ function parseMemoryPayload(raw: unknown): {
   }
 }
 
+async function currentSnapshotUpdatedAt(): Promise<number | null> {
+  const res = await fetch('/api/cloud/snapshot', {
+    credentials: 'include',
+    cache: 'no-store',
+  })
+  if (res.status === 401) throw authLostError()
+  if (res.status === 404) return null
+  if (!res.ok) {
+    const detail = await responseDetail(res)
+    throw new Error(
+      `Cloud snapshot version check failed (${res.status})${detail ? `: ${detail}` : ''}`,
+    )
+  }
+
+  const body: unknown = await res.json()
+  const snapshot = isObject(body) ? body.snapshot : null
+  const updatedAt = isObject(snapshot) ? snapshot.updatedAt : null
+  if (
+    typeof updatedAt !== 'number' ||
+    !Number.isSafeInteger(updatedAt) ||
+    updatedAt < 0
+  ) {
+    throw new Error('Malformed cloud snapshot version response')
+  }
+  return updatedAt
+}
+
+async function responseErrorCode(res: Response): Promise<string | null> {
+  try {
+    const body: unknown = await res.clone().json()
+    return isObject(body) && typeof body.error === 'string' ? body.error : null
+  } catch {
+    return null
+  }
+}
+
 export async function uploadCloudSnapshot(
   trigger: CloudSnapshotTrigger,
 ): Promise<{ updatedAt: number }> {
   try {
     if (!isCloudConfigured()) throw authLostError()
-    const payload = await buildExportPayload()
-    const res = await fetch('/api/cloud/snapshot', {
-      method: 'PUT',
-      credentials: 'include',
-      headers: {
-        'content-type': 'application/json',
-        'X-Source-Device': 'phone',
-      },
-      body: JSON.stringify(payload),
-    })
-    if (res.status === 401) throw authLostError()
-    if (!res.ok) {
-      const detail = await responseDetail(res)
-      throw new Error(
-        `Cloud snapshot failed (${res.status})${detail ? `: ${detail}` : ''}`,
-      )
+    for (let attempt = 0; attempt < MAX_SNAPSHOT_UPLOAD_ATTEMPTS; attempt += 1) {
+      const baseUpdatedAt = await currentSnapshotUpdatedAt()
+      const payload = await buildExportPayload()
+      const res = await fetch('/api/cloud/snapshot', {
+        method: 'PUT',
+        credentials: 'include',
+        headers: {
+          'content-type': 'application/json',
+          'X-Source-Device': 'phone',
+          'X-Snapshot-Base-Updated-At':
+            baseUpdatedAt === null ? 'none' : String(baseUpdatedAt),
+          ...(trigger === 'chat_action_applied'
+            ? {
+                'X-Coach-Protocol': 'proposal-reservation-v1',
+                'X-Snapshot-Trigger': 'chat_action_applied',
+              }
+            : {}),
+        },
+        body: JSON.stringify(payload),
+      })
+      if (res.status === 401) throw authLostError()
+      if (!res.ok) {
+        const retryableVersionConflict =
+          res.status === 409 &&
+          (await responseErrorCode(res)) === 'snapshot_version_changed'
+        if (
+          retryableVersionConflict &&
+          attempt + 1 < MAX_SNAPSHOT_UPLOAD_ATTEMPTS
+        ) {
+          continue
+        }
+        const detail = await responseDetail(res)
+        throw new Error(
+          `Cloud snapshot failed (${res.status})${detail ? `: ${detail}` : ''}`,
+        )
+      }
+      const body: unknown = await res.json()
+      const snapshot = isObject(body) ? body.snapshot : null
+      const updatedAt =
+        isObject(snapshot) && typeof snapshot.updatedAt === 'number'
+          ? snapshot.updatedAt
+          : Date.now()
+      saveStatus({
+        lastSnapshotUploadAt: Date.now(),
+        lastSnapshotUpdatedAt: updatedAt,
+        lastSnapshotTrigger: trigger,
+        lastSnapshotError: null,
+      })
+      return { updatedAt }
     }
-    const body: unknown = await res.json()
-    const snapshot = isObject(body) ? body.snapshot : null
-    const updatedAt =
-      isObject(snapshot) && typeof snapshot.updatedAt === 'number'
-        ? snapshot.updatedAt
-        : Date.now()
-    saveStatus({
-      lastSnapshotUploadAt: Date.now(),
-      lastSnapshotUpdatedAt: updatedAt,
-      lastSnapshotTrigger: trigger,
-      lastSnapshotError: null,
-    })
-    return { updatedAt }
+    throw new Error('Cloud snapshot failed after version retries')
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     saveStatus({ lastSnapshotError: message })

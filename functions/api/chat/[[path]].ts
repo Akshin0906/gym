@@ -1,8 +1,11 @@
 import {
+  readCloudSession,
   requireAutomationSecret,
   requireDeviceSession,
   sha256Hex,
+  type CloudAuthSessionRow,
   type D1Database,
+  type D1PreparedStatement,
 } from '../../lib/cloudAuth'
 
 type ReasoningEffort = 'medium' | 'xhigh'
@@ -102,6 +105,7 @@ const MAX_REQUEST_BYTES = 1048576
 const MAX_CONTEXT_BYTES = 524288
 const MAX_ACTION_PLAN_BYTES = 131072
 const MAX_RESULT_BYTES = 65536
+const SNAPSHOT_ID = 'primary'
 const MAX_USER_TEXT_LENGTH = 6000
 const MAX_ASSISTANT_TEXT_LENGTH = 24000
 const BRIDGE_ONLINE_WINDOW_MS = 45000
@@ -116,6 +120,9 @@ const RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000
 const RETAIN_TERMINAL_JOBS = 500
 const RETAIN_RESOLVED_PROPOSALS = 500
 const RETAIN_TRANSCRIPT_MESSAGES = 120
+export const COACH_TRANSCRIPT_PROTOCOL = 'proposal-reservation-v1'
+const COACH_TRANSCRIPT_PROTOCOL_HEADER = 'X-Coach-Protocol'
+const PROPOSAL_RESERVATION_KIND = 'coach_apply_reservation_v1'
 const ACTION_SCOPES = [
   'active_workout',
   'one_time_workout',
@@ -123,6 +130,41 @@ const ACTION_SCOPES = [
   'exercise_library',
   'ai_memory',
 ] as const
+const COACH_RESULT_ACTION_TYPES = new Set([
+  'swap_active_exercise',
+  'add_active_exercise',
+  'update_active_exercise_targets',
+  'create_one_time_workout',
+  'create_session_template',
+  'create_program',
+  'rename_program',
+  'replace_program',
+  'archive_program',
+  'replace_session_template',
+  'delete_session_template',
+  'create_custom_exercise',
+  'save_ai_note',
+])
+const COACH_RESULT_KEYS = new Set([
+  'proposalId',
+  'appliedAt',
+  'sourceStateHash',
+  'sourceActionStateHash',
+  'replayed',
+  'syncPending',
+  'changes',
+  'activeSessionId',
+  'programId',
+  'sessionTemplateId',
+  'exerciseId',
+])
+const COACH_RESULT_CHANGE_KEYS = new Set(['type', 'label', 'entityId'])
+const COACH_RECEIPT_KEYS = new Set([
+  'proposalId',
+  'appliedAt',
+  'sourceStateHash',
+  'resultJson',
+])
 type ActionScope = (typeof ACTION_SCOPES)[number]
 type ValidatedAction = Record<string, unknown> & { type: string }
 const MUSCLE_GROUPS = [
@@ -146,6 +188,12 @@ interface ValidatedActionPlan {
   summary: string
   scope: ActionScope
   actions: ValidatedAction[]
+}
+
+interface ProposalReservation {
+  _kind: typeof PROPOSAL_RESERVATION_KIND
+  ownerSessionId: string
+  reservedAt: number
 }
 
 class ApiError extends Error {
@@ -181,6 +229,53 @@ function parseJson(raw: string): unknown | null {
   } catch {
     return null
   }
+}
+
+function parseProposalReservation(
+  raw: string | null,
+): ProposalReservation | null {
+  if (!raw) return null
+  const parsed = parseJson(raw)
+  if (
+    !isObject(parsed) ||
+    parsed._kind !== PROPOSAL_RESERVATION_KIND ||
+    typeof parsed.ownerSessionId !== 'string' ||
+    !parsed.ownerSessionId ||
+    typeof parsed.reservedAt !== 'number' ||
+    !Number.isSafeInteger(parsed.reservedAt) ||
+    parsed.reservedAt < 0
+  ) {
+    return null
+  }
+  return {
+    _kind: PROPOSAL_RESERVATION_KIND,
+    ownerSessionId: parsed.ownerSessionId,
+    reservedAt: parsed.reservedAt,
+  }
+}
+
+function reservationUnavailableError(): ApiError {
+  return new ApiError(
+    409,
+    'proposal_reserved',
+    'This proposal is reserved by another paired device. Return to the device that started Apply. Reservations do not expire automatically; if that session was lost, manual operator recovery is required after verifying the device\'s local workout data.',
+  )
+}
+
+function reservationLockedError(): ApiError {
+  return new ApiError(
+    409,
+    'proposal_reserved',
+    'This proposal is reserved for application. Retry Apply or finish syncing it on the same paired device. Reservations do not expire automatically; if that session was lost, manual operator recovery is required after verifying the device\'s local workout data.',
+  )
+}
+
+async function currentDeviceSession(
+  ctx: PagesContext,
+): Promise<CloudAuthSessionRow> {
+  const session = await readCloudSession(ctx.request, ctx.env)
+  if (!session) throw new ApiError(401, 'unauthorized')
+  return session
 }
 
 function jsonByteLength(value: unknown): number {
@@ -286,11 +381,114 @@ function validSha256Hex(value: unknown): value is string {
   return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)
 }
 
+function isBoundedNonEmptyString(
+  value: unknown,
+  maximum: number,
+): value is string {
+  return (
+    typeof value === 'string' &&
+    value.trim().length > 0 &&
+    value.length <= maximum
+  )
+}
+
+function hasOnlyKeys(
+  value: Record<string, unknown>,
+  allowed: ReadonlySet<string>,
+): boolean {
+  return Object.keys(value).every((key) => allowed.has(key))
+}
+
+function isCoachActionResult(value: unknown): value is Record<string, unknown> {
+  if (!isObject(value) || !hasOnlyKeys(value, COACH_RESULT_KEYS)) return false
+  if (
+    !isBoundedNonEmptyString(value.proposalId, 200) ||
+    typeof value.appliedAt !== 'number' ||
+    !Number.isSafeInteger(value.appliedAt) ||
+    value.appliedAt < 0 ||
+    !validSha256Hex(value.sourceStateHash) ||
+    (value.sourceActionStateHash !== undefined &&
+      !validSha256Hex(value.sourceActionStateHash)) ||
+    typeof value.replayed !== 'boolean' ||
+    (value.syncPending !== undefined &&
+      typeof value.syncPending !== 'boolean') ||
+    !Array.isArray(value.changes) ||
+    value.changes.length < 1 ||
+    value.changes.length > 12
+  ) {
+    return false
+  }
+  for (const change of value.changes) {
+    if (
+      !isObject(change) ||
+      !hasOnlyKeys(change, COACH_RESULT_CHANGE_KEYS) ||
+      typeof change.type !== 'string' ||
+      !COACH_RESULT_ACTION_TYPES.has(change.type) ||
+      !isBoundedNonEmptyString(change.label, 1000) ||
+      (change.entityId !== undefined &&
+        !isBoundedNonEmptyString(change.entityId, 200))
+    ) {
+      return false
+    }
+  }
+  for (const key of [
+    'activeSessionId',
+    'programId',
+    'sessionTemplateId',
+    'exerciseId',
+  ]) {
+    if (
+      value[key] !== undefined &&
+      !isBoundedNonEmptyString(value[key], 200)
+    ) {
+      return false
+    }
+  }
+  return true
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(',')}]`
+  }
+  if (isObject(value)) {
+    return `{${Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`)
+      .join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'undefined'
+}
+
+function comparableCoachResult(result: Record<string, unknown>): string {
+  const comparable = { ...result }
+  // The uploaded receipt is intentionally pending until that exact snapshot
+  // succeeds; the client flips only this transport flag before reporting.
+  // `replayed` is also execution metadata, not part of the saved mutation.
+  delete comparable.syncPending
+  delete comparable.replayed
+  return canonicalJson(comparable)
+}
+
 function isActionScope(value: unknown): value is ActionScope {
   return (
     typeof value === 'string' &&
     (ACTION_SCOPES as readonly string[]).includes(value)
   )
+}
+
+export function assertCompleteActionStateHashes(context: unknown): void {
+  const hashes = isObject(context) ? context.actionStateHashes : null
+  const missing = ACTION_SCOPES.filter(
+    (scope) => !isObject(hashes) || !validSha256Hex(hashes[scope]),
+  )
+  if (missing.length > 0) {
+    throw new ApiError(
+      409,
+      'coach_context_update_required',
+      `Update or refresh the app before using Coach; missing capabilities: ${missing.join(', ')}`,
+    )
+  }
 }
 
 function invalidActionPlan(detail: string): never {
@@ -672,6 +870,82 @@ export function trustedActionStateHash(
   return hash
 }
 
+export function trustedActionStateHashForPlan(
+  contextJson: string,
+  scope: ActionScope,
+): string {
+  const hash = trustedActionStateHash(contextJson, scope)
+  const payload = parseJson(contextJson)
+  const memory = isObject(payload) ? payload.memory : null
+  if (scope === 'ai_memory' && isObject(memory) && memory.paused === true) {
+    throw new ApiError(
+      409,
+      'ai_memory_paused',
+      'Resume AI Memory before saving a Coach note',
+    )
+  }
+  return hash
+}
+
+export function completionHashInput({
+  assistantText,
+  model,
+  effort,
+  codexThreadId,
+  actionPlan,
+  discardCodexThread,
+  expectedCodexThreadId,
+}: {
+  assistantText: string
+  model: string
+  effort: ReasoningEffort
+  codexThreadId: string | null
+  actionPlan: Record<string, unknown> | null
+  discardCodexThread: boolean
+  expectedCodexThreadId: string | null
+}): string {
+  const legacyPayload = {
+    assistantText,
+    model,
+    effort,
+    codexThreadId,
+    actionPlan,
+  }
+  return JSON.stringify(
+    discardCodexThread
+      ? { ...legacyPayload, discardCodexThread, expectedCodexThreadId }
+      : legacyPayload,
+  )
+}
+
+export function discardConversationThreadStatement(
+  db: D1Database,
+  expectedCodexThreadId: string | null,
+  jobId: string,
+  nextStatus: JobStatus,
+  failureTransitionId: string,
+): D1PreparedStatement {
+  return db
+    .prepare(
+      `UPDATE codex_chat_conversations
+       SET codex_thread_id = NULL
+       WHERE id = ? AND codex_thread_id IS ?
+         AND EXISTS (
+           SELECT 1 FROM codex_chat_jobs
+           WHERE id = ? AND conversation_id = ? AND status = ?
+             AND worker_id = ? AND lease_token IS NULL
+         )`,
+    )
+    .bind(
+      CONVERSATION_ID,
+      expectedCodexThreadId,
+      jobId,
+      CONVERSATION_ID,
+      nextStatus,
+      failureTransitionId,
+    )
+}
+
 function requireSameOriginForMutation(request: Request): Response | null {
   const method = request.method.toUpperCase()
   if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return null
@@ -727,13 +1001,21 @@ function jobResponse(row: JobRow): unknown {
   }
 }
 
-function proposalResponse(row: ProposalRow): unknown {
+function proposalResponse(
+  row: ProposalRow,
+  options: { includeActionPlan?: boolean } = {},
+): unknown {
+  const reservation = parseProposalReservation(row.result_json)
+  const includeActionPlan = options.includeActionPlan !== false
   return {
     id: row.id,
     messageId: row.assistant_message_id,
     jobId: row.job_id,
     status: row.status,
-    actionPlan: parseJson(row.action_plan_json),
+    actionPlan:
+      includeActionPlan || row.status !== 'proposed'
+        ? parseJson(row.action_plan_json)
+        : null,
     sourceStateHash:
       row.state_hash ??
       (isObject(parseJson(row.action_plan_json))
@@ -742,7 +1024,10 @@ function proposalResponse(row: ProposalRow): unknown {
         : null),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
-    result: row.result_json ? parseJson(row.result_json) : null,
+    result:
+      row.result_json && !reservation ? parseJson(row.result_json) : null,
+    reserved: reservation !== null,
+    reservedAt: reservation?.reservedAt ?? null,
   }
 }
 
@@ -790,11 +1075,126 @@ async function readProposal(
     .first<ProposalRow>()
 }
 
+function proposalResultUnverifiedError(): ApiError {
+  return new ApiError(
+    409,
+    'proposal_result_unverified',
+    'Sync the applied Coach change before finalizing its proposal result.',
+  )
+}
+
+async function requireMatchingSnapshotReceipt(
+  db: D1Database,
+  proposal: ProposalRow,
+  submittedResult: unknown,
+): Promise<void> {
+  if (!isCoachActionResult(submittedResult)) {
+    throw proposalResultUnverifiedError()
+  }
+  const plan = parseJson(proposal.action_plan_json)
+  if (
+    !isObject(plan) ||
+    !validSha256Hex(plan.sourceStateHash) ||
+    !validSha256Hex(plan.sourceActionStateHash) ||
+    submittedResult.proposalId !== proposal.id ||
+    submittedResult.sourceStateHash !== plan.sourceStateHash ||
+    (submittedResult.sourceActionStateHash !== undefined &&
+      submittedResult.sourceActionStateHash !== plan.sourceActionStateHash) ||
+    submittedResult.syncPending === true ||
+    (proposal.state_hash !== undefined &&
+      proposal.state_hash !== plan.sourceStateHash)
+  ) {
+    throw proposalResultUnverifiedError()
+  }
+
+  const snapshot = await db
+    .prepare(
+      `SELECT payload_json
+       FROM workout_snapshots
+       WHERE id = ?`,
+    )
+    .bind(SNAPSHOT_ID)
+    .first<{ payload_json: string }>()
+  if (!snapshot || typeof snapshot.payload_json !== 'string') {
+    throw proposalResultUnverifiedError()
+  }
+  const payload = parseJson(snapshot.payload_json)
+  const data = isObject(payload) ? payload.data : null
+  const receipts = isObject(data) ? data.chatActionReceipts : null
+  if (!Array.isArray(receipts)) throw proposalResultUnverifiedError()
+  const matching = receipts.filter(
+    (receipt) => isObject(receipt) && receipt.proposalId === proposal.id,
+  )
+  if (matching.length !== 1) throw proposalResultUnverifiedError()
+
+  const receipt = matching[0]
+  if (
+    !isObject(receipt) ||
+    !hasOnlyKeys(receipt, COACH_RECEIPT_KEYS) ||
+    receipt.proposalId !== proposal.id ||
+    typeof receipt.appliedAt !== 'number' ||
+    !Number.isSafeInteger(receipt.appliedAt) ||
+    receipt.appliedAt < 0 ||
+    receipt.sourceStateHash !== plan.sourceStateHash ||
+    typeof receipt.resultJson !== 'string' ||
+    new TextEncoder().encode(receipt.resultJson).byteLength > MAX_RESULT_BYTES
+  ) {
+    throw proposalResultUnverifiedError()
+  }
+  const receiptResult = parseJson(receipt.resultJson)
+  if (
+    !isCoachActionResult(receiptResult) ||
+    receiptResult.proposalId !== receipt.proposalId ||
+    receiptResult.appliedAt !== receipt.appliedAt ||
+    receiptResult.sourceStateHash !== receipt.sourceStateHash ||
+    (receiptResult.sourceActionStateHash !== undefined &&
+      receiptResult.sourceActionStateHash !== plan.sourceActionStateHash) ||
+    receiptResult.appliedAt !== submittedResult.appliedAt ||
+    comparableCoachResult(receiptResult) !==
+      comparableCoachResult(submittedResult)
+  ) {
+    throw proposalResultUnverifiedError()
+  }
+}
+
 async function normalizeExpiredLeases(
   db: D1Database,
   now: number,
 ): Promise<void> {
+  const conversation = await readConversation(db)
+  const expirationTransitionId = `expired:${crypto.randomUUID()}`
   await db.batch([
+    db
+      .prepare(
+        `UPDATE codex_chat_jobs
+         SET worker_id = ?, lease_token = ?
+         WHERE conversation_id = ? AND status = 'leased'
+           AND lease_expires_at <= ?`,
+      )
+      .bind(
+        expirationTransitionId,
+        expirationTransitionId,
+        CONVERSATION_ID,
+        now,
+      ),
+    db
+      .prepare(
+        `UPDATE codex_chat_conversations
+         SET codex_thread_id = NULL
+         WHERE id = ? AND codex_thread_id IS ?
+           AND EXISTS (
+             SELECT 1 FROM codex_chat_jobs
+             WHERE conversation_id = ? AND status = 'leased'
+               AND worker_id = ? AND lease_token = ?
+           )`,
+      )
+      .bind(
+        CONVERSATION_ID,
+        conversation?.codex_thread_id ?? null,
+        CONVERSATION_ID,
+        expirationTransitionId,
+        expirationTransitionId,
+      ),
     db
       .prepare(
         `UPDATE codex_chat_jobs
@@ -802,24 +1202,45 @@ async function normalizeExpiredLeases(
              lease_expires_at = NULL, claimed_at = NULL, completed_at = ?,
              updated_at = ?,
              last_error = COALESCE(last_error, 'max_attempts_exhausted')
-         WHERE attempts >= max_attempts
-           AND (
-             status = 'queued' OR
-             (status = 'leased' AND lease_expires_at <= ?)
-           )`,
+         WHERE conversation_id = ? AND status = 'leased'
+           AND worker_id = ? AND lease_token = ?
+           AND attempts >= max_attempts`,
       )
-      .bind(now, now, now),
+      .bind(
+        now,
+        now,
+        CONVERSATION_ID,
+        expirationTransitionId,
+        expirationTransitionId,
+      ),
     db
       .prepare(
         `UPDATE codex_chat_jobs
          SET status = 'queued', available_at = ?, worker_id = NULL,
              lease_token = NULL, lease_expires_at = NULL, claimed_at = NULL,
              updated_at = ?, last_error = 'lease_expired'
-         WHERE status = 'leased'
-           AND lease_expires_at <= ?
+         WHERE conversation_id = ? AND status = 'leased'
+           AND worker_id = ? AND lease_token = ?
            AND attempts < max_attempts`,
       )
-      .bind(now, now, now),
+      .bind(
+        now,
+        now,
+        CONVERSATION_ID,
+        expirationTransitionId,
+        expirationTransitionId,
+      ),
+    db
+      .prepare(
+        `UPDATE codex_chat_jobs
+         SET status = 'failed', worker_id = NULL, lease_token = NULL,
+             lease_expires_at = NULL, claimed_at = NULL, completed_at = ?,
+             updated_at = ?,
+             last_error = COALESCE(last_error, 'max_attempts_exhausted')
+         WHERE conversation_id = ? AND status = 'queued'
+           AND attempts >= max_attempts`,
+      )
+      .bind(now, now, CONVERSATION_ID),
     db
       .prepare(
         `UPDATE codex_chat_bridge_heartbeat
@@ -1068,6 +1489,9 @@ async function handleGetState(db: D1Database): Promise<Response> {
 async function handleGetMessages(ctx: PagesContext): Promise<Response> {
   await maintainChatData(ctx.env.WORKOUT_DB, Date.now())
   const url = new URL(ctx.request.url)
+  const includeActionPlans =
+    ctx.request.headers.get(COACH_TRANSCRIPT_PROTOCOL_HEADER) ===
+    COACH_TRANSCRIPT_PROTOCOL
   const rawAfter = url.searchParams.get('after') ?? '0'
   const rawLimit = url.searchParams.get('limit') ?? '50'
   const after = Number(rawAfter)
@@ -1122,7 +1546,9 @@ async function handleGetMessages(ctx: PagesContext): Promise<Response> {
 
   return json(200, {
     messages: rows.map(messageResponse),
-    proposals: proposals.map(proposalResponse),
+    proposals: proposals.map((proposal) =>
+      proposalResponse(proposal, { includeActionPlan: includeActionPlans }),
+    ),
     nextCursor,
     hasMore,
   })
@@ -1212,6 +1638,11 @@ async function handlePostMessage(ctx: PagesContext): Promise<Response> {
     })
   }
 
+  // Preserve exact idempotent replays from clients that enqueued work before
+  // capability hashes became mandatory. Only newly enqueued work needs the
+  // complete trusted capability set.
+  assertCompleteActionStateHashes(body.context)
+
   const digest = await sha256Hex(`${CONVERSATION_ID}:${clientMessageId}`)
   const contextId = `ctx_${digest}`
   const messageId = `msg_u_${digest}`
@@ -1286,6 +1717,148 @@ async function handlePostMessage(ctx: PagesContext): Promise<Response> {
   })
 }
 
+async function handleReserveProposal(
+  ctx: PagesContext,
+  proposalId: string,
+): Promise<Response> {
+  if (!validOpaqueId(proposalId)) throw new ApiError(400, 'invalid_proposal_id')
+  const body = await readJsonBody(ctx.request)
+  const expectedUpdatedAt = body.expectedUpdatedAt
+  if (
+    typeof expectedUpdatedAt !== 'number' ||
+    !Number.isSafeInteger(expectedUpdatedAt) ||
+    expectedUpdatedAt < 0
+  ) {
+    throw new ApiError(
+      400,
+      'invalid_request',
+      'expectedUpdatedAt must be a non-negative safe integer',
+    )
+  }
+  const session = await currentDeviceSession(ctx)
+  const existing = await readProposal(ctx.env.WORKOUT_DB, proposalId)
+  if (!existing) throw new ApiError(404, 'proposal_not_found')
+  if (existing.status !== 'proposed') {
+    throw new ApiError(409, 'proposal_already_resolved')
+  }
+  const existingReservation = parseProposalReservation(existing.result_json)
+  if (existingReservation) {
+    if (existingReservation.ownerSessionId !== session.id) {
+      throw reservationUnavailableError()
+    }
+    return json(200, {
+      proposal: proposalResponse(existing),
+      replayed: true,
+    })
+  }
+  if (existing.result_json !== null) {
+    throw new ApiError(409, 'proposal_state_invalid')
+  }
+  if (existing.updated_at !== expectedUpdatedAt) {
+    throw new ApiError(
+      409,
+      'proposal_changed',
+      'This Coach proposal changed. Refresh and review it before applying.',
+    )
+  }
+
+  const now = Date.now()
+  const reservationJson = JSON.stringify({
+    _kind: PROPOSAL_RESERVATION_KIND,
+    ownerSessionId: session.id,
+    reservedAt: now,
+  } satisfies ProposalReservation)
+  const result = await ctx.env.WORKOUT_DB.prepare(
+    `UPDATE codex_chat_action_proposals
+     SET result_json = ?, updated_at = ?
+     WHERE id = ? AND conversation_id = ? AND status = 'proposed'
+       AND result_json IS NULL AND updated_at = ?
+       AND NOT EXISTS (
+         SELECT 1
+         FROM codex_chat_action_proposals reserved
+         WHERE reserved.conversation_id = ?
+           AND reserved.status = 'proposed'
+           AND reserved.result_json IS NOT NULL
+           AND CASE
+             WHEN json_valid(reserved.result_json) THEN
+               COALESCE(
+                 json_extract(reserved.result_json, '$._kind') = ?
+                 AND json_type(reserved.result_json, '$.ownerSessionId') = 'text'
+                 AND json_extract(reserved.result_json, '$.ownerSessionId') = ?
+                 AND json_type(reserved.result_json, '$.reservedAt') = 'integer'
+                 AND json_extract(reserved.result_json, '$.reservedAt') >= 0,
+                 0
+               )
+             ELSE 0
+           END = 0
+       )
+       AND EXISTS (
+         SELECT 1
+         FROM cloud_auth_sessions live_session
+         WHERE live_session.id = ?
+           AND live_session.revoked_at IS NULL
+           AND live_session.expires_at > ?
+       )`,
+  )
+    .bind(
+      reservationJson,
+      now,
+      proposalId,
+      CONVERSATION_ID,
+      expectedUpdatedAt,
+      CONVERSATION_ID,
+      PROPOSAL_RESERVATION_KIND,
+      session.id,
+      session.id,
+      now,
+    )
+    .run()
+
+  if ((result.meta?.changes ?? 0) !== 1) {
+    // A logout/expiry can race the authenticated preflight. Re-authenticate
+    // before diagnosing proposal contention so a revoked session cannot leave
+    // an orphan reservation behind.
+    await currentDeviceSession(ctx)
+    const current = await readProposal(ctx.env.WORKOUT_DB, proposalId)
+    if (!current) throw new ApiError(404, 'proposal_not_found')
+    const currentReservation = parseProposalReservation(current.result_json)
+    if (
+      current.status === 'proposed' &&
+      currentReservation?.ownerSessionId === session.id
+    ) {
+      return json(200, {
+        proposal: proposalResponse(current),
+        replayed: true,
+      })
+    }
+    if (current.status === 'proposed' && currentReservation) {
+      throw reservationUnavailableError()
+    }
+    if (
+      current.status === 'proposed' &&
+      current.result_json === null &&
+      current.updated_at === expectedUpdatedAt
+    ) {
+      // The target remained unchanged, so the atomic global-owner predicate
+      // was the only guard that could have rejected this reservation.
+      throw reservationUnavailableError()
+    }
+    throw new ApiError(409, 'proposal_already_resolved')
+  }
+
+  await ctx.env.WORKOUT_DB.prepare(
+    `UPDATE codex_chat_conversations SET updated_at = ? WHERE id = ?`,
+  )
+    .bind(now, CONVERSATION_ID)
+    .run()
+  const reserved = await readProposal(ctx.env.WORKOUT_DB, proposalId)
+  if (!reserved) throw new ApiError(404, 'proposal_not_found')
+  return json(200, {
+    proposal: proposalResponse(reserved),
+    replayed: false,
+  })
+}
+
 async function handleProposalResult(
   ctx: PagesContext,
   proposalId: string,
@@ -1328,15 +1901,49 @@ async function handleProposalResult(
     }
     throw new ApiError(409, 'proposal_already_resolved')
   }
+  const session = await currentDeviceSession(ctx)
+  const reservation = parseProposalReservation(existing.result_json)
+  if (!reservation) {
+    throw new ApiError(
+      409,
+      'proposal_not_reserved',
+      'Refresh the app and reserve this proposal before applying it.',
+    )
+  }
+  if (reservation.ownerSessionId !== session.id) {
+    throw reservationUnavailableError()
+  }
+  if (body.status === 'applied') {
+    await requireMatchingSnapshotReceipt(
+      ctx.env.WORKOUT_DB,
+      existing,
+      persistedResult,
+    )
+  }
   const now = Date.now()
   const result = await ctx.env.WORKOUT_DB.prepare(
     `UPDATE codex_chat_action_proposals
      SET status = ?, result_json = ?, updated_at = ?
-     WHERE id = ? AND conversation_id = ? AND status = 'proposed'`,
+     WHERE id = ? AND conversation_id = ? AND status = 'proposed'
+       AND result_json = ?`,
   )
-    .bind(body.status, resultJson, now, proposalId, CONVERSATION_ID)
+    .bind(
+      body.status,
+      resultJson,
+      now,
+      proposalId,
+      CONVERSATION_ID,
+      existing.result_json,
+    )
     .run()
   if ((result.meta?.changes ?? 0) !== 1) {
+    const current = await readProposal(ctx.env.WORKOUT_DB, proposalId)
+    if (
+      current?.status === body.status &&
+      current.result_json === resultJson
+    ) {
+      return json(200, { proposal: proposalResponse(current) })
+    }
     throw new ApiError(409, 'proposal_already_resolved')
   }
   await ctx.env.WORKOUT_DB.prepare(
@@ -1361,15 +1968,32 @@ async function handleDismissProposal(
   if (existing.status !== 'proposed') {
     throw new ApiError(409, 'proposal_already_resolved')
   }
+  if (existing.result_json !== null) {
+    if (parseProposalReservation(existing.result_json)) {
+      throw reservationLockedError()
+    }
+    throw new ApiError(409, 'proposal_state_invalid')
+  }
   const now = Date.now()
   const result = await ctx.env.WORKOUT_DB.prepare(
     `UPDATE codex_chat_action_proposals
      SET status = 'dismissed', updated_at = ?
-     WHERE id = ? AND conversation_id = ? AND status = 'proposed'`,
+     WHERE id = ? AND conversation_id = ? AND status = 'proposed'
+       AND result_json IS NULL`,
   )
     .bind(now, proposalId, CONVERSATION_ID)
     .run()
   if ((result.meta?.changes ?? 0) !== 1) {
+    const current = await readProposal(ctx.env.WORKOUT_DB, proposalId)
+    if (current?.status === 'dismissed') {
+      return json(200, { proposal: proposalResponse(current) })
+    }
+    if (
+      current?.status === 'proposed' &&
+      parseProposalReservation(current.result_json)
+    ) {
+      throw reservationLockedError()
+    }
     throw new ApiError(409, 'proposal_already_resolved')
   }
   const proposal = await readProposal(ctx.env.WORKOUT_DB, proposalId)
@@ -1381,35 +2005,61 @@ async function handleCancelJob(
   jobId: string,
 ): Promise<Response> {
   if (!validOpaqueId(jobId)) throw new ApiError(400, 'invalid_job_id')
+  const existing = await readJob(ctx.env.WORKOUT_DB, jobId)
+  if (!existing || existing.conversation_id !== CONVERSATION_ID) {
+    throw new ApiError(404, 'job_not_found')
+  }
+  if (existing.status === 'cancelled') {
+    return json(200, { job: jobResponse(existing), replayed: true })
+  }
+  if (existing.status !== 'queued' && existing.status !== 'leased') {
+    throw new ApiError(409, 'job_not_cancellable')
+  }
+  const conversation = await readConversation(ctx.env.WORKOUT_DB)
   const now = Date.now()
-  const result = await ctx.env.WORKOUT_DB.prepare(
+  const cancellationTransitionId = `cancelled:${crypto.randomUUID()}`
+  const cancelStatement = ctx.env.WORKOUT_DB.prepare(
     `UPDATE codex_chat_jobs
-     SET status = 'cancelled', worker_id = NULL, lease_token = NULL,
+     SET status = 'cancelled',
+         worker_id = CASE WHEN status = 'leased' THEN ? ELSE NULL END,
+         lease_token = NULL,
          lease_expires_at = NULL, claimed_at = NULL, completed_at = ?,
          last_error = NULL, completion_hash = NULL, updated_at = ?
      WHERE id = ? AND conversation_id = ?
        AND status IN ('queued', 'leased')`,
   )
-    .bind(now, now, jobId, CONVERSATION_ID)
-    .run()
+    .bind(
+      cancellationTransitionId,
+      now,
+      now,
+      jobId,
+      CONVERSATION_ID,
+    )
 
-  if ((result.meta?.changes ?? 0) !== 1) {
-    const existing = await readJob(ctx.env.WORKOUT_DB, jobId)
-    if (!existing || existing.conversation_id !== CONVERSATION_ID) {
-      throw new ApiError(404, 'job_not_found')
-    }
-    if (existing.status === 'cancelled') {
-      return json(200, { job: jobResponse(existing), replayed: true })
-    }
-    throw new ApiError(409, 'job_not_cancellable')
-  }
-
-  await ctx.env.WORKOUT_DB.batch([
+  const [result] = await ctx.env.WORKOUT_DB.batch([
+    cancelStatement,
+    discardConversationThreadStatement(
+      ctx.env.WORKOUT_DB,
+      conversation?.codex_thread_id ?? null,
+      jobId,
+      'cancelled',
+      cancellationTransitionId,
+    ),
+    ctx.env.WORKOUT_DB
+      .prepare(
+        `UPDATE codex_chat_jobs
+         SET worker_id = NULL
+         WHERE id = ? AND status = 'cancelled' AND worker_id = ?`,
+      )
+      .bind(jobId, cancellationTransitionId),
     ctx.env.WORKOUT_DB.prepare(
       `UPDATE codex_chat_conversations
        SET updated_at = ?
-       WHERE id = ?`,
-    ).bind(now, CONVERSATION_ID),
+       WHERE id = ? AND EXISTS (
+         SELECT 1 FROM codex_chat_jobs
+         WHERE id = ? AND status = 'cancelled'
+       )`,
+    ).bind(now, CONVERSATION_ID, jobId),
     ctx.env.WORKOUT_DB.prepare(
       `UPDATE codex_chat_bridge_heartbeat
        SET status = CASE WHEN status = 'working' THEN 'idle' ELSE status END,
@@ -1417,6 +2067,16 @@ async function handleCancelJob(
        WHERE id = ? AND active_job_id = ?`,
     ).bind(CONVERSATION_ID, jobId),
   ])
+  if ((result.meta?.changes ?? 0) !== 1) {
+    const current = await readJob(ctx.env.WORKOUT_DB, jobId)
+    if (!current || current.conversation_id !== CONVERSATION_ID) {
+      throw new ApiError(404, 'job_not_found')
+    }
+    if (current.status === 'cancelled') {
+      return json(200, { job: jobResponse(current), replayed: true })
+    }
+    throw new ApiError(409, 'job_not_cancellable')
+  }
   const cancelled = await readJob(ctx.env.WORKOUT_DB, jobId)
   return json(200, {
     job: cancelled ? jobResponse(cancelled) : null,
@@ -1424,29 +2084,80 @@ async function handleCancelJob(
   })
 }
 
+const NO_RESERVED_PROPOSAL_SQL = `NOT EXISTS (
+  SELECT 1
+  FROM codex_chat_action_proposals reserved
+  WHERE reserved.conversation_id = ?
+    AND reserved.status = 'proposed'
+    AND reserved.result_json IS NOT NULL
+)`
+
+async function readReservedProposalId(db: D1Database): Promise<string | null> {
+  const row = await db
+    .prepare(
+      `SELECT id
+       FROM codex_chat_action_proposals
+       WHERE conversation_id = ? AND status = 'proposed'
+         AND result_json IS NOT NULL
+       LIMIT 1`,
+    )
+    .bind(CONVERSATION_ID)
+    .first<{ id: string }>()
+  return row?.id ?? null
+}
+
 async function handleDeleteConversation(db: D1Database): Promise<Response> {
-  await db.batch([
+  const guardValues = [CONVERSATION_ID] as const
+  const results = await db.batch([
     db
-      .prepare(`DELETE FROM codex_chat_action_proposals WHERE conversation_id = ?`)
-      .bind(CONVERSATION_ID),
+      .prepare(
+        `DELETE FROM codex_chat_action_proposals
+         WHERE conversation_id = ? AND ${NO_RESERVED_PROPOSAL_SQL}`,
+      )
+      .bind(CONVERSATION_ID, ...guardValues),
     db
-      .prepare(`DELETE FROM codex_chat_jobs WHERE conversation_id = ?`)
-      .bind(CONVERSATION_ID),
+      .prepare(
+        `DELETE FROM codex_chat_jobs
+         WHERE conversation_id = ? AND ${NO_RESERVED_PROPOSAL_SQL}`,
+      )
+      .bind(CONVERSATION_ID, ...guardValues),
     db
-      .prepare(`DELETE FROM codex_chat_messages WHERE conversation_id = ?`)
-      .bind(CONVERSATION_ID),
+      .prepare(
+        `DELETE FROM codex_chat_messages
+         WHERE conversation_id = ? AND ${NO_RESERVED_PROPOSAL_SQL}`,
+      )
+      .bind(CONVERSATION_ID, ...guardValues),
     db
-      .prepare(`DELETE FROM codex_chat_contexts WHERE conversation_id = ?`)
-      .bind(CONVERSATION_ID),
+      .prepare(
+        `DELETE FROM codex_chat_contexts
+         WHERE conversation_id = ? AND ${NO_RESERVED_PROPOSAL_SQL}`,
+      )
+      .bind(CONVERSATION_ID, ...guardValues),
     db
-      .prepare(`DELETE FROM codex_chat_conversations WHERE id = ?`)
-      .bind(CONVERSATION_ID),
+      .prepare(
+        `DELETE FROM codex_chat_conversations
+         WHERE id = ? AND ${NO_RESERVED_PROPOSAL_SQL}`,
+      )
+      .bind(CONVERSATION_ID, ...guardValues),
     db.prepare(
       `UPDATE codex_chat_bridge_heartbeat
        SET status = 'idle', active_job_id = NULL
-       WHERE id = ?`,
-    ).bind(CONVERSATION_ID),
+       WHERE id = ? AND ${NO_RESERVED_PROPOSAL_SQL}`,
+    ).bind(CONVERSATION_ID, ...guardValues),
   ])
+  const conversationDelete = results[4]
+  if ((conversationDelete?.meta?.changes ?? 0) !== 1) {
+    const reservedProposalId = await readReservedProposalId(db)
+    if (reservedProposalId) throw reservationLockedError()
+    const remainingConversation = await readConversation(db)
+    if (remainingConversation) {
+      throw new ApiError(
+        409,
+        'conversation_changed',
+        'The Coach conversation changed while it was being cleared. Refresh and retry.',
+      )
+    }
+  }
   return json(200, { cleared: true, conversationId: CONVERSATION_ID })
 }
 
@@ -1463,19 +2174,42 @@ async function handleHeartbeat(ctx: PagesContext): Promise<Response> {
     throw new ApiError(400, 'invalid_active_job_id')
   }
   const now = Date.now()
-  await ctx.env.WORKOUT_DB.prepare(
-    `INSERT INTO codex_chat_bridge_heartbeat
+  // The marker is independent of heartbeat version so a rolling old edge
+  // cannot make the new edge mistake an unperformed migration for completion.
+  // D1 batches commit atomically: detach first, then durably mark it complete.
+  const [migration] = await ctx.env.WORKOUT_DB.batch([
+    ctx.env.WORKOUT_DB.prepare(
+      `UPDATE codex_chat_conversations
+       SET codex_thread_id = NULL, updated_at = ?
+       WHERE id = ? AND codex_thread_id IS NOT NULL AND ? = '1.4'
+         AND EXISTS (
+           SELECT 1 FROM codex_chat_maintenance
+           WHERE id = ? AND bridge_v14_thread_detached_at IS NULL
+         )`,
+    ).bind(now, CONVERSATION_ID, bridgeVersion, CONVERSATION_ID),
+    ctx.env.WORKOUT_DB.prepare(
+      `UPDATE codex_chat_maintenance
+       SET bridge_v14_thread_detached_at = ?
+       WHERE id = ? AND bridge_v14_thread_detached_at IS NULL
+         AND ? = '1.4'`,
+    ).bind(now, CONVERSATION_ID, bridgeVersion),
+    ctx.env.WORKOUT_DB.prepare(
+      `INSERT INTO codex_chat_bridge_heartbeat
        (id, last_seen_at, status, bridge_version, model, active_job_id)
-     VALUES (?, ?, ?, ?, ?, ?)
-     ON CONFLICT(id) DO UPDATE SET
-       last_seen_at = excluded.last_seen_at,
-       status = excluded.status,
-       bridge_version = excluded.bridge_version,
-       model = excluded.model,
-       active_job_id = excluded.active_job_id`,
-  )
-    .bind(CONVERSATION_ID, now, status, bridgeVersion, model, activeJobId)
-    .run()
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         last_seen_at = excluded.last_seen_at,
+         status = excluded.status,
+         bridge_version = CASE
+           WHEN codex_chat_bridge_heartbeat.bridge_version = '1.4'
+             AND (excluded.bridge_version IS NULL OR excluded.bridge_version = '1.3')
+           THEN codex_chat_bridge_heartbeat.bridge_version
+           ELSE excluded.bridge_version
+         END,
+         model = excluded.model,
+         active_job_id = excluded.active_job_id`,
+    ).bind(CONVERSATION_ID, now, status, bridgeVersion, model, activeJobId),
+  ])
   return json(200, {
     heartbeat: {
       lastSeenAt: now,
@@ -1483,7 +2217,37 @@ async function handleHeartbeat(ctx: PagesContext): Promise<Response> {
       bridgeVersion,
       model,
       activeJobId,
+      threadDetachedForUpgrade: (migration.meta?.changes ?? 0) === 1,
     },
+  })
+}
+
+async function handleDiscardConversationThread(
+  ctx: PagesContext,
+): Promise<Response> {
+  const body = await readJsonBody(ctx.request)
+  if (!('expectedCodexThreadId' in body)) {
+    throw new ApiError(400, 'invalid_request', 'expectedCodexThreadId is required')
+  }
+  const expectedCodexThreadId = optionalString(
+    body.expectedCodexThreadId,
+    'expectedCodexThreadId',
+    300,
+  )
+  const now = Date.now()
+  const result = await ctx.env.WORKOUT_DB.prepare(
+    `UPDATE codex_chat_conversations
+     SET codex_thread_id = NULL, updated_at = ?
+     WHERE id = ? AND codex_thread_id IS ?`,
+  )
+    .bind(now, CONVERSATION_ID, expectedCodexThreadId)
+    .run()
+  const current = await readConversation(ctx.env.WORKOUT_DB)
+  return json(200, {
+    acknowledged: true,
+    detached: (result.meta?.changes ?? 0) === 1,
+    expectedCodexThreadId,
+    codexThreadId: current?.codex_thread_id ?? null,
   })
 }
 
@@ -1504,15 +2268,34 @@ async function handleClaimJob(ctx: PagesContext): Promise<Response> {
   let claimed: JobRow | null = null
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const candidate = await ctx.env.WORKOUT_DB.prepare(
-      `SELECT id
-       FROM codex_chat_jobs
-       WHERE attempts < max_attempts
-         AND status = 'queued'
-         AND available_at <= ?
-       ORDER BY created_at ASC
+      `SELECT candidate.id
+       FROM codex_chat_jobs AS candidate
+       JOIN codex_chat_messages AS candidate_message
+         ON candidate_message.id = candidate.user_message_id
+       WHERE candidate.attempts < candidate.max_attempts
+         AND candidate.status = 'queued'
+         AND candidate.available_at <= ?
+         AND NOT EXISTS (
+           SELECT 1 FROM codex_chat_jobs AS active
+           WHERE active.conversation_id = candidate.conversation_id
+             AND active.status = 'leased'
+             AND active.lease_expires_at > ?
+         )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM codex_chat_jobs AS earlier
+           JOIN codex_chat_messages AS earlier_message
+             ON earlier_message.id = earlier.user_message_id
+           WHERE earlier.conversation_id = candidate.conversation_id
+             AND earlier.id <> candidate.id
+             AND earlier.status = 'queued'
+             AND earlier.attempts < earlier.max_attempts
+             AND earlier_message.sequence < candidate_message.sequence
+         )
+       ORDER BY candidate_message.sequence ASC
        LIMIT 1`,
     )
-      .bind(now)
+      .bind(now, now)
       .first<{ id: string }>()
     if (!candidate) break
 
@@ -1525,7 +2308,27 @@ async function handleClaimJob(ctx: PagesContext): Promise<Response> {
            updated_at = ?, last_error = NULL
        WHERE id = ? AND attempts < max_attempts
          AND status = 'queued'
-         AND available_at <= ?`,
+         AND available_at <= ?
+         AND NOT EXISTS (
+           SELECT 1 FROM codex_chat_jobs AS active
+           WHERE active.conversation_id = codex_chat_jobs.conversation_id
+             AND active.id <> codex_chat_jobs.id
+             AND active.status = 'leased'
+             AND active.lease_expires_at > ?
+         )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM codex_chat_jobs AS earlier
+           JOIN codex_chat_messages AS earlier_message
+             ON earlier_message.id = earlier.user_message_id
+           JOIN codex_chat_messages AS candidate_message
+             ON candidate_message.id = codex_chat_jobs.user_message_id
+           WHERE earlier.conversation_id = codex_chat_jobs.conversation_id
+             AND earlier.id <> codex_chat_jobs.id
+             AND earlier.status = 'queued'
+             AND earlier.attempts < earlier.max_attempts
+             AND earlier_message.sequence < candidate_message.sequence
+         )`,
     )
       .bind(
         workerId,
@@ -1534,6 +2337,7 @@ async function handleClaimJob(ctx: PagesContext): Promise<Response> {
         now,
         now,
         candidate.id,
+        now,
         now,
       )
       .run()
@@ -1675,6 +2479,32 @@ async function handleCompleteJob(
   const model = requiredString(body.model, 'model', 120)
   const effort = assertReasoningEffort(body.effort)
   const codexThreadId = optionalString(body.codexThreadId, 'codexThreadId', 300)
+  if (
+    body.discardCodexThread !== undefined &&
+    typeof body.discardCodexThread !== 'boolean'
+  ) {
+    throw new ApiError(400, 'invalid_request', 'discardCodexThread must be boolean')
+  }
+  const discardCodexThread = body.discardCodexThread === true
+  if (discardCodexThread && !('expectedCodexThreadId' in body)) {
+    throw new ApiError(
+      400,
+      'invalid_request',
+      'expectedCodexThreadId is required when discarding a thread',
+    )
+  }
+  const expectedCodexThreadId = optionalString(
+    body.expectedCodexThreadId,
+    'expectedCodexThreadId',
+    300,
+  )
+  if (discardCodexThread && codexThreadId !== null) {
+    throw new ApiError(
+      400,
+      'invalid_request',
+      'A discarded thread cannot become the resumable thread',
+    )
+  }
 
   const job = await readJob(ctx.env.WORKOUT_DB, jobId)
   if (!job) throw new ApiError(404, 'job_not_found')
@@ -1698,7 +2528,7 @@ async function handleCompleteJob(
     actionPlan = {
       ...validatedPlan,
       sourceStateHash: context.state_hash,
-      sourceActionStateHash: trustedActionStateHash(
+      sourceActionStateHash: trustedActionStateHashForPlan(
         context.context_json,
         validatedPlan.scope,
       ),
@@ -1708,7 +2538,15 @@ async function handleCompleteJob(
     }
   }
   const completionHash = await sha256Hex(
-    JSON.stringify({ assistantText, model, effort, codexThreadId, actionPlan }),
+    completionHashInput({
+      assistantText,
+      model,
+      effort,
+      codexThreadId,
+      actionPlan,
+      discardCodexThread,
+      expectedCodexThreadId,
+    }),
   )
 
   if (job.status === 'completed') {
@@ -1799,7 +2637,11 @@ async function handleCompleteJob(
     ),
     ctx.env.WORKOUT_DB.prepare(
       `UPDATE codex_chat_conversations
-       SET updated_at = ?, codex_thread_id = COALESCE(?, codex_thread_id)
+       SET updated_at = ?,
+           codex_thread_id = CASE
+             WHEN ? = 1 AND codex_thread_id IS ? THEN NULL
+             ELSE COALESCE(?, codex_thread_id)
+           END
        WHERE id = ? AND EXISTS (
          SELECT 1 FROM codex_chat_jobs
          WHERE id = ? AND status = 'completed' AND lease_token = ?
@@ -1807,6 +2649,8 @@ async function handleCompleteJob(
        )`,
     ).bind(
       now,
+      discardCodexThread ? 1 : 0,
+      expectedCodexThreadId,
       codexThreadId,
       CONVERSATION_ID,
       job.id,
@@ -1838,6 +2682,25 @@ async function handleFailJob(
   const leaseToken = requiredString(body.leaseToken, 'leaseToken', 160)
   const error = requiredString(body.error, 'error', 1000)
   const retryable = body.retryable === true
+  if (
+    body.discardCodexThread !== undefined &&
+    typeof body.discardCodexThread !== 'boolean'
+  ) {
+    throw new ApiError(400, 'invalid_request', 'discardCodexThread must be boolean')
+  }
+  const discardCodexThread = body.discardCodexThread === true
+  if (discardCodexThread && !('expectedCodexThreadId' in body)) {
+    throw new ApiError(
+      400,
+      'invalid_request',
+      'expectedCodexThreadId is required when discarding a thread',
+    )
+  }
+  const expectedCodexThreadId = optionalString(
+    body.expectedCodexThreadId,
+    'expectedCodexThreadId',
+    300,
+  )
   const retryAfterMs = boundedInteger(
     body.retryAfterMs,
     DEFAULT_RETRY_MS,
@@ -1857,9 +2720,10 @@ async function handleFailJob(
   const shouldRetry = retryable && job.attempts < job.max_attempts
   const nextStatus: JobStatus = shouldRetry ? 'queued' : 'failed'
   const availableAt = shouldRetry ? now + retryAfterMs : job.available_at
-  const result = await ctx.env.WORKOUT_DB.prepare(
+  const failureTransitionId = `failed:${crypto.randomUUID()}`
+  const failStatement = ctx.env.WORKOUT_DB.prepare(
     `UPDATE codex_chat_jobs
-     SET status = ?, available_at = ?, worker_id = NULL, lease_token = NULL,
+     SET status = ?, available_at = ?, worker_id = ?, lease_token = NULL,
          lease_expires_at = NULL, claimed_at = NULL, completed_at = ?,
          last_error = ?, updated_at = ?
      WHERE id = ? AND status = 'leased' AND lease_token = ?
@@ -1868,6 +2732,7 @@ async function handleFailJob(
     .bind(
       nextStatus,
       availableAt,
+      failureTransitionId,
       shouldRetry ? null : now,
       error,
       now,
@@ -1875,7 +2740,28 @@ async function handleFailJob(
       leaseToken,
       now,
     )
-    .run()
+  const statements = [failStatement]
+  if (discardCodexThread) {
+    statements.push(
+      discardConversationThreadStatement(
+        ctx.env.WORKOUT_DB,
+        expectedCodexThreadId,
+        job.id,
+        nextStatus,
+        failureTransitionId,
+      ),
+    )
+  }
+  statements.push(
+    ctx.env.WORKOUT_DB
+      .prepare(
+        `UPDATE codex_chat_jobs
+         SET worker_id = NULL
+         WHERE id = ? AND worker_id = ? AND status = ?`,
+      )
+      .bind(job.id, failureTransitionId, nextStatus),
+  )
+  const [result] = await ctx.env.WORKOUT_DB.batch(statements)
   if ((result.meta?.changes ?? 0) !== 1) {
     throw new ApiError(409, 'lease_lost')
   }
@@ -1911,6 +2797,10 @@ export const onRequest = async (ctx: PagesContext): Promise<Response> => {
       return await handleDeleteConversation(ctx.env.WORKOUT_DB)
     }
 
+    const proposalReserveMatch = path.match(/^proposals\/([^/]+)\/reserve$/)
+    if (proposalReserveMatch && method === 'POST') {
+      return await handleReserveProposal(ctx, proposalReserveMatch[1])
+    }
     const proposalResultMatch = path.match(/^proposals\/([^/]+)\/result$/)
     if (proposalResultMatch && method === 'POST') {
       return await handleProposalResult(ctx, proposalResultMatch[1])
@@ -1926,6 +2816,12 @@ export const onRequest = async (ctx: PagesContext): Promise<Response> => {
 
     if (path === 'automation/heartbeat' && method === 'POST') {
       return await handleHeartbeat(ctx)
+    }
+    if (
+      path === 'automation/conversation/discard-thread' &&
+      method === 'POST'
+    ) {
+      return await handleDiscardConversationThread(ctx)
     }
     if (path === 'automation/jobs/claim' && method === 'POST') {
       return await handleClaimJob(ctx)

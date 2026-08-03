@@ -62,7 +62,7 @@ describe('buildLiveCoachContext', () => {
     )
   })
 
-  it('keeps active plans valid when current or unrelated sets and done flags change', async () => {
+  it('hashes active logged counts and done flags but ignores unrelated sets', async () => {
     await db.workoutSessions.add({
       id: 'other-session',
       sessionTemplateId: null,
@@ -81,42 +81,50 @@ describe('buildLiveCoachContext', () => {
       completedAt: null,
     })
     const before = await buildLiveCoachContext('session')
-    await db.loggedSets.bulkAdd([
-      {
-        id: 'set',
-        workoutSessionId: 'session',
-        exerciseId: 'exercise',
-        setNumber: 1,
-        weightLbs: 100,
-        reps: 8,
-        rpe: null,
-        loggedAt: 2,
-      },
-      {
-        id: 'other-set',
-        workoutSessionId: 'other-session',
-        exerciseId: 'exercise',
-        setNumber: 1,
-        weightLbs: 50,
-        reps: 12,
-        rpe: null,
-        loggedAt: 2,
-      },
-    ])
+    await db.loggedSets.add({
+      id: 'other-set',
+      workoutSessionId: 'other-session',
+      exerciseId: 'exercise',
+      setNumber: 1,
+      weightLbs: 50,
+      reps: 12,
+      rpe: null,
+      loggedAt: 2,
+    })
+    const afterUnrelatedSet = await buildLiveCoachContext('session')
+    expect(afterUnrelatedSet.context.actionStateHashes.active_workout).toBe(
+      before.context.actionStateHashes.active_workout,
+    )
+
+    await db.loggedSets.add({
+      id: 'set',
+      workoutSessionId: 'session',
+      exerciseId: 'exercise',
+      setNumber: 1,
+      weightLbs: 100,
+      reps: 8,
+      rpe: null,
+      loggedAt: 2,
+    })
+    const afterActiveSet = await buildLiveCoachContext('session')
+    expect(afterActiveSet.context.actionStateHashes.active_workout).not.toBe(
+      afterUnrelatedSet.context.actionStateHashes.active_workout,
+    )
+
     await db.workoutSessions.update('session', {
       doneExerciseIds: ['exercise'],
     })
-    const after = await buildLiveCoachContext('session')
+    const afterDone = await buildLiveCoachContext('session')
 
-    expect(after.context.activeWorkout?.exercises[0].sets).toHaveLength(1)
-    expect(after.stateHash).not.toBe(before.stateHash)
-    expect(after.context.actionStateHashes.active_workout).toBe(
-      before.context.actionStateHashes.active_workout,
+    expect(afterDone.context.activeWorkout?.exercises[0].sets).toHaveLength(1)
+    expect(afterDone.stateHash).not.toBe(before.stateHash)
+    expect(afterDone.context.actionStateHashes.active_workout).not.toBe(
+      afterActiveSet.context.actionStateHashes.active_workout,
     )
-    expect(after.context.actionStateHashes.program).toBe(
+    expect(afterDone.context.actionStateHashes.program).toBe(
       before.context.actionStateHashes.program,
     )
-    expect(after.context.actionStateHashes.one_time_workout).not.toBe(
+    expect(afterDone.context.actionStateHashes.one_time_workout).not.toBe(
       before.context.actionStateHashes.one_time_workout,
     )
   })
@@ -169,6 +177,47 @@ describe('buildLiveCoachContext', () => {
     const afterRoster = await buildLiveCoachContext('session')
     expect(afterRoster.context.actionStateHashes.active_workout).not.toBe(
       afterTargets.context.actionStateHashes.active_workout,
+    )
+  })
+
+  it('canonicalizes done-marker ordering in the active hash', async () => {
+    await db.exercises.add({
+      id: 'second-exercise',
+      name: 'Cable Fly',
+      primaryMuscle: 'chest',
+      secondaryMuscles: [],
+      notes: '',
+      defaultRestSeconds: 60,
+      isCustom: false,
+      hiddenFromLibrary: false,
+      createdAt: 2,
+    })
+    await db.workoutSessions.update('session', {
+      exerciseSnapshot: [
+        {
+          exerciseId: 'exercise',
+          order: 0,
+          targetSets: 3,
+          targetRepRange: '8-10',
+        },
+        {
+          exerciseId: 'second-exercise',
+          order: 1,
+          targetSets: 3,
+          targetRepRange: '10-12',
+        },
+      ],
+      doneExerciseIds: ['second-exercise', 'exercise'],
+    })
+    const first = await buildLiveCoachContext('session')
+
+    await db.workoutSessions.update('session', {
+      doneExerciseIds: ['exercise', 'second-exercise'],
+    })
+    const second = await buildLiveCoachContext('session')
+
+    expect(second.context.actionStateHashes.active_workout).toBe(
+      first.context.actionStateHashes.active_workout,
     )
   })
 

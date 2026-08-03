@@ -623,9 +623,11 @@ function ActionDetails({
 function ResultBadge({
   status,
   appliedLabel,
+  reserved,
 }: {
   status: CoachProposal['status']
   appliedLabel: string
+  reserved: boolean
 }) {
   if (status === 'applied') {
     return (
@@ -648,6 +650,13 @@ function ResultBadge({
       </span>
     )
   }
+  if (reserved) {
+    return (
+      <span className="inline-flex items-center gap-1 text-xs font-semibold text-amber-200">
+        <ShieldCheck size={14} /> Reserved
+      </span>
+    )
+  }
   return null
 }
 
@@ -655,6 +664,7 @@ export function CoachActionCard({
   proposal,
   context,
   busy,
+  interactionLocked,
   error,
   onApply,
   onDismiss,
@@ -662,6 +672,7 @@ export function CoachActionCard({
   proposal: CoachProposal
   context: CoachLiveContext | null
   busy: boolean
+  interactionLocked: boolean
   error: string | null
   onApply: () => void
   onDismiss: () => void
@@ -674,6 +685,7 @@ export function CoachActionCard({
     invalid = caught instanceof Error ? caught.message : String(caught)
   }
   const applied = proposal.status === 'applied'
+  const reserved = proposal.status === 'proposed' && proposal.reserved === true
   const presentation = plan ? planPresentation(plan, context, applied) : null
   const currentScopeHash = plan ? context?.actionStateHashes[plan.scope] : null
   const contextUnavailable = Boolean(
@@ -702,17 +714,33 @@ export function CoachActionCard({
       ('syncWarning' in proposal.result &&
         typeof proposal.result.syncWarning === 'string'))
   const danger = presentation?.danger ?? false
+  const controlsLocked = busy || interactionLocked
+  const visiblyLocked =
+    proposal.status === 'proposed' && interactionLocked && !busy
+  const cardLabel =
+    proposal.status === 'applied'
+      ? 'Coach applied action'
+      : proposal.status === 'failed'
+        ? 'Coach failed action'
+        : proposal.status === 'dismissed'
+          ? 'Coach dismissed action'
+          : reserved
+            ? 'Coach reserved action'
+            : 'Coach proposed action'
 
   return (
     <section
-      className="ml-8 rounded-2xl overflow-hidden"
+      className={`ml-8 rounded-2xl overflow-hidden transition-opacity ${
+        visiblyLocked ? 'opacity-60' : ''
+      }`}
       style={{
         background: danger ? 'oklch(0.20 0.035 25)' : 'oklch(0.22 0.025 50)',
         border: danger
           ? '1px solid oklch(0.48 0.14 25)'
           : '1px solid oklch(0.42 0.1 50)',
       }}
-      aria-label={applied ? 'Coach applied action' : 'Coach proposed action'}
+      aria-label={cardLabel}
+      aria-disabled={visiblyLocked || undefined}
     >
       <div className="px-4 py-3">
         <div className="flex items-start gap-2">
@@ -737,6 +765,7 @@ export function CoachActionCard({
           <ResultBadge
             status={proposal.status}
             appliedLabel={presentation?.appliedLabel ?? 'Applied'}
+            reserved={reserved}
           />
         </div>
 
@@ -794,6 +823,16 @@ export function CoachActionCard({
           </div>
         )}
 
+        {reserved && (
+          <div className="mt-3 flex gap-2 rounded-xl border border-amber-800/50 bg-amber-950/35 px-3 py-2 text-xs leading-5 text-amber-100">
+            <ShieldCheck size={14} className="mt-0.5 shrink-0" />
+            <span>
+              Reserved for application. Dismiss is unavailable; Apply can only
+              continue on the paired device that reserved this change.
+            </span>
+          </div>
+        )}
+
         {(invalid || contextUnavailable || stale || error || remoteError) && (
           <div className="mt-3 flex gap-2 rounded-xl px-3 py-2 text-xs leading-5 bg-red-950/35 text-red-200 border border-red-900/50">
             <AlertTriangle size={14} className="mt-0.5 shrink-0" />
@@ -825,7 +864,7 @@ export function CoachActionCard({
           <button
             type="button"
             onClick={onDismiss}
-            disabled={busy}
+            disabled={controlsLocked || reserved}
             className="py-3 text-sm font-semibold text-[var(--color-fg-dim)] hover:bg-white/5 disabled:opacity-50"
           >
             Dismiss
@@ -833,7 +872,9 @@ export function CoachActionCard({
           <button
             type="button"
             onClick={onApply}
-            disabled={busy || Boolean(invalid) || contextUnavailable || stale}
+            disabled={
+              controlsLocked || Boolean(invalid) || contextUnavailable || stale
+            }
             className={`py-3 inline-flex items-center justify-center gap-1.5 border-l border-[var(--color-border)] text-sm font-bold disabled:opacity-40 ${
               danger
                 ? 'bg-red-950/30 text-red-200 hover:bg-red-950/55'

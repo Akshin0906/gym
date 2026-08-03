@@ -165,7 +165,7 @@ export function AiMemoryScreen() {
 
   return (
     <>
-      <Header title="AI Memory" back="/settings" />
+      <Header title="AI Memory" back />
       <div className="px-4 py-5 space-y-6 max-w-md mx-auto">
         {error && <ErrorAlert message={error} />}
         {!settings ? (

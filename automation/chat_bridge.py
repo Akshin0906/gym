@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-BRIDGE_VERSION = "1.3"
+BRIDGE_VERSION = "1.4"
 MODEL = "gpt-5.6-sol"
 ALLOWED_EFFORTS = {"medium", "xhigh"}
 DEFAULT_EFFORT = "medium"
@@ -95,6 +95,14 @@ class AppServerExited(TransientError):
 
 class ModelOutputError(TransientError):
     pass
+
+
+class ActionPlanDowngrade(BridgeError):
+    """A model-authored mutation that trusted context cannot safely publish."""
+
+    def __init__(self, assistant_text: str):
+        self.assistant_text = assistant_text
+        super().__init__(assistant_text)
 
 
 class CompletionPending(TransientError):
@@ -654,23 +662,37 @@ class CloudClient:
             expected={200, 404, 409},
         )
 
+    def discard_thread(
+        self, expected_codex_thread_id: str | None
+    ) -> tuple[int, Any]:
+        return self.request(
+            "POST",
+            f"{API_ROOT}/conversation/discard-thread",
+            body={"expectedCodexThreadId": expected_codex_thread_id},
+        )
+
     def fail(
         self,
         job: ClaimedJob,
         error: str,
         *,
         retryable: bool,
+        discard_codex_thread: bool = False,
         retry_after_ms: int = 5000,
     ) -> tuple[int, Any]:
+        body: dict[str, Any] = {
+            "leaseToken": job.lease_token,
+            "error": error[:1000],
+            "retryable": retryable,
+            "retryAfterMs": retry_after_ms,
+        }
+        if discard_codex_thread:
+            body["discardCodexThread"] = True
+            body["expectedCodexThreadId"] = job.codex_thread_id
         return self.request(
             "POST",
             f"{API_ROOT}/jobs/{job.id}/fail",
-            body={
-                "leaseToken": job.lease_token,
-                "error": error[:1000],
-                "retryable": retryable,
-                "retryAfterMs": retry_after_ms,
-            },
+            body=body,
             expected={200, 404, 409},
         )
 
@@ -1705,14 +1727,22 @@ def bind_action_plan_to_state(
     if action_plan is None:
         return None
     scope = require_string(action_plan.get("scope"), "actionPlan.scope", maximum=40)
-    action_hashes = require_object(
-        context_payload.get("actionStateHashes"),
-        "context.payload.actionStateHashes",
+    action_hashes = context_payload.get("actionStateHashes")
+    action_state_hash = (
+        action_hashes.get(scope) if isinstance(action_hashes, dict) else None
     )
-    action_state_hash = require_sha256_hex(
-        action_hashes.get(scope),
-        f"context.payload.actionStateHashes.{scope}",
-    )
+    if not isinstance(action_state_hash, str) or SHA256_HEX.fullmatch(action_state_hash) is None:
+        raise ActionPlanDowngrade(
+            "I couldn't safely prepare that change because this app sent an "
+            "outdated action context. Update or refresh the app, then try again."
+        )
+    if scope == "ai_memory":
+        memory = context_payload.get("memory")
+        if isinstance(memory, dict) and memory.get("paused") is True:
+            raise ActionPlanDowngrade(
+                "AI Memory is paused, so I didn't save that note. Resume AI Memory "
+                "in AI Insights, then ask me again."
+            )
     result = dict(action_plan)
     result["sourceStateHash"] = require_string(
         state_hash, "sourceStateHash", maximum=256
@@ -1814,14 +1844,105 @@ def write_completion_spool(
     atomic_write_json(
         path,
         {
-            "version": 1,
+            "version": 2,
             "jobId": job.id,
             "conversationId": job.conversation_id,
+            "expectedCodexThreadId": job.codex_thread_id,
             "createdAt": dt.datetime.now(dt.timezone.utc).isoformat(),
             "completionBody": completion_body,
         },
     )
     return path
+
+
+def thread_discard_intent_path(config: Config, job_id: str) -> Path:
+    name = hashlib.sha256(job_id.encode("utf-8")).hexdigest() + ".json"
+    return config.state_dir / "thread-discard" / name
+
+
+def write_thread_discard_intent(
+    config: Config,
+    *,
+    job_id: str,
+    conversation_id: str,
+    expected_codex_thread_id: str | None,
+) -> Path:
+    path = thread_discard_intent_path(config, job_id)
+    atomic_write_json(
+        path,
+        {
+            "version": 1,
+            "jobId": job_id,
+            "conversationId": conversation_id,
+            "expectedCodexThreadId": expected_codex_thread_id,
+            "createdAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+        },
+    )
+    return path
+
+
+def disarm_thread_discard_intent(config: Config, job_id: str) -> None:
+    with contextlib.suppress(FileNotFoundError):
+        thread_discard_intent_path(config, job_id).unlink()
+
+
+def flush_thread_discard_intents(
+    config: Config, cloud: CloudClient, logger: logging.Logger
+) -> None:
+    intent_dir = config.state_dir / "thread-discard"
+    intent_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for path in sorted(intent_dir.glob("*.json")):
+        record = require_object(read_json(path), "thread discard intent")
+        require_integer(
+            record.get("version"),
+            "thread discard intent.version",
+            minimum=1,
+            maximum=1,
+        )
+        job_id = require_string(
+            record.get("jobId"), "thread discard intent.jobId", maximum=200
+        )
+        conversation_id = require_string(
+            record.get("conversationId"),
+            "thread discard intent.conversationId",
+            maximum=200,
+        )
+        expected_codex_thread_id = optional_string(
+            record.get("expectedCodexThreadId"),
+            "thread discard intent.expectedCodexThreadId",
+            maximum=300,
+        )
+        cloud.discard_thread(expected_codex_thread_id)
+        try:
+            path.unlink()
+        except OSError as exc:
+            logger.warning(
+                "Could not remove acknowledged thread discard intent %s: %s",
+                path,
+                exc,
+            )
+        logger.info("Acknowledged thread discard intent for job %s", job_id)
+
+
+def safeguard_unpublished_completion(
+    config: Config,
+    cloud: CloudClient,
+    logger: logging.Logger,
+    *,
+    job_id: str,
+    conversation_id: str,
+    expected_codex_thread_id: str | None,
+) -> None:
+    write_thread_discard_intent(
+        config,
+        job_id=job_id,
+        conversation_id=conversation_id,
+        expected_codex_thread_id=expected_codex_thread_id,
+    )
+    # A stale completion is about to leave the publishable spool. Confirm the
+    # independent expected-thread CAS first; an outage leaves both files for a
+    # later retry and blocks the next claim.
+    flush_thread_discard_intents(config, cloud, logger)
 
 
 def quarantine_spool(config: Config, path: Path, category: str) -> None:
@@ -1864,8 +1985,26 @@ def flush_spools(config: Config, cloud: CloudClient, logger: logging.Logger) -> 
     for path in sorted(spool_dir.glob("*.json")):
         try:
             record = require_object(read_json(path), "completion spool")
+            version = require_integer(
+                record.get("version", 1),
+                "spool.version",
+                minimum=1,
+                maximum=2,
+            )
             job_id = require_string(record.get("jobId"), "spool.jobId", maximum=200)
+            conversation_id = require_string(
+                record.get("conversationId"),
+                "spool.conversationId",
+                maximum=200,
+            )
             body = require_object(record.get("completionBody"), "spool.completionBody")
+            expected_codex_thread_id = optional_string(
+                record.get("expectedCodexThreadId")
+                if version >= 2
+                else body.get("expectedCodexThreadId"),
+                "spool.expectedCodexThreadId",
+                maximum=300,
+            )
         except BridgeError:
             logger.exception("Quarantining invalid completion spool %s", path)
             quarantine_spool(config, path, "invalid")
@@ -1873,10 +2012,24 @@ def flush_spools(config: Config, cloud: CloudClient, logger: logging.Logger) -> 
         try:
             status, _ = cloud.complete(job_id, body)
         except CloudHTTPError as exc:
+            if version >= 2 or "expectedCodexThreadId" in body:
+                safeguard_unpublished_completion(
+                    config,
+                    cloud,
+                    logger,
+                    job_id=job_id,
+                    conversation_id=conversation_id,
+                    expected_codex_thread_id=expected_codex_thread_id,
+                )
             logger.error("Quarantining rejected completion spool %s: %s", path, exc)
             quarantine_spool(config, path, "invalid")
             continue
         if status == 200:
+            if version >= 2:
+                # A confirmed (or idempotently replayed) completion published
+                # this turn. Disarm first so a crash cannot leave an intent that
+                # detaches the now-canonical thread after the spool disappears.
+                disarm_thread_discard_intent(config, job_id)
             try:
                 path.unlink()
             except OSError as exc:
@@ -1888,6 +2041,15 @@ def flush_spools(config: Config, cloud: CloudClient, logger: logging.Logger) -> 
             job_id,
             status,
         )
+        if version >= 2 or "expectedCodexThreadId" in body:
+            safeguard_unpublished_completion(
+                config,
+                cloud,
+                logger,
+                job_id=job_id,
+                conversation_id=conversation_id,
+                expected_codex_thread_id=expected_codex_thread_id,
+            )
         quarantine_spool(config, path, "stale")
 
 
@@ -1961,7 +2123,7 @@ class ChatBridge:
 
         return callback
 
-    def _generate(self, job: ClaimedJob) -> tuple[dict[str, Any], str]:
+    def _generate(self, job: ClaimedJob) -> tuple[str, str]:
         app = self.ensure_app_server()
         thread_id, recovery_seed = self.ensure_thread(app, job)
         prompt = build_turn_prompt(job, recovery_seed=recovery_seed)
@@ -1989,7 +2151,7 @@ class ChatBridge:
                 output_schema=self.output_schema,
                 on_wait=self._lease_callback(job),
             )
-        return parse_model_output(raw), thread_id
+        return raw, thread_id
 
     def process_job(self, job: ClaimedJob) -> None:
         self.logger.info(
@@ -2007,19 +2169,42 @@ class ChatBridge:
             effort=job.effort,
         )
         self.heartbeat("working", job.id)
-        try:
-            output, thread_id = self._generate(job)
-            action_plan = bind_action_plan_to_state(
-                output["actionPlan"], job.state_hash, job.context_payload
+        if job.codex_thread_id is not None:
+            # Pre-arm before Codex can advance a resumable thread. A crash at any
+            # later point can then recover by either publishing a durable
+            # completion first or detaching exactly this canonical thread.
+            write_thread_discard_intent(
+                self.config,
+                job_id=job.id,
+                conversation_id=job.conversation_id,
+                expected_codex_thread_id=job.codex_thread_id,
             )
+        try:
+            raw, thread_id = self._generate(job)
+            output = parse_model_output(raw)
+            discard_codex_thread = False
+            try:
+                action_plan = bind_action_plan_to_state(
+                    output["actionPlan"], job.state_hash, job.context_payload
+                )
+            except ActionPlanDowngrade as exc:
+                # The model turn contains a proposal that canonical D1 must not
+                # publish. Persist an accurate no-action response, and atomically
+                # detach the resumed thread so the next turn recovers from D1.
+                output = {"assistantText": exc.assistant_text, "actionPlan": None}
+                action_plan = None
+                discard_codex_thread = True
             completion: dict[str, Any] = {
                 "leaseToken": job.lease_token,
                 "assistantText": output["assistantText"],
                 "actionPlan": action_plan,
-                "codexThreadId": thread_id,
+                "codexThreadId": None if discard_codex_thread else thread_id,
                 "model": MODEL,
                 "effort": job.effort,
             }
+            if discard_codex_thread:
+                completion["discardCodexThread"] = True
+                completion["expectedCodexThreadId"] = job.codex_thread_id
             path = write_completion_spool(self.config, job, completion)
             try:
                 status, _ = self.cloud.complete(job.id, completion)
@@ -2038,6 +2223,7 @@ class ChatBridge:
                 quarantine_spool(self.config, path, "invalid")
                 raise
             if status == 200:
+                disarm_thread_discard_intent(self.config, job.id)
                 with contextlib.suppress(OSError):
                     path.unlink()
                 self.logger.info("Completed chat job %s", job.id)
@@ -2048,14 +2234,26 @@ class ChatBridge:
                     lastJobId=job.id,
                     conversationId=job.conversation_id,
                     effort=job.effort,
-                    codexThreadId=thread_id,
+                    codexThreadId=completion["codexThreadId"],
                 )
                 return
+            write_thread_discard_intent(
+                self.config,
+                job_id=job.id,
+                conversation_id=job.conversation_id,
+                expected_codex_thread_id=job.codex_thread_id,
+            )
             quarantine_spool(self.config, path, "stale")
             raise LostLease(
                 f"Cloud rejected the completed result for job {job.id} with HTTP {status}"
             )
         except LostLease:
+            write_thread_discard_intent(
+                self.config,
+                job_id=job.id,
+                conversation_id=job.conversation_id,
+                expected_codex_thread_id=job.codex_thread_id,
+            )
             update_status(
                 self.config,
                 stage="idle",
@@ -2067,20 +2265,41 @@ class ChatBridge:
             # Never mark the job failed or regenerate after Codex succeeded.
             raise
         except BridgeError as exc:
-            self._report_failure(job, exc, retryable=exc.retryable)
+            self._report_failure(
+                job,
+                exc,
+                retryable=exc.retryable,
+                discard_codex_thread=True,
+            )
             raise
         except (TimeoutError, OSError) as exc:
             wrapped = TransientError(str(exc))
-            self._report_failure(job, wrapped, retryable=True)
+            self._report_failure(
+                job, wrapped, retryable=True, discard_codex_thread=True
+            )
             raise wrapped from exc
         except BaseException as exc:
             wrapped = BridgeError(f"Unexpected bridge failure: {type(exc).__name__}")
-            self._report_failure(job, wrapped, retryable=False)
+            self._report_failure(
+                job, wrapped, retryable=False, discard_codex_thread=True
+            )
             raise
 
     def _report_failure(
-        self, job: ClaimedJob, error: BaseException, *, retryable: bool
+        self,
+        job: ClaimedJob,
+        error: BaseException,
+        *,
+        retryable: bool,
+        discard_codex_thread: bool,
     ) -> None:
+        if discard_codex_thread:
+            write_thread_discard_intent(
+                self.config,
+                job_id=job.id,
+                conversation_id=job.conversation_id,
+                expected_codex_thread_id=job.codex_thread_id,
+            )
         message = f"{type(error).__name__}: {error}"[:1000]
         self.logger.error("Chat job %s failed: %s", job.id, message)
         update_status(
@@ -2092,7 +2311,12 @@ class ChatBridge:
             message=message,
         )
         with contextlib.suppress(BridgeError):
-            self.cloud.fail(job, message, retryable=retryable)
+            self.cloud.fail(
+                job,
+                message,
+                retryable=retryable,
+                discard_codex_thread=discard_codex_thread,
+            )
         with contextlib.suppress(BridgeError):
             self.heartbeat("error", job.id)
 
@@ -2119,6 +2343,7 @@ class ChatBridge:
         if removed:
             self.logger.info("Pruned %s old chat completion diagnostics", removed)
         flush_spools(self.config, self.cloud, self.logger)
+        flush_thread_discard_intents(self.config, self.cloud, self.logger)
         self.heartbeat("idle")
         update_status(self.config, stage="idle", outcome="running", workerId=self.worker_id)
         idle_backoff = IdleClaimBackoff(
@@ -2131,6 +2356,9 @@ class ChatBridge:
                     # A validated spooled result always takes precedence over
                     # claiming more work, so a cloud outage cannot regenerate it.
                     flush_spools(self.config, self.cloud, self.logger)
+                    flush_thread_discard_intents(
+                        self.config, self.cloud, self.logger
+                    )
                     job = self.cloud.claim(
                         self.worker_id, self.config.lease_duration_ms
                     )

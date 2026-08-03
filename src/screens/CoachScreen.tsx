@@ -3,6 +3,7 @@ import { Bot, LoaderCircle, Sparkles, Trash2, WifiOff } from 'lucide-react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { CoachActionCard } from '../components/CoachActionCard'
 import { CoachComposer } from '../components/CoachComposer'
+import { CoachMessageBody } from '../components/CoachMessageBody'
 import { CoachStatus } from '../components/CoachStatus'
 import { Header } from '../components/Header'
 import {
@@ -14,6 +15,7 @@ import {
 } from '../db/repositories/chatActions'
 import {
   cancelCoachJob,
+  CoachApiError,
   clearCoachConversation,
   dismissCoachProposal,
   fetchCoachState,
@@ -21,7 +23,22 @@ import {
   fetchFullCoachTranscript,
   postCoachMessage,
   reportCoachProposalResult,
+  reserveCoachProposal,
 } from '../lib/chatApi'
+import {
+  applyReservedCoachProposal,
+  clearCoachConversationAndRefresh,
+  coachReceiptMatchesActionPlan,
+  CoachReceiptAdoptionError,
+  CoachMutationGate,
+  CoachProposalUnavailableError,
+  CoachRemoteRequestGate,
+  CoachSendRetryBuffer,
+  finalizeFailedCoachProposal,
+  resolveCoachClearRecoveryError,
+  syncCoachActionReceipts,
+  type CoachRemoteRequestTicket,
+} from '../lib/coachConversationLifecycle'
 import { buildLiveCoachContext, type CoachLiveContext } from '../lib/chatContext'
 import type {
   CoachActionResult,
@@ -43,15 +60,41 @@ function mergeById<T extends { id: string }>(current: T[], incoming: T[]): T[] {
   return Array.from(merged.values())
 }
 
+function receiptMatchesProposal(
+  proposal: CoachProposal,
+  result: CoachActionResult,
+): boolean {
+  try {
+    const plan = parseCoachActionPlan(proposal.actionPlan)
+    return coachReceiptMatchesActionPlan(result, {
+      proposalId: proposal.id,
+      sourceStateHash: plan.sourceStateHash,
+      sourceActionStateHash: plan.sourceActionStateHash,
+    })
+  } catch {
+    return false
+  }
+}
+
+interface RefreshRemoteOptions {
+  force?: boolean
+  fullTranscript?: boolean
+}
+
+type CoachSendRequest = Parameters<typeof postCoachMessage>[0]
+
 function MessageBubble({ message }: { message: CoachMessage }) {
   const user = message.role === 'user'
   return (
-    <article className={`flex ${user ? 'justify-end' : 'justify-start'}`}>
+    <article
+      aria-label={user ? 'You' : 'Coach'}
+      className={`flex ${user ? 'justify-end' : 'justify-start'}`}
+    >
       <div
-        className={`max-w-[88%] rounded-2xl px-4 py-3 ${
+        className={`min-w-0 rounded-2xl px-4 py-3 ${
           user
-            ? 'rounded-br-md bg-[var(--color-accent)] text-black'
-            : 'rounded-bl-md bg-[var(--color-surface)] border border-[var(--color-border)]'
+            ? 'max-w-[88%] rounded-br-md bg-[var(--color-accent)] text-black'
+            : 'w-full rounded-bl-md bg-[var(--color-surface)] border border-[var(--color-border)]'
         }`}
       >
         {!user && (
@@ -64,7 +107,11 @@ function MessageBubble({ message }: { message: CoachMessage }) {
             )}
           </div>
         )}
-        <p className="whitespace-pre-wrap text-sm leading-6">{message.text}</p>
+        {user ? (
+          <p className="whitespace-pre-wrap text-sm leading-6">{message.text}</p>
+        ) : (
+          <CoachMessageBody text={message.text} />
+        )}
         <div
           className={`mt-1.5 text-[10px] nums ${
             user ? 'text-black/55 text-right' : 'text-[var(--color-fg-faint)]'
@@ -95,19 +142,39 @@ export function CoachScreen() {
   )
   const [loading, setLoading] = useState(true)
   const [sending, setSending] = useState(false)
+  const [clearing, setClearing] = useState(false)
   const [cancellingJobId, setCancellingJobId] = useState<string | null>(null)
   const [busyProposalId, setBusyProposalId] = useState<string | null>(null)
   const [proposalErrors, setProposalErrors] = useState<Map<string, string>>(
     () => new Map(),
   )
   const [pageError, setPageError] = useState<string | null>(null)
-  const remoteRefreshInFlight = useRef(false)
   const transcriptCursor = useRef(0)
   const remoteRef = useRef<CoachConversationState | null>(null)
   const proposalsRef = useRef<CoachProposal[]>([])
+  const requestGateRef = useRef<CoachRemoteRequestGate | null>(null)
+  const mutationGateRef = useRef<CoachMutationGate | null>(null)
+  const sendRetryBufferRef = useRef<CoachSendRetryBuffer<CoachSendRequest> | null>(
+    null,
+  )
+  const clearingRef = useRef(false)
+  const sendingRef = useRef(false)
   const endRef = useRef<HTMLDivElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const shouldAutoScroll = useRef(true)
+
+  if (!requestGateRef.current) {
+    requestGateRef.current = new CoachRemoteRequestGate()
+  }
+  if (!mutationGateRef.current) {
+    mutationGateRef.current = new CoachMutationGate()
+  }
+  if (!sendRetryBufferRef.current) {
+    sendRetryBufferRef.current = new CoachSendRetryBuffer()
+  }
+  const requestGate = requestGateRef.current
+  const mutationGate = mutationGateRef.current
+  const sendRetryBuffer = sendRetryBufferRef.current
 
   const refreshLocalContext = useCallback(async () => {
     const live = await buildLiveCoachContext(preferredSessionId)
@@ -115,63 +182,59 @@ export function CoachScreen() {
     return live
   }, [preferredSessionId])
 
-  const reconcileReceipts = useCallback(async (incoming: CoachProposal[]) => {
-    const [receiptPairs, pendingResults] = await Promise.all([
-      Promise.all(
-        incoming.map(async (proposal) => [
-          proposal.id,
-          await getAppliedCoachActionResult(proposal.id),
-        ] as const),
-      ),
-      listPendingCoachActionResults(),
-    ])
-    const receipts = new Map<string, CoachActionResult>()
-    const newlySyncedIds = new Set<string>()
-    for (const [id, result] of receiptPairs) {
-      if (result) receipts.set(id, result)
-    }
-    if (pendingResults.length > 0) {
+  const reconcileReceipts = useCallback(
+    async (
+      incoming: CoachProposal[],
+      isCurrent: () => boolean = () => true,
+    ) => {
+      const pendingResults = await listPendingCoachActionResults()
+      if (!isCurrent()) return
       try {
-        await uploadCloudSnapshot('chat_action_applied')
-        const synced = await Promise.all(
-          pendingResults.map(async (result) => [
-            result.proposalId,
-            await markCoachActionSynced(result.proposalId),
-          ] as const),
-        )
-        for (const [id, result] of synced) {
-          receipts.set(id, result)
-          newlySyncedIds.add(id)
-          void reportCoachProposalResult(id, 'applied', { result }).catch(() => {
-            // A cleared conversation has no remote proposal; the snapshot is
-            // still synced and the durable local receipt is now complete.
-          })
-        }
-      } catch {
-        // Keep durable pending receipts visible and retry on a later refresh.
-      }
-    }
-    setLocalApplied((current) => {
-      const next = new Map(current)
-      for (const [id, result] of receipts) next.set(id, result)
-      return next
-    })
-    for (const proposal of incoming) {
-      const receipt = receipts.get(proposal.id)
-      if (
-        receipt &&
-        receipt.syncPending !== true &&
-        !newlySyncedIds.has(proposal.id) &&
-        proposal.status === 'proposed'
-      ) {
-        void reportCoachProposalResult(proposal.id, 'applied', {
-          result: receipt,
-        }).catch(() => {
-          // The durable local receipt safely retries on a later refresh.
+        const receipts = await syncCoachActionReceipts({
+          pendingResults,
+          currentProposals: incoming,
+          isCurrent,
+          receiptMatchesProposal,
+          reserve: (proposal) =>
+            reserveCoachProposal(proposal.id, proposal.updatedAt),
+          uploadSnapshot: async () => {
+            await uploadCloudSnapshot('chat_action_applied')
+          },
+          markSynced: markCoachActionSynced,
+          getApplied: getAppliedCoachActionResult,
+          reportApplied: (result) =>
+            reportCoachProposalResult(result.proposalId, 'applied', { result }),
+          onReceiptsChanged: (discovered) => {
+            if (!isCurrent()) return
+            setLocalApplied((current) => {
+              const next = new Map(current)
+              for (const [id, result] of discovered) next.set(id, result)
+              return next
+            })
+          },
         })
+        if (!receipts || !isCurrent()) return
+        setLocalApplied((current) => {
+          const next = new Map(current)
+          for (const [id, result] of receipts) next.set(id, result)
+          return next
+        })
+        setProposalErrors((current) => {
+          const next = new Map(current)
+          for (const id of receipts.keys()) next.delete(id)
+          return next
+        })
+      } catch (error) {
+        if (error instanceof CoachReceiptAdoptionError && isCurrent()) {
+          setProposalErrors((current) =>
+            new Map(current).set(error.proposalId, error.message),
+          )
+        }
+        // Durable receipts remain pending and retry on a later refresh.
       }
-    }
-  }, [])
+    },
+    [],
+  )
 
   const ingestTranscript = useCallback(
     async (
@@ -181,14 +244,23 @@ export function CoachScreen() {
         nextCursor: number
       },
       replace: boolean,
+      ticket?: CoachRemoteRequestTicket,
     ) => {
+      const isCurrent = () => !ticket || requestGate.isCurrent(ticket)
+      if (!isCurrent()) return
       transcriptCursor.current = transcript.nextCursor
-      const sortedMessages = transcript.messages.slice().sort((a, b) => a.sequence - b.sequence)
-      const sortedProposals = transcript.proposals.slice().sort((a, b) => a.createdAt - b.createdAt)
+      const sortedMessages = transcript.messages
+        .slice()
+        .sort((a, b) => a.sequence - b.sequence)
+      const sortedProposals = transcript.proposals
+        .slice()
+        .sort((a, b) => a.createdAt - b.createdAt)
       setMessages((current) =>
         replace
           ? sortedMessages
-          : mergeById(current, sortedMessages).sort((a, b) => a.sequence - b.sequence),
+          : mergeById(current, sortedMessages).sort(
+              (a, b) => a.sequence - b.sequence,
+            ),
       )
       const nextProposals = replace
         ? sortedProposals
@@ -197,12 +269,15 @@ export function CoachScreen() {
           )
       proposalsRef.current = nextProposals
       setProposals(nextProposals)
-      await reconcileReceipts(sortedProposals)
+      await reconcileReceipts(nextProposals, isCurrent)
     },
-    [reconcileReceipts],
+    [reconcileReceipts, requestGate],
   )
 
-  const fetchIncrementalTranscript = useCallback(async (after: number) => {
+  const fetchIncrementalTranscript = useCallback(async (
+    after: number,
+    signal?: AbortSignal,
+  ) => {
     const next = {
       messages: [] as CoachMessage[],
       proposals: [] as CoachProposal[],
@@ -211,7 +286,7 @@ export function CoachScreen() {
     let hasMore = true
     let pages = 0
     while (hasMore && pages < 100) {
-      const page = await fetchCoachTranscriptPage(next.nextCursor)
+      const page = await fetchCoachTranscriptPage(next.nextCursor, 100, signal)
       next.messages.push(...page.messages)
       next.proposals.push(...page.proposals)
       if (page.hasMore && page.nextCursor <= next.nextCursor) {
@@ -222,73 +297,101 @@ export function CoachScreen() {
       pages += 1
     }
     if (hasMore) throw new Error('Coach transcript is too large to update safely')
-    return next
+    return { ...next, hasMore: false }
   }, [])
 
   const refreshRemote = useCallback(
-    async (quiet = false) => {
-      if (remoteRefreshInFlight.current) return
-      remoteRefreshInFlight.current = true
+    async (
+      quiet = false,
+      options: RefreshRemoteOptions = {},
+    ): Promise<boolean> => {
+      const ticket = requestGate.begin({ replace: options.force })
+      if (!ticket) return false
+      const isCurrent = () => requestGate.isCurrent(ticket)
       try {
         const previousRemote = remoteRef.current
-        const nextRemote = await fetchCoachState()
-        remoteRef.current = nextRemote
-        setRemote(nextRemote)
+        const nextRemote = await fetchCoachState(ticket.signal)
+        if (!isCurrent()) return false
         const proposalStateChanged =
           previousRemote !== null &&
           previousRemote.latestProposalUpdatedAt !==
             nextRemote.latestProposalUpdatedAt
-        let transcriptRefreshed = false
+        let transcript: Awaited<
+          ReturnType<typeof fetchFullCoachTranscript>
+        > | null = null
+        let replaceTranscript = false
         if (
+          options.fullTranscript ||
           nextRemote.latestMessageSequence < transcriptCursor.current ||
           proposalStateChanged
         ) {
-          await ingestTranscript(await fetchFullCoachTranscript(), true)
-          transcriptRefreshed = true
+          transcript = await fetchFullCoachTranscript(ticket.signal)
+          replaceTranscript = true
         } else if (nextRemote.latestMessageSequence > transcriptCursor.current) {
-          await ingestTranscript(
-            await fetchIncrementalTranscript(transcriptCursor.current),
-            false,
+          transcript = await fetchIncrementalTranscript(
+            transcriptCursor.current,
+            ticket.signal,
           )
-          transcriptRefreshed = true
         }
-        if (!transcriptRefreshed) {
-          await reconcileReceipts(proposalsRef.current)
+        if (!isCurrent()) return false
+        remoteRef.current = nextRemote
+        setRemote(nextRemote)
+        if (transcript) {
+          await ingestTranscript(transcript, replaceTranscript, ticket)
+        } else {
+          await reconcileReceipts(proposalsRef.current, isCurrent)
         }
+        if (!isCurrent()) return false
         setPageError(null)
+        return true
       } catch (caught) {
-        if (!quiet) {
+        if (isCurrent() && !quiet) {
           setPageError(caught instanceof Error ? caught.message : String(caught))
         }
+        return false
       } finally {
-        remoteRefreshInFlight.current = false
+        requestGate.finish(ticket)
       }
     },
-    [fetchIncrementalTranscript, ingestTranscript, reconcileReceipts],
+    [
+      fetchIncrementalTranscript,
+      ingestTranscript,
+      reconcileReceipts,
+      requestGate,
+    ],
   )
 
   const loadInitial = useCallback(async () => {
+    const ticket = requestGate.begin({ replace: true })
+    if (!ticket) return
+    const isCurrent = () => requestGate.isCurrent(ticket)
     try {
       const [live, nextRemote, transcript] = await Promise.all([
         buildLiveCoachContext(preferredSessionId),
-        fetchCoachState(),
-        fetchFullCoachTranscript(),
+        fetchCoachState(ticket.signal),
+        fetchFullCoachTranscript(ticket.signal),
       ])
+      if (!isCurrent()) return
       setContext(live.context)
       remoteRef.current = nextRemote
       setRemote(nextRemote)
-      await ingestTranscript(transcript, true)
-      setPageError(null)
+      await ingestTranscript(transcript, true, ticket)
+      if (isCurrent()) setPageError(null)
     } catch (caught) {
-      setPageError(caught instanceof Error ? caught.message : String(caught))
+      if (isCurrent()) {
+        setPageError(caught instanceof Error ? caught.message : String(caught))
+      }
     } finally {
-      setLoading(false)
+      const completedCurrentRequest = isCurrent()
+      requestGate.finish(ticket)
+      if (completedCurrentRequest) setLoading(false)
     }
-  }, [ingestTranscript, preferredSessionId])
+  }, [ingestTranscript, preferredSessionId, requestGate])
 
   useEffect(() => {
     void loadInitial()
-  }, [loadInitial])
+    return () => requestGate.invalidate()
+  }, [loadInitial, requestGate])
 
   const pollDelay =
     (remote?.counts.queued ?? 0) + (remote?.counts.processing ?? 0) > 0
@@ -359,20 +462,29 @@ export function CoachScreen() {
   const waitingForMac = Boolean(pendingJob && remote?.bridge?.online !== true)
 
   async function send(text: string, reasoningEffort: CoachReasoningEffort) {
-    if (sending) return
+    if (loading || sendingRef.current || clearingRef.current) return
+    sendingRef.current = true
     shouldAutoScroll.current = true
     setSending(true)
     setPageError(null)
     try {
-      const live = await buildLiveCoachContext(preferredSessionId)
-      setContext(live.context)
-      const response = await postCoachMessage({
-        clientMessageId: crypto.randomUUID(),
+      const request = await sendRetryBuffer.getOrCreate(
         text,
         reasoningEffort,
-        context: live.context,
-        stateHash: live.stateHash,
-      })
+        async () => {
+          const live = await buildLiveCoachContext(preferredSessionId)
+          setContext(live.context)
+          return {
+            clientMessageId: crypto.randomUUID(),
+            text,
+            reasoningEffort,
+            context: live.context,
+            stateHash: live.stateHash,
+          }
+        },
+      )
+      const response = await postCoachMessage(request)
+      sendRetryBuffer.confirm(request)
       if (response.message) {
         setMessages((current) =>
           mergeById(current, [response.message as CoachMessage]).sort(
@@ -380,35 +492,95 @@ export function CoachScreen() {
           ),
         )
       }
-      await refreshRemote(true)
+      await refreshRemote(true, { force: true })
     } catch (caught) {
+      if (
+        caught instanceof CoachApiError &&
+        caught.status >= 400 &&
+        caught.status < 500 &&
+        caught.status !== 408 &&
+        caught.status !== 429
+      ) {
+        sendRetryBuffer.reset()
+      }
       setPageError(caught instanceof Error ? caught.message : String(caught))
       throw caught
     } finally {
+      sendingRef.current = false
       setSending(false)
     }
   }
 
   async function apply(proposal: CoachProposal) {
-    if (busyProposalId) return
+    if (clearingRef.current) return
+    const mutationTicket = mutationGate.begin('proposal')
+    if (!mutationTicket) return
     setBusyProposalId(proposal.id)
     setProposalErrors((current) => {
       const next = new Map(current)
       next.delete(proposal.id)
       return next
     })
+    let reservationAcquired = false
+    const mergeProposal = (updated: CoachProposal | null) => {
+      if (!updated) return
+      const next = mergeById(proposalsRef.current, [updated])
+      proposalsRef.current = next
+      setProposals(next)
+    }
+    const finalizeFailure = async (message: string) => {
+      try {
+        const failed = await finalizeFailedCoachProposal({
+          getApplied: () => getAppliedCoachActionResult(proposal.id),
+          reportFailed: () =>
+            reportCoachProposalResult(proposal.id, 'failed', { error: message }),
+        })
+        mergeProposal(failed)
+        return failed
+      } catch {
+        // The same-device reservation remains durable and can be retried.
+        return null
+      }
+    }
     try {
-      const live = await buildLiveCoachContext(preferredSessionId)
-      const plan = parseCoachActionPlan(proposal.actionPlan)
-      let result = await applyCoachActionPlan({
-        proposalId: proposal.id,
-        rawPlan: proposal.actionPlan,
-        currentStateHash: live.stateHash,
-        currentActionStateHashes: live.context.actionStateHashes,
+      const applied = await applyReservedCoachProposal({
+        visibleProposal: proposal,
+        prepare: async (visibleProposal) => {
+          const plan = parseCoachActionPlan(visibleProposal.actionPlan)
+          const live = await buildLiveCoachContext(preferredSessionId)
+          if (clearingRef.current) {
+            throw new Error('Coach conversation is being cleared.')
+          }
+          return { live, scope: plan.scope }
+        },
+        reserve: async (visibleProposal) => {
+          const reserved = await reserveCoachProposal(
+            visibleProposal.id,
+            visibleProposal.updatedAt,
+          )
+          reservationAcquired = true
+          return reserved
+        },
+        apply: async (currentProposal, prepared) => {
+          if (clearingRef.current) {
+            throw new Error('Coach conversation is being cleared.')
+          }
+          return {
+            scope: prepared.scope,
+            result: await applyCoachActionPlan({
+              proposalId: currentProposal.id,
+              rawPlan: currentProposal.actionPlan,
+              currentStateHash: prepared.live.stateHash,
+              currentActionStateHashes:
+                prepared.live.context.actionStateHashes,
+            }),
+          }
+        },
       })
+      let result = applied.result
       setLocalApplied((current) => new Map(current).set(proposal.id, result))
       if (result.activeSessionId) setActiveSession(result.activeSessionId)
-      if (plan.scope === 'one_time_workout' && result.activeSessionId) {
+      if (applied.scope === 'one_time_workout' && result.activeSessionId) {
         navigate('/workout')
       }
 
@@ -424,25 +596,42 @@ export function CoachScreen() {
         result,
       })
       await refreshLocalContext()
-      await refreshRemote(true)
+      await refreshRemote(true, { force: true, fullTranscript: true })
     } catch (caught) {
+      if (clearingRef.current) return
+      if (caught instanceof CoachProposalUnavailableError) {
+        let currentProposal = caught.currentProposal
+        if (reservationAcquired) {
+          currentProposal =
+            (await finalizeFailure(caught.message)) ?? currentProposal
+        }
+        const next = currentProposal
+          ? mergeById(proposalsRef.current, [currentProposal])
+          : proposalsRef.current.filter((item) => item.id !== proposal.id)
+        proposalsRef.current = next
+        setProposals(next)
+        await refreshRemote(true, { force: true, fullTranscript: true })
+        setPageError(caught.message)
+        return
+      }
       const message = caught instanceof Error ? caught.message : String(caught)
       setProposalErrors((current) => new Map(current).set(proposal.id, message))
-      const receipt = await getAppliedCoachActionResult(proposal.id)
-      if (!receipt) {
-        void reportCoachProposalResult(proposal.id, 'failed', { error: message }).catch(
-          () => {
-            // Keep the local error visible if reporting also fails.
-          },
-        )
+      if (reservationAcquired) {
+        await finalizeFailure(message)
+      }
+      if (caught instanceof CoachApiError && caught.status === 409) {
+        await refreshRemote(true, { force: true, fullTranscript: true })
       }
     } finally {
+      mutationGate.finish(mutationTicket)
       setBusyProposalId(null)
     }
   }
 
   async function dismiss(proposal: CoachProposal) {
-    if (busyProposalId) return
+    if (clearingRef.current || proposal.reserved === true) return
+    const mutationTicket = mutationGate.begin('proposal')
+    if (!mutationTicket) return
     setBusyProposalId(proposal.id)
     try {
       const updated = await dismissCoachProposal(proposal.id)
@@ -451,6 +640,7 @@ export function CoachScreen() {
         proposalsRef.current = next
         setProposals(next)
       }
+      await refreshRemote(true, { force: true, fullTranscript: true })
     } catch (caught) {
       setProposalErrors((current) =>
         new Map(current).set(
@@ -458,57 +648,115 @@ export function CoachScreen() {
           caught instanceof Error ? caught.message : String(caught),
         ),
       )
+      if (caught instanceof CoachApiError && caught.status === 409) {
+        await refreshRemote(true, { force: true, fullTranscript: true })
+      }
     } finally {
+      mutationGate.finish(mutationTicket)
       setBusyProposalId(null)
     }
   }
 
   async function cancelPendingJob() {
-    if (!pendingJob || cancellingJobId) return
+    if (!pendingJob || cancellingJobId || clearingRef.current) return
+    const mutationTicket = mutationGate.begin('cancel')
+    if (!mutationTicket) return
     setCancellingJobId(pendingJob.id)
     setPageError(null)
     try {
       await cancelCoachJob(pendingJob.id)
-      await refreshRemote(true)
+      await refreshRemote(true, { force: true, fullTranscript: true })
     } catch (caught) {
       setPageError(caught instanceof Error ? caught.message : String(caught))
     } finally {
+      mutationGate.finish(mutationTicket)
       setCancellingJobId(null)
     }
   }
 
   async function clearConversation() {
+    if (clearingRef.current || mutationGate.busy || sendingRef.current) return
     if (!messages.length && !proposals.length) return
     if (!confirm('Clear this Coach conversation? Applied workout changes stay saved.')) {
       return
     }
+    const mutationTicket = mutationGate.begin('clear')
+    if (!mutationTicket) return
+    clearingRef.current = true
+    setClearing(true)
+    setLoading(true)
+    let remoteCleared = false
     try {
-      const pendingResults = await listPendingCoachActionResults()
-      if (pendingResults.length > 0) {
-        try {
-          await uploadCloudSnapshot('chat_action_applied')
-          await Promise.all(
-            pendingResults.map((result) =>
-              markCoachActionSynced(result.proposalId),
-            ),
-          )
-        } catch {
-          throw new Error(
-            'Coach has changes waiting to sync. The conversation was not cleared; retry when cloud sync is available.',
-          )
-        }
-      }
-      await clearCoachConversation()
-      setMessages([])
-      proposalsRef.current = []
-      setProposals([])
-      setLocalApplied(new Map())
-      setProposalErrors(new Map())
-      setPageError(null)
-      transcriptCursor.current = 0
-      await Promise.all([refreshLocalContext(), refreshRemote(true)])
+      await clearCoachConversationAndRefresh({
+        gate: requestGate,
+        prepare: async () => {
+          const pendingResults = await listPendingCoachActionResults()
+          await syncCoachActionReceipts({
+            pendingResults,
+            currentProposals: proposalsRef.current,
+            receiptMatchesProposal,
+            reserve: (proposal) =>
+              reserveCoachProposal(proposal.id, proposal.updatedAt),
+            uploadSnapshot: async () => {
+              await uploadCloudSnapshot('chat_action_applied')
+            },
+            markSynced: markCoachActionSynced,
+            getApplied: getAppliedCoachActionResult,
+            reportApplied: (result) =>
+              reportCoachProposalResult(result.proposalId, 'applied', {
+                result,
+              }),
+          })
+        },
+        clearRemote: async () => {
+          await clearCoachConversation()
+          remoteCleared = true
+        },
+        resetLocal: () => {
+          setMessages([])
+          proposalsRef.current = []
+          setProposals([])
+          setLocalApplied(new Map())
+          setProposalErrors(new Map())
+          setPageError(null)
+          transcriptCursor.current = 0
+          remoteRef.current = null
+          setRemote(null)
+          sendRetryBuffer.reset()
+        },
+        refreshFresh: async () => {
+          const [, refreshed] = await Promise.all([
+            refreshLocalContext(),
+            refreshRemote(false, { force: true, fullTranscript: true }),
+          ])
+          if (!refreshed) {
+            throw new Error(
+              'Coach was cleared, but the fresh conversation could not be loaded.',
+            )
+          }
+        },
+      })
     } catch (caught) {
-      setPageError(caught instanceof Error ? caught.message : String(caught))
+      const message = caught instanceof Error ? caught.message : String(caught)
+      const recovered = await refreshRemote(false, {
+        force: true,
+        fullTranscript: true,
+      })
+      setPageError((recoveryError) =>
+        resolveCoachClearRecoveryError({
+          remoteCleared,
+          recovered,
+          operationError: message,
+          recoveryError,
+        }),
+      )
+    } finally {
+      clearingRef.current = false
+      mutationGate.finish(mutationTicket)
+      setClearing(false)
+      // A pre-clear loadInitial ticket was invalidated and deliberately cannot
+      // update loading; the clear lifecycle owns the terminal loading state.
+      setLoading(false)
     }
   }
 
@@ -530,6 +778,9 @@ export function CoachScreen() {
         proposal={shown}
         context={context}
         busy={busyProposalId === proposal.id}
+        interactionLocked={
+          clearing || busyProposalId !== null || cancellingJobId !== null
+        }
         error={proposalErrors.get(proposal.id) ?? null}
         onApply={() => void apply(proposal)}
         onDismiss={() => void dismiss(proposal)}
@@ -547,7 +798,13 @@ export function CoachScreen() {
           <button
             type="button"
             onClick={() => void clearConversation()}
-            disabled={messages.length === 0 && proposals.length === 0}
+            disabled={
+              clearing ||
+              sending ||
+              cancellingJobId !== null ||
+              busyProposalId !== null ||
+              (messages.length === 0 && proposals.length === 0)
+            }
             aria-label="Clear Coach conversation"
             className="min-h-11 min-w-11 grid place-items-center text-[var(--color-fg-faint)] hover:text-red-300 disabled:opacity-30"
           >
@@ -572,7 +829,7 @@ export function CoachScreen() {
           role="log"
           aria-live="polite"
           aria-relevant="additions text"
-          aria-busy={loading || sending}
+          aria-busy={loading || sending || clearing}
           className="max-w-md mx-auto px-3 pt-4 pb-16 space-y-3"
         >
           {pageError && (
@@ -643,7 +900,11 @@ export function CoachScreen() {
               <button
                 type="button"
                 onClick={() => void cancelPendingJob()}
-                disabled={cancellingJobId === pendingJob.id}
+                disabled={
+                  clearing ||
+                  busyProposalId !== null ||
+                  cancellingJobId === pendingJob.id
+                }
                 className="min-h-11 shrink-0 rounded-lg px-3 text-xs font-semibold text-red-300 hover:bg-red-950/35 disabled:opacity-50"
               >
                 {cancellingJobId === pendingJob.id ? 'Cancelling…' : 'Cancel'}
@@ -657,8 +918,9 @@ export function CoachScreen() {
       <div id="coach-composer" className="max-w-md w-full mx-auto">
         <CoachComposer
           hasActiveWorkout={Boolean(context?.activeWorkout)}
-          disabled={sending}
+          disabled={loading || sending || clearing}
           onSend={send}
+          onDraftChange={() => sendRetryBuffer.reset()}
         />
       </div>
     </div>

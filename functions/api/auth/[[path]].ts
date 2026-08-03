@@ -187,13 +187,26 @@ async function handleLogout(ctx: PagesContext): Promise<Response> {
   if (ctx.env.WORKOUT_DB) {
     const session = await readCloudSession(ctx.request, ctx.env)
     if (session) {
-      await ctx.env.WORKOUT_DB.prepare(
+      const revoked = await ctx.env.WORKOUT_DB.prepare(
         `UPDATE cloud_auth_sessions
          SET revoked_at = ?
-         WHERE id = ?`,
+         WHERE id = ?
+           AND revoked_at IS NULL
+           AND NOT EXISTS (
+             SELECT 1
+             FROM codex_chat_action_proposals reserved
+             WHERE reserved.status = 'proposed'
+               AND reserved.result_json IS NOT NULL
+               AND json_valid(reserved.result_json)
+               AND json_extract(reserved.result_json, '$._kind') = 'coach_apply_reservation_v1'
+               AND json_extract(reserved.result_json, '$.ownerSessionId') = ?
+           )`,
       )
-        .bind(Date.now(), session.id)
+        .bind(Date.now(), session.id, session.id)
         .run()
+      if ((revoked.meta?.changes ?? 0) !== 1) {
+        return json(409, { error: 'coach_action_reservation_active' })
+      }
     }
   }
   return json(

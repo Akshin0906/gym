@@ -1,4 +1,5 @@
 import { db } from '../schema'
+import { parseCoachActionResultJson } from '../../lib/coachActionResult'
 import type {
   AiMemorySettings,
   AiMemorySummary,
@@ -38,6 +39,42 @@ export interface ExportPayload {
   }
 }
 
+type ExportTableName = keyof ExportPayload['data']
+
+// Export schema history intentionally differs from the Dexie version number:
+// v1 was the original workout graph, v2 added recommendations and AI memory,
+// v3 added daily briefings, and v4 added Coach action receipts.
+const EXPORT_TABLE_INTRODUCED_IN: Readonly<Record<ExportTableName, number>> = {
+  exercises: 1,
+  programs: 1,
+  sessionTemplates: 1,
+  templateExercises: 1,
+  workoutSessions: 1,
+  loggedSets: 1,
+  recommendations: 2,
+  aiMemorySettings: 2,
+  aiNotes: 2,
+  aiMemorySummaries: 2,
+  dailyBriefings: 3,
+  chatActionReceipts: 4,
+}
+
+const EXPORT_TABLE_NAMES = Object.keys(
+  EXPORT_TABLE_INTRODUCED_IN,
+) as ExportTableName[]
+
+export function assertExportTableCoverage(
+  dexieTableNames: readonly string[],
+  data: Readonly<Record<string, unknown>>,
+): void {
+  const missing = dexieTableNames.filter((name) => !(name in data))
+  if (missing.length > 0) {
+    throw new Error(
+      `Export payload is missing Dexie tables: ${missing.join(', ')}`,
+    )
+  }
+}
+
 export async function buildExportPayload(): Promise<ExportPayload> {
   return db.transaction('r', db.tables, async () => {
     const data = {
@@ -54,31 +91,25 @@ export async function buildExportPayload(): Promise<ExportPayload> {
       aiMemorySummaries: await db.aiMemorySummaries.toArray(),
       chatActionReceipts: await db.chatActionReceipts.toArray(),
     }
-    // Safety net: if a future Dexie table is added without being wired into
-    // the export, surface it loudly instead of silently dropping it from
-    // backups (the bug that lost dailyBriefings before schema v3).
-    const missing = db.tables
-      .map((t) => t.name)
-      .filter((name) => !(name in data))
-    if (missing.length > 0) {
-      console.warn(
-        `[export] tables missing from backup payload: ${missing.join(', ')}`,
-      )
-    }
-    return {
+    assertExportTableCoverage(
+      db.tables.map((table) => table.name),
+      data,
+    )
+    return validatePayload({
       schemaVersion: SCHEMA_VERSION,
       exportedAt: Date.now(),
       appVersion: APP_VERSION,
       data,
-    }
+    })
   })
 }
 
 export function downloadExport(payload: ExportPayload): void {
-  const json = JSON.stringify(payload, null, 2)
+  const validated = validatePayload(payload)
+  const json = JSON.stringify(validated, null, 2)
   const blob = new Blob([json], { type: 'application/json' })
   const url = URL.createObjectURL(blob)
-  const date = new Date(payload.exportedAt)
+  const date = new Date(validated.exportedAt)
   const yyyy = date.getFullYear()
   const mm = String(date.getMonth() + 1).padStart(2, '0')
   const dd = String(date.getDate()).padStart(2, '0')
@@ -390,14 +421,26 @@ function isAiMemorySummary(value: unknown): value is AiMemorySummary {
 }
 
 function isChatActionReceipt(value: unknown): value is ChatActionReceipt {
-  return (
+  if (!(
     isObject(value) &&
     isNonEmptyString(value.proposalId) &&
     isFiniteNumber(value.appliedAt) &&
     value.appliedAt >= 0 &&
     isNonEmptyString(value.sourceStateHash) &&
     typeof value.resultJson === 'string'
-  )
+  )) {
+    return false
+  }
+  try {
+    const result = parseCoachActionResultJson(value.resultJson)
+    return (
+      result.proposalId === value.proposalId &&
+      result.appliedAt === value.appliedAt &&
+      result.sourceStateHash === value.sourceStateHash
+    )
+  } catch {
+    return false
+  }
 }
 
 function hasDenseOrder(values: number[]): boolean {
@@ -501,22 +544,6 @@ function validatePayload(raw: unknown): ExportPayload {
     throw new Error(`Unsupported schemaVersion: ${String(raw.schemaVersion)}`)
   const data = raw.data
   if (!isObject(data)) throw new Error('Import is missing `data`')
-  const requiredTables = [
-    'exercises',
-    'programs',
-    'sessionTemplates',
-    'templateExercises',
-    'workoutSessions',
-    'loggedSets',
-  ] as const
-  // Tables added after the original schema. Absent in older export files, so
-  // they're optional, but if present they must be well-formed.
-  const optionalTables = [
-    'recommendations',
-    'aiMemorySettings',
-    'aiNotes',
-    'aiMemorySummaries',
-  ] as const
   const tableValidators = {
     exercises: isExercise,
     programs: isProgram,
@@ -531,30 +558,28 @@ function validatePayload(raw: unknown): ExportPayload {
     aiMemorySummaries: isAiMemorySummary,
     chatActionReceipts: isChatActionReceipt,
   } as const
-  for (const t of requiredTables) {
-    if (!isArrayOf(data[t], tableValidators[t])) {
-      throw new Error(`Import table "${t}" is missing or malformed`)
+  const schemaVersion = Number(raw.schemaVersion)
+  for (const table of EXPORT_TABLE_NAMES) {
+    const value = data[table]
+    if (value === undefined) {
+      if (schemaVersion >= EXPORT_TABLE_INTRODUCED_IN[table]) {
+        throw new Error(
+          `Import table "${table}" is missing for schemaVersion ${schemaVersion}`,
+        )
+      }
+      continue
     }
-  }
-  for (const t of optionalTables) {
-    if (data[t] !== undefined && !isArrayOf(data[t], tableValidators[t])) {
-      throw new Error(`Import table "${t}" is malformed`)
+    const validator: (item: unknown) => boolean = tableValidators[table]
+    if (!isArrayOf(value, validator)) {
+      const detail =
+        EXPORT_TABLE_INTRODUCED_IN[table] === 1
+          ? 'is missing or malformed'
+          : 'is malformed'
+      throw new Error(`Import table "${table}" ${detail}`)
     }
-  }
-  if (
-    data.chatActionReceipts !== undefined &&
-    !isArrayOf(data.chatActionReceipts, tableValidators.chatActionReceipts)
-  ) {
-    throw new Error('Import table "chatActionReceipts" is malformed')
-  }
-  if (
-    data.dailyBriefings !== undefined &&
-    !isArrayOf(data.dailyBriefings, tableValidators.dailyBriefings)
-  ) {
-    throw new Error('Import table "dailyBriefings" is malformed')
   }
   const payload: ExportPayload = {
-    schemaVersion: Number(raw.schemaVersion),
+    schemaVersion,
     exportedAt:
       typeof raw.exportedAt === 'number' ? raw.exportedAt : Date.now(),
     appVersion: typeof raw.appVersion === 'string' ? raw.appVersion : '',

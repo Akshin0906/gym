@@ -31,6 +31,9 @@ export interface CoachProposal {
   createdAt: number
   updatedAt: number
   result: unknown | null
+  /** True when one paired device has durably claimed this proposal. */
+  reserved?: boolean
+  reservedAt?: number | null
 }
 
 export interface CoachBridgeState {
@@ -197,7 +200,8 @@ export interface CoachActionResult {
   proposalId: string
   appliedAt: number
   sourceStateHash: string
-  sourceActionStateHash: string
+  /** Missing only on receipts written before scoped action hashes existed. */
+  sourceActionStateHash?: string
   replayed: boolean
   syncPending?: boolean
   changes: CoachActionChange[]

@@ -194,6 +194,80 @@ class ChatBackendSqlSmokeTest(unittest.TestCase):
             ("idle", None),
         )
 
+    def test_expired_lease_marker_preserves_schema_check_until_requeue(self) -> None:
+        job_id = self._insert_job(
+            3,
+            status="leased",
+            attempts=1,
+            lease_expires_at=10,
+        )
+        self.db.execute(
+            "UPDATE codex_chat_conversations SET codex_thread_id = ? WHERE id = ?",
+            ("thread-old", CONVERSATION_ID),
+        )
+        now = 20
+        marker = "expired:test-transition"
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute(
+                """UPDATE codex_chat_jobs
+                   SET worker_id = ?, lease_token = NULL
+                   WHERE id = ? AND status = 'leased'""",
+                (marker, job_id),
+            )
+
+        self.db.execute(
+            """UPDATE codex_chat_jobs
+               SET worker_id = ?, lease_token = ?
+               WHERE conversation_id = ? AND status = 'leased'
+                 AND lease_expires_at <= ?""",
+            (marker, marker, CONVERSATION_ID, now),
+        )
+        self.db.execute(
+            """UPDATE codex_chat_conversations
+               SET codex_thread_id = NULL
+               WHERE id = ? AND codex_thread_id IS ?
+                 AND EXISTS (
+                   SELECT 1 FROM codex_chat_jobs
+                   WHERE conversation_id = ? AND status = 'leased'
+                     AND worker_id = ? AND lease_token = ?
+                 )""",
+            (
+                CONVERSATION_ID,
+                "thread-old",
+                CONVERSATION_ID,
+                marker,
+                marker,
+            ),
+        )
+        self.db.execute(
+            """UPDATE codex_chat_jobs
+               SET status = 'queued', available_at = ?, worker_id = NULL,
+                   lease_token = NULL, lease_expires_at = NULL,
+                   claimed_at = NULL, updated_at = ?,
+                   last_error = 'lease_expired'
+               WHERE conversation_id = ? AND status = 'leased'
+                 AND worker_id = ? AND lease_token = ?
+                 AND attempts < max_attempts""",
+            (now, now, CONVERSATION_ID, marker, marker),
+        )
+
+        self.assertEqual(
+            self.db.execute(
+                """SELECT status, worker_id, lease_token, lease_expires_at,
+                          claimed_at, last_error
+                   FROM codex_chat_jobs WHERE id = ?""",
+                (job_id,),
+            ).fetchone(),
+            ("queued", None, None, None, None, "lease_expired"),
+        )
+        self.assertIsNone(
+            self.db.execute(
+                "SELECT codex_thread_id FROM codex_chat_conversations WHERE id = ?",
+                (CONVERSATION_ID,),
+            ).fetchone()[0],
+        )
+
     def test_retention_is_bounded_and_preserves_live_references(self) -> None:
         for index in range(510):
             self._insert_job(

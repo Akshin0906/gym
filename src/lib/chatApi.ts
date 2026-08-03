@@ -8,6 +8,8 @@ import type {
   CoachTranscriptPage,
 } from './chatTypes'
 
+export const COACH_TRANSCRIPT_PROTOCOL = 'proposal-reservation-v1'
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
@@ -68,10 +70,29 @@ function parseProposal(raw: unknown): CoachProposal | null {
     createdAt: numberValue(raw.createdAt),
     updatedAt: numberValue(raw.updatedAt),
     result: raw.result === undefined ? null : raw.result,
+    reserved: raw.reserved === true,
+    reservedAt:
+      typeof raw.reservedAt === 'number' && Number.isSafeInteger(raw.reservedAt)
+        ? raw.reservedAt
+        : null,
   }
 }
 
-async function responseError(response: Response): Promise<Error> {
+export class CoachApiError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string | null,
+    readonly detail: string,
+  ) {
+    super(
+      `Coach request failed (${status})${detail ? `: ${detail}` : code ? `: ${code}` : ''}`,
+    )
+    this.name = 'CoachApiError'
+  }
+}
+
+async function responseError(response: Response): Promise<CoachApiError> {
+  let code: string | null = null
   let detail = ''
   try {
     const raw = (await response.text()).trim()
@@ -79,7 +100,8 @@ async function responseError(response: Response): Promise<Error> {
       try {
         const parsed: unknown = JSON.parse(raw)
         if (isObject(parsed)) {
-          detail = stringValue(parsed.detail) || stringValue(parsed.error)
+          code = stringValue(parsed.error) || null
+          detail = stringValue(parsed.detail) || code || ''
         }
       } catch {
         detail = raw.slice(0, 240)
@@ -88,9 +110,7 @@ async function responseError(response: Response): Promise<Error> {
   } catch {
     // The HTTP status still gives the caller a useful error.
   }
-  return new Error(
-    `Coach request failed (${response.status})${detail ? `: ${detail}` : ''}`,
-  )
+  return new CoachApiError(response.status, code, detail)
 }
 
 async function jsonRequest(
@@ -116,8 +136,10 @@ async function jsonRequest(
   }
 }
 
-export async function fetchCoachState(): Promise<CoachConversationState> {
-  const raw = await jsonRequest('/api/chat/state')
+export async function fetchCoachState(
+  signal?: AbortSignal,
+): Promise<CoachConversationState> {
+  const raw = await jsonRequest('/api/chat/state', { signal })
   if (!isObject(raw)) throw new Error('Malformed Coach state')
 
   const conversation = isObject(raw.conversation)
@@ -168,9 +190,13 @@ export async function fetchCoachState(): Promise<CoachConversationState> {
 export async function fetchCoachTranscriptPage(
   after = 0,
   limit = 100,
+  signal?: AbortSignal,
 ): Promise<CoachTranscriptPage> {
   const params = new URLSearchParams({ after: String(after), limit: String(limit) })
-  const raw = await jsonRequest(`/api/chat/messages?${params}`)
+  const raw = await jsonRequest(`/api/chat/messages?${params}`, {
+    signal,
+    headers: { 'X-Coach-Protocol': COACH_TRANSCRIPT_PROTOCOL },
+  })
   if (!isObject(raw)) throw new Error('Malformed Coach transcript')
   return {
     messages: Array.isArray(raw.messages)
@@ -186,14 +212,16 @@ export async function fetchCoachTranscriptPage(
   }
 }
 
-export async function fetchFullCoachTranscript(): Promise<CoachTranscriptPage> {
+export async function fetchFullCoachTranscript(
+  signal?: AbortSignal,
+): Promise<CoachTranscriptPage> {
   const messages: CoachMessage[] = []
   const proposals: CoachProposal[] = []
   let cursor = 0
   let hasMore = true
   let pages = 0
   while (hasMore && pages < 100) {
-    const page = await fetchCoachTranscriptPage(cursor)
+    const page = await fetchCoachTranscriptPage(cursor, 100, signal)
     messages.push(...page.messages)
     proposals.push(...page.proposals)
     if (page.nextCursor <= cursor && page.hasMore) {
@@ -246,6 +274,24 @@ export async function reportCoachProposalResult(
     },
   )
   return isObject(raw) ? parseProposal(raw.proposal) : null
+}
+
+export async function reserveCoachProposal(
+  proposalId: string,
+  expectedUpdatedAt: number,
+): Promise<CoachProposal> {
+  const raw = await jsonRequest(
+    `/api/chat/proposals/${encodeURIComponent(proposalId)}/reserve`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ expectedUpdatedAt }),
+    },
+  )
+  const proposal = isObject(raw) ? parseProposal(raw.proposal) : null
+  if (!proposal || proposal.status !== 'proposed' || proposal.reserved !== true) {
+    throw new Error('Coach returned an invalid proposal reservation')
+  }
+  return proposal
 }
 
 export async function dismissCoachProposal(

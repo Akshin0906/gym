@@ -455,7 +455,7 @@ class ModelOutputValidationTests(unittest.TestCase):
         validated = bridge.validate_model_output(swap_output())
         payload = claim_envelope()["context"]["payload"]
         payload["actionStateHashes"]["active_workout"] = "A" * 64
-        with self.assertRaises(bridge.ConfigError):
+        with self.assertRaises(bridge.ActionPlanDowngrade):
             bridge.bind_action_plan_to_state(
                 validated["actionPlan"], "trusted-hash", payload
             )
@@ -464,7 +464,9 @@ class ModelOutputValidationTests(unittest.TestCase):
         validated = bridge.validate_model_output(swap_output())
         payload = claim_envelope()["context"]["payload"]
         del payload["actionStateHashes"]["active_workout"]
-        with self.assertRaises(bridge.ConfigError):
+        with self.assertRaisesRegex(
+            bridge.ActionPlanDowngrade, "Update or refresh the app"
+        ):
             bridge.bind_action_plan_to_state(
                 validated["actionPlan"], "trusted-hash", payload
             )
@@ -476,6 +478,17 @@ class ModelOutputValidationTests(unittest.TestCase):
             validated["actionPlan"], "trusted-hash", context_payload
         )
         self.assertEqual(plan["sourceActionStateHash"], "d" * 64)
+
+    def test_paused_ai_memory_plan_is_downgraded_by_trusted_code(self) -> None:
+        validated = bridge.validate_model_output(memory_output())
+        context_payload = claim_envelope()["context"]["payload"]
+        context_payload["memory"] = {"paused": True}
+        with self.assertRaisesRegex(
+            bridge.ActionPlanDowngrade, "AI Memory is paused"
+        ):
+            bridge.bind_action_plan_to_state(
+                validated["actionPlan"], "trusted-hash", context_payload
+            )
 
     def test_custom_exercise_plan_binds_the_trusted_library_hash(self) -> None:
         validated = bridge.validate_model_output(create_custom_exercise_output())
@@ -806,6 +819,107 @@ class IdleBackoffTests(unittest.TestCase):
 
 
 class RuntimeBoundsTests(unittest.TestCase):
+    def _process_with_output(
+        self, directory: str, envelope: dict, model_output: str
+    ) -> tuple[dict, object]:
+        class CapturingCloud:
+            def __init__(self) -> None:
+                self.completions: list[dict] = []
+                self.failures: list[dict] = []
+
+            def complete(self, _job_id: str, body: dict) -> tuple[int, dict]:
+                self.completions.append(body)
+                return 200, {}
+
+            def fail(
+                self,
+                _job: object,
+                _error: str,
+                **kwargs: object,
+            ) -> tuple[int, dict]:
+                self.failures.append(kwargs)
+                return 200, {}
+
+        state_dir = Path(directory) / "state"
+        config = type("ConfigStub", (), {"state_dir": state_dir})()
+        cloud = CapturingCloud()
+        chat = object.__new__(bridge.ChatBridge)
+        chat.config = config
+        chat.cloud = cloud
+        chat.logger = logging.getLogger("unpublished-turn-test")
+        chat.heartbeat = lambda *_args, **_kwargs: None
+        chat._generate = lambda _job: (model_output, "thread-1")
+        job = bridge.validate_claim(envelope)
+        assert job is not None
+        chat.process_job(job)
+        return cloud.completions[0], cloud
+
+    def test_old_client_missing_action_hash_gets_refresh_response_and_discards_thread(
+        self,
+    ) -> None:
+        envelope = claim_envelope()
+        envelope["codexThreadId"] = "thread-1"
+        del envelope["context"]["payload"]["actionStateHashes"]["ai_memory"]
+        with tempfile.TemporaryDirectory() as directory:
+            completion, cloud = self._process_with_output(
+                directory, envelope, json.dumps(memory_output())
+            )
+
+        self.assertIsNone(completion["actionPlan"])
+        self.assertIn("Update or refresh the app", completion["assistantText"])
+        self.assertIsNone(completion["codexThreadId"])
+        self.assertTrue(completion["discardCodexThread"])
+        self.assertEqual(completion["expectedCodexThreadId"], "thread-1")
+        self.assertEqual(cloud.failures, [])
+
+    def test_paused_memory_never_publishes_an_enabled_proposal(self) -> None:
+        envelope = claim_envelope()
+        envelope["codexThreadId"] = "thread-1"
+        envelope["context"]["payload"]["memory"] = {"paused": True}
+        with tempfile.TemporaryDirectory() as directory:
+            completion, _cloud = self._process_with_output(
+                directory, envelope, json.dumps(memory_output())
+            )
+
+        self.assertIsNone(completion["actionPlan"])
+        self.assertIn("AI Memory is paused", completion["assistantText"])
+        self.assertTrue(completion["discardCodexThread"])
+
+    def test_malformed_post_model_output_invalidates_the_resumed_thread(self) -> None:
+        class FailingCloud:
+            def __init__(self) -> None:
+                self.failure: dict | None = None
+
+            def fail(
+                self,
+                _job: object,
+                _error: str,
+                **kwargs: object,
+            ) -> tuple[int, dict]:
+                self.failure = kwargs
+                return 200, {}
+
+        envelope = claim_envelope()
+        envelope["codexThreadId"] = "thread-1"
+        job = bridge.validate_claim(envelope)
+        assert job is not None
+        with tempfile.TemporaryDirectory() as directory:
+            cloud = FailingCloud()
+            chat = object.__new__(bridge.ChatBridge)
+            chat.config = type(
+                "ConfigStub", (), {"state_dir": Path(directory) / "state"}
+            )()
+            chat.cloud = cloud
+            chat.logger = logging.getLogger("invalid-output-thread-test")
+            chat.heartbeat = lambda *_args, **_kwargs: None
+            chat._generate = lambda _job: ('{"assistantText":"missing plan"}', "thread-1")
+
+            with self.assertRaises(bridge.ModelOutputError):
+                chat.process_job(job)
+
+        self.assertIsNotNone(cloud.failure)
+        self.assertTrue(cloud.failure["discard_codex_thread"])
+
     def test_app_server_log_rotates_with_hard_bounds(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "app-server.stderr.log"
@@ -859,7 +973,7 @@ class RuntimeBoundsTests(unittest.TestCase):
             chat.logger = logging.getLogger("cancelled-completion-test")
             chat.heartbeat = lambda *_args, **_kwargs: None
             chat._generate = lambda _job: (
-                bridge.validate_model_output(swap_output()),
+                json.dumps(swap_output()),
                 "thread-1",
             )
             job = bridge.validate_claim(claim_envelope())
@@ -872,6 +986,213 @@ class RuntimeBoundsTests(unittest.TestCase):
             stale = state_dir / "spool" / "stale"
             self.assertEqual(len(list(stale.glob("*.json"))), 1)
             self.assertFalse((state_dir / "spool" / "invalid").exists())
+            intent_path = bridge.thread_discard_intent_path(config, job.id)
+            self.assertTrue(intent_path.is_file())
+            intent = bridge.read_json(intent_path)
+            self.assertEqual(intent["expectedCodexThreadId"], "thread-1")
+            stale_record = bridge.read_json(next(stale.glob("*.json")))
+            self.assertEqual(stale_record["version"], 2)
+            self.assertEqual(stale_record["expectedCodexThreadId"], "thread-1")
+
+    def test_transient_completion_stays_publishable_and_disarms_on_replay(
+        self,
+    ) -> None:
+        class OutageCloud:
+            def complete(self, _job_id: str, _body: dict) -> tuple[int, dict]:
+                raise bridge.TransientError("completion response unavailable")
+
+        class RecoveredCloud:
+            def __init__(self) -> None:
+                self.discard_calls = 0
+
+            def complete(self, _job_id: str, _body: dict) -> tuple[int, dict]:
+                return 200, {}
+
+            def discard_thread(
+                self, _expected_codex_thread_id: str | None
+            ) -> tuple[int, dict]:
+                self.discard_calls += 1
+                return 200, {}
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory) / "state"
+            config = type("ConfigStub", (), {"state_dir": state_dir})()
+            chat = object.__new__(bridge.ChatBridge)
+            chat.config = config
+            chat.cloud = OutageCloud()
+            chat.logger = logging.getLogger("completion-outage-test")
+            chat.heartbeat = lambda *_args, **_kwargs: None
+            chat._generate = lambda _job: (json.dumps(swap_output()), "thread-1")
+            job = bridge.validate_claim(claim_envelope())
+            assert job is not None
+
+            with self.assertRaises(bridge.CompletionPending):
+                chat.process_job(job)
+
+            completion_path = bridge.spool_path(config, job.id)
+            intent_path = bridge.thread_discard_intent_path(config, job.id)
+            self.assertTrue(completion_path.is_file())
+            self.assertTrue(intent_path.is_file())
+            recovered = RecoveredCloud()
+            bridge.flush_spools(config, recovered, chat.logger)
+            bridge.flush_thread_discard_intents(config, recovered, chat.logger)
+
+            self.assertFalse(completion_path.exists())
+            self.assertFalse(intent_path.exists())
+            self.assertEqual(recovered.discard_calls, 0)
+
+    def test_stale_completion_after_outage_discards_only_the_expected_thread(
+        self,
+    ) -> None:
+        class OutageCloud:
+            def complete(self, _job_id: str, _body: dict) -> tuple[int, dict]:
+                raise bridge.TransientError("offline until after lease expiry")
+
+        class ExpiredLeaseCloud:
+            def __init__(self, canonical_thread: str | None) -> None:
+                self.canonical_thread = canonical_thread
+                self.discarded: list[str | None] = []
+
+            def complete(self, _job_id: str, _body: dict) -> tuple[int, dict]:
+                return 409, {"error": "lease_lost"}
+
+            def discard_thread(
+                self, expected_codex_thread_id: str | None
+            ) -> tuple[int, dict]:
+                self.discarded.append(expected_codex_thread_id)
+                if self.canonical_thread == expected_codex_thread_id:
+                    self.canonical_thread = None
+                return 200, {"acknowledged": True}
+
+        for canonical_before, canonical_after in (
+            ("thread-1", None),
+            ("thread-new", "thread-new"),
+        ):
+            with self.subTest(canonical_before=canonical_before):
+                with tempfile.TemporaryDirectory() as directory:
+                    state_dir = Path(directory) / "state"
+                    config = type("ConfigStub", (), {"state_dir": state_dir})()
+                    chat = object.__new__(bridge.ChatBridge)
+                    chat.config = config
+                    chat.cloud = OutageCloud()
+                    chat.logger = logging.getLogger("expired-completion-test")
+                    chat.heartbeat = lambda *_args, **_kwargs: None
+                    chat._generate = lambda _job: (
+                        json.dumps(swap_output()),
+                        "thread-1",
+                    )
+                    envelope = claim_envelope()
+                    envelope["job"]["leaseExpiresAt"] = 1
+                    job = bridge.validate_claim(envelope)
+                    assert job is not None
+
+                    with self.assertRaises(bridge.CompletionPending):
+                        chat.process_job(job)
+
+                    recovered = ExpiredLeaseCloud(canonical_before)
+                    bridge.flush_spools(config, recovered, chat.logger)
+
+                    self.assertEqual(recovered.discarded, ["thread-1"])
+                    self.assertEqual(recovered.canonical_thread, canonical_after)
+                    self.assertFalse(
+                        bridge.thread_discard_intent_path(config, job.id).exists()
+                    )
+                    self.assertFalse(bridge.spool_path(config, job.id).exists())
+                    self.assertEqual(
+                        len(list((state_dir / "spool" / "stale").glob("*.json"))),
+                        1,
+                    )
+
+    def test_failed_upload_intent_survives_lease_expiry_and_recovers(self) -> None:
+        class FailureOutageCloud:
+            def fail(
+                self, *_args: object, **_kwargs: object
+            ) -> tuple[int, dict]:
+                raise bridge.TransientError("failure upload unavailable")
+
+        class RecoveryCloud:
+            def __init__(self) -> None:
+                self.canonical_thread: str | None = "thread-1"
+
+            def discard_thread(
+                self, expected_codex_thread_id: str | None
+            ) -> tuple[int, dict]:
+                if self.canonical_thread == expected_codex_thread_id:
+                    self.canonical_thread = None
+                return 200, {"acknowledged": True}
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory) / "state"
+            config = type("ConfigStub", (), {"state_dir": state_dir})()
+            chat = object.__new__(bridge.ChatBridge)
+            chat.config = config
+            chat.cloud = FailureOutageCloud()
+            chat.logger = logging.getLogger("failure-upload-outage-test")
+            chat.heartbeat = lambda *_args, **_kwargs: None
+            chat._generate = lambda _job: (
+                '{"assistantText":"missing actionPlan"}',
+                "thread-1",
+            )
+            envelope = claim_envelope()
+            envelope["job"]["leaseExpiresAt"] = 1
+            job = bridge.validate_claim(envelope)
+            assert job is not None
+
+            with self.assertRaises(bridge.ModelOutputError):
+                chat.process_job(job)
+
+            intent_path = bridge.thread_discard_intent_path(config, job.id)
+            self.assertTrue(intent_path.is_file())
+            recovered = RecoveryCloud()
+            bridge.flush_thread_discard_intents(config, recovered, chat.logger)
+            self.assertIsNone(recovered.canonical_thread)
+            self.assertFalse(intent_path.exists())
+
+    def test_run_flushes_completions_then_discards_before_claim(self) -> None:
+        order: list[str] = []
+
+        class OrderingCloud:
+            def claim(self, _worker_id: str, _lease_ms: int) -> None:
+                order.append("claim")
+                return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = type(
+                "ConfigStub",
+                (),
+                {
+                    "state_dir": Path(directory) / "state",
+                    "poll_seconds": 1.0,
+                    "idle_max_poll_seconds": 2.0,
+                    "lease_duration_ms": 30_000,
+                },
+            )()
+            chat = object.__new__(bridge.ChatBridge)
+            chat.config = config
+            chat.cloud = OrderingCloud()
+            chat.logger = logging.getLogger("flush-order-test")
+            chat.worker_id = "worker-1"
+            chat.stop_requested = False
+            chat.app_server = None
+            chat.heartbeat = lambda *_args, **_kwargs: order.append("heartbeat")
+
+            with (
+                mock.patch.object(
+                    bridge,
+                    "flush_spools",
+                    side_effect=lambda *_args: order.append("completion"),
+                ),
+                mock.patch.object(
+                    bridge,
+                    "flush_thread_discard_intents",
+                    side_effect=lambda *_args: order.append("discard"),
+                ),
+                mock.patch.object(bridge.signal, "signal"),
+            ):
+                self.assertEqual(chat.run(once=True), bridge.EXIT_OK)
+
+        claim_index = order.index("claim")
+        self.assertEqual(order[claim_index - 2 : claim_index], ["completion", "discard"])
 
     def test_install_pruning_preserves_active_release_and_pending_spool(self) -> None:
         manager = Path(__file__).resolve().parents[1] / "manage_chat_bridge.sh"
