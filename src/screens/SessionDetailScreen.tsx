@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router'
 import { Header } from '../components/Header'
 import { SetLogger } from '../components/SetLogger'
 import { getExercisesByIds } from '../db/repositories/exercises'

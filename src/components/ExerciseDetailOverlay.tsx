@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { BarChart3, ChevronDown, ChevronLeft } from 'lucide-react'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import {
   CartesianGrid,
   Line,

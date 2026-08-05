@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { ArrowDown, ArrowUp, ChevronRight } from 'lucide-react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useParams } from 'react-router'
 import { Header } from '../components/Header'
 import { getExercise } from '../db/repositories/exercises'
 import {

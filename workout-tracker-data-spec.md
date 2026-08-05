@@ -1,6 +1,12 @@
-# Workout Tracker PWA — Data Spec
+# Workout Tracker PWA — Initial Data Spec (Historical)
 
-This document is the source of truth for the data layer. The main spec (`workout-tracker-spec.md`) describes *what the app does*; this document describes *how data is stored, queried, and computed*. If anything conflicts, this document wins for data-layer decisions.
+> **Status:** This document records the original data-layer design and is kept for
+> architectural history. The current schema is implemented in `src/db/schema.ts`,
+> current row types live in `src/db/types.ts`, and the versioned backup contract is
+> enforced by `src/db/repositories/exportImport.ts` and its tests.
+
+This document describes the initial six-table design. It is not the source of
+truth for the evolved application.
 
 ## 1. Storage choice
 
@@ -102,9 +108,10 @@ export interface LoggedSet {
 }
 ```
 
-## 3. Dexie schema definition
+## 3. Initial Dexie schema definition
 
-Use Dexie version 1 for the initial release. Index strings follow Dexie syntax: primary key first, then comma-separated secondary indexes. `++` denotes auto-increment (not used here — all ids are uuids). Compound indexes use `[a+b]`.
+The first release used Dexie version 1. The live application now carries forward
+that schema through later migrations; see `src/db/schema.ts`.
 
 ```ts
 import Dexie, { Table } from "dexie";
@@ -583,9 +590,11 @@ export const SEED_EXERCISES: Omit<Exercise, "id" | "createdAt">[] = [
 
 On first launch (when `exercises` table is empty), insert all seed exercises in a single transaction with freshly generated uuids and `createdAt = Date.now()`. Do not re-seed on subsequent launches even if the user deletes all exercises.
 
-## 8. JSON export / import format
+## 8. Initial JSON export / import format
 
-Format is a flat dump of every table. Versioned to allow future migrations.
+The original v1 shape below is superseded. The current v4 payload covers all
+twelve Dexie tables, accepts supported older payloads, validates relationships
+before clearing data, and enforces import size bounds.
 
 ```ts
 interface ExportPayload {
@@ -666,29 +675,13 @@ Rules:
 - Never silently drop fields. If removing a field, log a warning to console during upgrade.
 - Always preserve `LoggedSet` data through any migration. It's the irreplaceable user history.
 
-## 10. Testing checklist for the data layer
+## 10. Current validation
 
-Before considering the data layer done, verify:
+The repository now automates the original acceptance criteria and the later cloud
+and Coach invariants. Coverage includes seeding, program transactions, workout
+snapshots, dense set ordering, history/analytics calculations, schema-versioned
+backup round trips, malformed and oversized imports, snapshot compare-and-swap,
+proposal reservations, and receipt replay.
 
-- [ ] Seeding inserts all exercises on a fresh install, does not duplicate on second launch
-- [ ] All seed exercises have `hiddenFromLibrary: false` and `isCustom: false`
-- [ ] Creating a program with `isActive=1` deactivates the previous active program in the same transaction
-- [ ] Archiving the active program sets `archivedAt` and `isActive=0`
-- [ ] Programs and Exercises have no delete path; repository and UI both refuse
-- [ ] Deleting a `SessionTemplate` preserves associated `WorkoutSession`s with `sessionTemplateId=null` and intact `name` + `exerciseSnapshot`
-- [ ] Deleting a set in the middle of a sequence renumbers subsequent sets
-- [ ] Hidden exercises (`hiddenFromLibrary=true`) do not appear in picker queries but DO appear in per-exercise history and analytics
-- [ ] "Last session sets for exercise" returns sets from the most recent session only, ordered by `setNumber`, with no hard-coded set-count cap
-- [ ] Suggested next session wraps around after the last session in the program
-- [ ] Starting a session from the active program snapshots `programName` and `exerciseSnapshot` into the new `WorkoutSession`
-- [ ] Freestyle session start (no template) has `programName=null` and `exerciseSnapshot=[]`
-- [ ] Renaming the active program does NOT update `programName` on already-started sessions
-- [ ] Editing a `SessionTemplate` (swap exercise, reorder, change target sets/reps) does NOT alter `exerciseSnapshot` on past or in-progress `WorkoutSession`s
-- [ ] Starting a new session with a prior `completedAt === null` session sets the prior session's `completedAt` to the max `LoggedSet.loggedAt` (or `startedAt` if no sets), in the same transaction as the new insert
-- [ ] After invariant 12 fires, at most one in-progress session exists
-- [ ] `getResumableSession()` returns the in-progress session when it started today; returns undefined when it started yesterday or earlier
-- [ ] Past sessions remain editable indefinitely (no midnight lock)
-- [ ] Volume calc: a 225×10 bench press (primary chest, secondary triceps+shoulders) contributes 2250 to chest, 1125 to triceps, 1125 to shoulders (using default `SECONDARY_VOLUME_WEIGHT = 0.5`)
-- [ ] Weekly volume calculation matches a hand-computed example for at least 2 distinct weeks of test data
-- [ ] Export + Import round-trips losslessly (byte-for-byte equality of exported JSON before vs after)
-- [ ] Export includes all six tables; import replaces, not merges
+Run `npm test` for the TypeScript suites and `npm run test:automation` for the
+Python bridge, daily briefing runner, and SQLite backend smoke tests.

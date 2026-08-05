@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Bot, LoaderCircle, Sparkles, Trash2, WifiOff } from 'lucide-react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router'
 import { CoachActionCard } from '../components/CoachActionCard'
 import { CoachComposer } from '../components/CoachComposer'
 import { CoachMessageBody } from '../components/CoachMessageBody'
@@ -366,16 +366,23 @@ export function CoachScreen() {
     if (!ticket) return
     const isCurrent = () => requestGate.isCurrent(ticket)
     try {
-      const [live, nextRemote, transcript] = await Promise.all([
+      const [live, nextRemote, transcript] = await Promise.allSettled([
         buildLiveCoachContext(preferredSessionId),
         fetchCoachState(ticket.signal),
         fetchFullCoachTranscript(ticket.signal),
       ])
       if (!isCurrent()) return
-      setContext(live.context)
-      remoteRef.current = nextRemote
-      setRemote(nextRemote)
-      await ingestTranscript(transcript, true, ticket)
+      if (live.status === 'rejected') throw live.reason
+
+      // Local workout context remains useful when cloud auth or the coach bridge
+      // is unavailable, so publish it before handling either remote result.
+      setContext(live.value.context)
+      if (nextRemote.status === 'rejected') throw nextRemote.reason
+      if (transcript.status === 'rejected') throw transcript.reason
+
+      remoteRef.current = nextRemote.value
+      setRemote(nextRemote.value)
+      await ingestTranscript(transcript.value, true, ticket)
       if (isCurrent()) setPageError(null)
     } catch (caught) {
       if (isCurrent()) {

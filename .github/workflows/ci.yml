@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22.22.0
+          cache: npm
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+
+      - name: Validate application and automation
+        run: npm run validate
+
+      - name: Validate scripts and structured files
+        run: |
+          python3 -m compileall -q automation functions
+          bash -n automation/*.sh
+          python3 - <<'PY'
+          import glob
+          import json
+          import plistlib
+
+          for path in glob.glob('automation/*.plist'):
+              with open(path, 'rb') as source:
+                  plistlib.load(source)
+
+          for path in glob.glob('automation/*_schema.json'):
+              with open(path, encoding='utf-8') as source:
+                  json.load(source)
+          PY
+
+      - name: Apply all migrations to a fresh SQLite database
+        run: |
+          python3 - <<'PY'
+          import sqlite3
+          from pathlib import Path
+
+          connection = sqlite3.connect(':memory:')
+          connection.execute('PRAGMA foreign_keys = ON')
+          for path in sorted(Path('migrations').glob('*.sql')):
+              connection.executescript(path.read_text(encoding='utf-8'))
+
+          integrity = connection.execute('PRAGMA integrity_check').fetchone()
+          if integrity != ('ok',):
+              raise SystemExit(f'integrity_check failed: {integrity!r}')
+
+          foreign_keys = connection.execute('PRAGMA foreign_key_check').fetchall()
+          if foreign_keys:
+              raise SystemExit(f'foreign_key_check failed: {foreign_keys!r}')
+          PY

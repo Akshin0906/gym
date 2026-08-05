@@ -3,7 +3,7 @@ import {
   type BlockerFunction,
   type Location,
   useBlocker,
-} from 'react-router-dom'
+} from 'react-router'
 
 const DEFAULT_MESSAGE =
   'You have unsaved changes. Leave this page and discard them?'

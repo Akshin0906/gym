@@ -259,8 +259,7 @@ class Config:
             oura_root=Path(
                 os.environ.get(
                     "WORKOUT_OURA_ROOT",
-                    "/Users/Apple/Documents/Codex/2026-06-04/"
-                    "files-mentioned-by-the-user-pasted/outputs/oura-codex-health",
+                    automation_root / "oura-codex-health",
                 )
             ).expanduser(),
             app_url=os.environ.get(

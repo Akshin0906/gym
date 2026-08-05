@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { Check, CheckCircle2, ChevronRight, Plus, StickyNote } from 'lucide-react'
 import { CountUp } from '../components/CountUp'
 import { ExerciseDetailOverlay } from '../components/ExerciseDetailOverlay'

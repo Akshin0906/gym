@@ -1,36 +1,60 @@
 {
   "name": "workout-tracker",
+  "description": "Offline-first workout tracker with confirmation-gated AI coaching.",
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "homepage": "https://workout-tracker-ay9.pages.dev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Akshin0906/gym.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Akshin0906/gym/issues"
+  },
+  "engines": {
+    "node": ">=22.22.0",
+    "npm": ">=10.9.0"
+  },
+  "packageManager": "npm@11.12.1",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "deploy": "npm run build && npx --yes wrangler@4.119.0 pages deploy dist --project-name workout-tracker --branch main",
+    "lint": "eslint . --max-warnings 0",
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit",
-    "test": "vitest run"
+    "typecheck:tests": "tsc -p tsconfig.tests.json --noEmit",
+    "test": "vitest run",
+    "test:automation": "python3 -m unittest discover -s automation/tests -v && python3 -m unittest functions/api/chat/backend_sql_smoke.py -v",
+    "validate": "npm run lint && npm run typecheck && npm run typecheck:tests && npm test && npm run test:automation && npm run build"
   },
   "dependencies": {
     "date-fns": "^4.3.0",
     "dexie": "^4.0.10",
     "lucide-react": "^1.16.0",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
     "react-markdown": "^10.1.0",
-    "react-router-dom": "^7.1.1",
+    "react-router": "^8.3.0",
     "recharts": "^2.15.0",
     "remark-breaks": "^4.0.0",
     "remark-gfm": "^4.0.1",
     "zustand": "^5.0.2"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@tailwindcss/vite": "^4.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.4",
+    "eslint": "^10.8.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
     "fake-indexeddb": "^6.2.5",
+    "globals": "^17.9.0",
     "tailwindcss": "^4.0.0",
     "typescript": "~5.7.2",
+    "typescript-eslint": "^8.66.0",
     "vite": "^6.0.7",
     "vite-plugin-pwa": "^0.21.1",
     "vitest": "^4.1.7"

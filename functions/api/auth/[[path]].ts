@@ -229,9 +229,7 @@ export const onRequest = async (ctx: PagesContext): Promise<Response> => {
 
     return json(404, { error: 'not_found' })
   } catch (err) {
-    return json(500, {
-      error: 'internal_error',
-      detail: err instanceof Error ? err.message : String(err),
-    })
+    console.error('auth api failure', err)
+    return json(500, { error: 'internal_error' })
   }
 }

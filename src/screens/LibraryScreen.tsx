@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router'
 import { ChevronRight, Eye, EyeOff, Plus, Search } from 'lucide-react'
 import { Header, SettingsLink } from '../components/Header'
 import { ErrorAlert } from '../components/Feedback'

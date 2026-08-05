@@ -4,7 +4,11 @@ dev-dist
 .wrangler/
 .DS_Store
 *.local
+.claude/
 .env*
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
 *.log
 *.tsbuildinfo
 __pycache__/

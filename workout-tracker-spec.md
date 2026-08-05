@@ -1,16 +1,21 @@
-# Workout Tracker PWA — Spec
+# Workout Tracker PWA — Initial Product Spec (Historical)
+
+> **Status:** This is the original product brief retained as a design-history
+> artifact. The implemented application has expanded to include a version-checked
+> cloud mirror, Oura recovery data, AI Memory, and a confirmation-gated Coach.
+> [README.md](README.md) and the source code are the current references.
 
 ## 1. Overview
 
 A single-user Progressive Web App for logging hypertrophy training. Built to be opened in the gym, used to quickly log straight sets against a structured program, and reviewed occasionally on desktop for program planning and progress checking. IndexedDB remains the primary store; Phase 1 cloud sync mirrors snapshots to D1 after completed workouts and manual syncs so a laptop Codex automation can write the daily briefing.
 
-## 2. User profile (it's me)
+## 2. Original target user profile
 
 - Trains for hypertrophy / bodybuilding
 - Follows one structured program at a time, swaps programs every few months
 - Logs only working sets, only straight sets
 - Cares about: last session's numbers, weekly volume per muscle group, estimated 1RM trends
-- Doesn't care about: PRs as a feature, plate math, bodyweight exercises, supersets, warm-ups, Apple Health, watch integration
+- Deprioritizes PR celebrations, plate math, supersets, warm-up tracking, Apple Health, and watch integration
 
 ## 3. Core user flow (the gym flow)
 
@@ -66,11 +71,12 @@ A single-user Progressive Web App for logging hypertrophy training. Built to be 
 ### Data management
 - Export all data as JSON (single button → downloads file)
 - Import from JSON (for restore / device migration)
-- This matters: iOS evicts PWA storage after ~7 weeks of non-use, and there's no other sync mechanism
+- This remains important because the cloud feature is a snapshot mirror, not a substitute for portable user-owned backups
 
-## 5. Explicitly out of scope
+## 5. Original exclusions
 
-These were considered and rejected. Do not build them. Do not ask about them.
+These constraints defined the initial release. Later additions are documented in
+the current README and source.
 
 - Supersets, drop sets, giant sets, any set grouping
 - Warm-up set tracking (only working sets are logged)
@@ -85,7 +91,7 @@ These were considered and rejected. Do not build them. Do not ask about them.
 - Body measurements
 - Apple Health / HealthKit (impossible in a PWA anyway)
 - Apple Watch companion
-- Cloud sync / multi-device sync
+- Automatic multi-device merging (a version-checked single-user snapshot mirror was added later)
 - Sharing workouts with anyone
 - Social features of any kind
 - Auto-starting timers
@@ -190,9 +196,10 @@ type MuscleGroup =
 - **React Router** for navigation
 - **Cloudflare Pages** for hosting
 
-## 9. Build plan (vertical slices)
+## 9. Original build plan (completed)
 
-Build in this order. Each slice should be shippable and testable.
+The application was delivered in these vertical slices before the later cloud and
+Coach work:
 
 1. **Slice 0 — Foundation.** Scaffold Vite + React + TS + Tailwind + Dexie + vite-plugin-pwa. Verify PWA installs to iPhone home screen. Deploy "hello world" to Cloudflare Pages.
 2. **Slice 1 — Exercise library.** Seed ~50 hypertrophy exercises. CRUD UI. Search by name and muscle group. Persistent notes editable per exercise.
@@ -205,7 +212,7 @@ Build in this order. Each slice should be shippable and testable.
 9. **Slice 8 — Export / import.** JSON dump and restore.
 10. **Slice 9 — iOS PWA polish.** Apple meta tags, splash screen, status bar style, icons in all sizes. Test "Add to Home Screen" feels native.
 
-## 10. iOS PWA requirements (slice 9 detail)
+## 10. Original iOS PWA requirements
 
 - `apple-mobile-web-app-capable: yes`
 - `apple-mobile-web-app-status-bar-style: black-translucent`
@@ -215,8 +222,9 @@ Build in this order. Each slice should be shippable and testable.
 - Audio unlock pattern for the rest timer (first user gesture primes `AudioContext`)
 - `display: standalone` in manifest
 
-## 11. Open questions for implementation time
+## 11. Resolved implementation decisions
 
-- Exact seed exercise list (defer until Slice 1)
-- Visual design / color scheme (defer until Slice 0 is up; iterate)
-- Whether to use `<dialog>` modals or routed full-screens for editing forms (lean full-screens on mobile)
+- The seed catalog lives in `src/db/seed.ts`.
+- The shipped visual system is a dark, high-contrast mobile UI with a lime accent.
+- Primary editors use routed full-screen forms; focused confirmations use the
+  accessible dialog component.

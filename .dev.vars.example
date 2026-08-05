@@ -1,0 +1,4 @@
+# Copy to .dev.vars for local Pages Functions development.
+# Never use production values in a committed file.
+CLOUD_PAIRING_SECRET=replace-with-a-local-pairing-code
+CLOUD_AUTOMATION_SECRET=replace-with-a-local-automation-secret

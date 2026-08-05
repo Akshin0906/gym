@@ -150,7 +150,6 @@ describe('installAppViewportSizing', () => {
     expect(values.get(APP_VIEWPORT_HEIGHT_VAR)).toBe('844px')
 
     const runFrame = queuedFrame as FrameRequestCallback | null
-    queuedFrame = null
     runFrame?.(0)
     expect(values.get(APP_VIEWPORT_HEIGHT_VAR)).toBe('510px')
     expect(values.get(APP_VIEWPORT_TOP_VAR)).toBe('334px')

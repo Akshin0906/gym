@@ -11,7 +11,7 @@ import {
   startOfWeek,
   subMonths,
 } from 'date-fns'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { Trash2 } from 'lucide-react'
 import { ErrorAlert } from '../components/Feedback'
 import { Header, SettingsLink } from '../components/Header'

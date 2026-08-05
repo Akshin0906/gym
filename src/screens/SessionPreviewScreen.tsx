@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router'
 import { Play } from 'lucide-react'
 import { Header } from '../components/Header'
 import { db } from '../db/schema'

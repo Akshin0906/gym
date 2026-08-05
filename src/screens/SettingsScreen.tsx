@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router'
 import {
   Activity,
   AlertCircle,
@@ -19,6 +19,8 @@ import { ErrorAlert, Toast, type ToastNotice } from '../components/Feedback'
 import { Header } from '../components/Header'
 import { ensureAiMemorySettings } from '../db/repositories/aiMemory'
 import {
+  MAX_IMPORT_BYTES,
+  MAX_IMPORT_SIZE_LABEL,
   buildExportPayload,
   downloadExport,
   importPayload,
@@ -97,6 +99,11 @@ export function SettingsScreen() {
 
   async function handleImportFile(file: File) {
     if (importing) return
+    if (file.size > MAX_IMPORT_BYTES) {
+      setError(`Import file must be ${MAX_IMPORT_SIZE_LABEL} or smaller`)
+      if (fileRef.current) fileRef.current.value = ''
+      return
+    }
     if (
       !confirm(
         'This will REPLACE all current data. A backup of your current data will download first. Continue?',
@@ -229,12 +236,28 @@ function CloudSyncSection({
   }))
   const [syncing, setSyncing] = useState(false)
   const [checkingAuth, setCheckingAuth] = useState(false)
+  const checkingAuthRef = useRef(false)
   const [pairing, setPairing] = useState(false)
   const [unpairing, setUnpairing] = useState(false)
   const [pairingSecret, setPairingSecret] = useState('')
   const [deviceName, setDeviceName] = useState('Phone PWA')
   const [authError, setAuthError] = useState<string | null>(null)
   const configured = auth.paired
+
+  const refreshAuth = useCallback(async () => {
+    if (checkingAuthRef.current) return
+    checkingAuthRef.current = true
+    setCheckingAuth(true)
+    try {
+      setAuth(await getCloudAuthStatus())
+      setAuthError(null)
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : String(err))
+    } finally {
+      checkingAuthRef.current = false
+      setCheckingAuth(false)
+    }
+  }, [])
 
   useEffect(() => {
     void refreshAuth()
@@ -246,20 +269,7 @@ function CloudSyncSection({
         return { paired, device: paired ? prev.device : null }
       })
     })
-  }, [])
-
-  async function refreshAuth() {
-    if (checkingAuth) return
-    setCheckingAuth(true)
-    try {
-      setAuth(await getCloudAuthStatus())
-      setAuthError(null)
-    } catch (err) {
-      setAuthError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setCheckingAuth(false)
-    }
-  }
+  }, [refreshAuth])
 
   async function handlePair() {
     if (pairing) return

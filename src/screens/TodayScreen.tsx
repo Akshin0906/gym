@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { ArrowRight, MessageCircle, Play, Plus, Sparkles, Zap } from 'lucide-react'
 import { BackupBanner } from '../components/BackupBanner'
 import { ErrorAlert } from '../components/Feedback'

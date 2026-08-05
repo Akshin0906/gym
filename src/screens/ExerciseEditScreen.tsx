@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router'
 import { BarChart3, Check, Eye, EyeOff } from 'lucide-react'
 import { Header } from '../components/Header'
 import {

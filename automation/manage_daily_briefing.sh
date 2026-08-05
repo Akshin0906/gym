@@ -5,7 +5,7 @@ umask 077
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUNTIME_ROOT="${WORKOUT_AUTOMATION_RUNTIME:-$HOME/.workout-tracker-codex-daily}"
-OURA_SOURCE="${WORKOUT_OURA_SOURCE:-/Users/Apple/Documents/Codex/2026-06-04/files-mentioned-by-the-user-pasted/outputs/oura-codex-health}"
+OURA_SOURCE="${WORKOUT_OURA_SOURCE:-$RUNTIME_ROOT/oura-codex-health}"
 LABEL="com.workout-tracker.codex-daily-briefing"
 AWAKE_LABEL="com.workout-tracker.codex-keep-awake"
 AGENTS_DIR="$HOME/Library/LaunchAgents"

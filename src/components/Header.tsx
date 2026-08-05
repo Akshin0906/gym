@@ -1,5 +1,5 @@
 import { type ReactNode } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router'
 import { ChevronLeft, MessageCircle, Settings } from 'lucide-react'
 
 interface HeaderProps {

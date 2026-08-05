@@ -6,7 +6,6 @@ import {
   coachReceiptMatchesActionPlan,
   CoachReceiptAdoptionError,
   CoachMutationGate,
-  CoachProposalUnavailableError,
   CoachRemoteRequestGate,
   CoachSendRetryBuffer,
   finalizeFailedCoachProposal,
@@ -630,7 +629,9 @@ describe('Coach proposal reservation', () => {
       events.push('reserve')
       return current
     })
-    const apply = vi.fn(async (value: CoachProposal, context: string) => value.id)
+    const apply = vi.fn(
+      async (value: CoachProposal, _context: string) => value.id,
+    )
     apply.mockImplementation(async (value, context) => {
       events.push('apply')
       expect(context).toBe('fresh context')

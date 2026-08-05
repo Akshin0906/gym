@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router'
 import { Archive, CheckCircle2, Copy, Plus, Zap } from 'lucide-react'
 import { ErrorAlert } from '../components/Feedback'
 import { Header, SettingsLink } from '../components/Header'

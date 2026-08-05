@@ -18,6 +18,9 @@ import type {
 // Bump whenever the exported table set changes. v4 added Coach action receipts.
 const SCHEMA_VERSION = 4
 const APP_VERSION = '0.1.0'
+export const MAX_IMPORT_BYTES = 20_000_000
+export const MAX_IMPORT_SIZE_LABEL = '20 MB'
+export const MAX_IMPORT_ROWS_PER_TABLE = 100_000
 
 export interface ExportPayload {
   schemaVersion: number
@@ -533,7 +536,10 @@ function assertRelationships(data: ExportPayload['data']): void {
   )
 }
 
-function validatePayload(raw: unknown): ExportPayload {
+function validatePayload(
+  raw: unknown,
+  maxRowsPerTable?: number,
+): ExportPayload {
   if (!isObject(raw)) throw new Error('Import file is not an object')
   if (
     raw.schemaVersion !== 1 &&
@@ -568,6 +574,15 @@ function validatePayload(raw: unknown): ExportPayload {
         )
       }
       continue
+    }
+    if (
+      maxRowsPerTable !== undefined &&
+      Array.isArray(value) &&
+      value.length > maxRowsPerTable
+    ) {
+      throw new Error(
+        `Import table "${table}" exceeds the ${maxRowsPerTable.toLocaleString('en-US')}-row limit`,
+      )
     }
     const validator: (item: unknown) => boolean = tableValidators[table]
     if (!isArrayOf(value, validator)) {
@@ -614,11 +629,27 @@ function validatePayload(raw: unknown): ExportPayload {
   return payload
 }
 
+export function assertImportByteLength(byteLength: number): void {
+  if (
+    !Number.isSafeInteger(byteLength) ||
+    byteLength < 0 ||
+    byteLength > MAX_IMPORT_BYTES
+  ) {
+    throw new Error(`Import file must be ${MAX_IMPORT_SIZE_LABEL} or smaller`)
+  }
+}
+
 export async function importPayload(rawJson: string): Promise<{
   imported: Record<string, number>
 }> {
+  // Reject obviously oversized strings before asking TextEncoder for another
+  // allocation. UTF-8 is never smaller than the JavaScript string length.
+  if (rawJson.length > MAX_IMPORT_BYTES) {
+    assertImportByteLength(rawJson.length)
+  }
+  assertImportByteLength(new TextEncoder().encode(rawJson).byteLength)
   const parsed: unknown = JSON.parse(rawJson)
-  const payload = validatePayload(parsed)
+  const payload = validatePayload(parsed, MAX_IMPORT_ROWS_PER_TABLE)
   await db.transaction('rw', db.tables, async () => {
     await Promise.all(db.tables.map((t) => t.clear()))
     await db.exercises.bulkAdd(payload.data.exercises)

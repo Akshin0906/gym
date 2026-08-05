@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import {
   isWithinPairAttemptLimit,
@@ -1785,6 +1785,42 @@ describe('atomic pairing rate limit', () => {
     })
     expect(response.status).toBe(400)
     expect(await response.json()).toEqual({ error: 'invalid_pairing_request' })
+  })
+
+  it('logs internal failures without exposing their details to callers', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const db: D1Database = {
+      prepare() {
+        throw new Error('sensitive database detail')
+      },
+      async batch<T>() {
+        return [] as D1Result<T>[]
+      },
+    }
+
+    try {
+      const response = await authOnRequest({
+        request: new Request('https://gym.test/api/auth/cloud', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'cf-connecting-ip': '203.0.113.7',
+          },
+          body: JSON.stringify({ pairingSecret: 'secret' }),
+        }),
+        env: { CLOUD_PAIRING_SECRET: 'secret', WORKOUT_DB: db },
+        params: { path: 'cloud' },
+      })
+
+      expect(response.status).toBe(500)
+      expect(await response.json()).toEqual({ error: 'internal_error' })
+      expect(consoleError).toHaveBeenCalledWith(
+        'auth api failure',
+        expect.any(Error),
+      )
+    } finally {
+      consoleError.mockRestore()
+    }
   })
 })
 

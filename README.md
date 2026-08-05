@@ -1,87 +1,148 @@
 # Gym
 
-Gym is a mobile-first progressive web app for planning training, logging
-workouts, reviewing progress, and getting context-aware coaching.
+[![CI](https://github.com/Akshin0906/gym/actions/workflows/ci.yml/badge.svg)](https://github.com/Akshin0906/gym/actions/workflows/ci.yml)
+[![Live demo](https://img.shields.io/badge/live-demo-b7ff3c?style=flat&labelColor=171717)](https://workout-tracker-ay9.pages.dev)
 
-## Highlights
+Gym is a mobile-first, offline-first workout tracker for planning hypertrophy
+training, logging sets quickly, reviewing progress, and working with a
+confirmation-gated AI coach.
 
-- Build an exercise library, training programs, sessions, and workout targets.
-- Start workouts, log and edit sets, track rest, and review workout history and
-  progress charts.
-- Export and import workout data for portable backups.
-- Pair a device with the cloud mirror for authenticated, conflict-safe sync.
-- Connect Oura recovery data for recovery-aware daily insights when available.
+<p align="center">
+  <a href="https://workout-tracker-ay9.pages.dev">
+    <img src="docs/screenshots/today.png" width="360" alt="Gym Today screen showing a planned workout and recent training summary" />
+  </a>
+</p>
 
-## AI Coach
+**[Try the live app](https://workout-tracker-ay9.pages.dev)** — the exercise
+library and all local workout features work without an account. Cloud snapshots,
+Oura data, and the AI Coach require private credentials and are intentionally not
+enabled for public visitors.
 
-The in-app Coach is intentionally confirmation-gated: it can suggest a memory
-note, program change, workout change, or custom exercise, but it cannot alter
-training data silently. The phone validates and applies a proposal locally,
-then synchronizes a durable receipt to the cloud.
+## What it demonstrates
 
-The Coach backend uses a local Codex bridge and Cloudflare D1 as the canonical
-transcript. It protects against duplicate work, stale snapshots, concurrent
-device changes, retry replays, and interrupted bridge sessions. See
-[automation/README.md](automation/README.md) for the daily-insight and Coach
-bridge architecture.
+- An installable React PWA that remains useful offline and stores workout data in
+  IndexedDB through Dexie.
+- Complete exercise, program, workout, history, backup, and analytics flows built
+  for a phone-sized gym interface.
+- Cloudflare Pages Functions and D1 endpoints with session hashing, atomic rate
+  limiting, version-checked snapshots, lease ownership, idempotent receipts, and
+  stale-write protection.
+- An AI Coach that may propose memories, exercises, programs, or workout changes,
+  but cannot mutate trusted training data until the user confirms the action on
+  the phone.
+- A failure-aware local automation bridge with bounded retries, durable spooling,
+  constrained Codex execution, and recovery across interrupted sessions.
+
+## Product tour
+
+- **Today:** resume an active workout or start the next session in the active
+  program.
+- **Workout:** compare prior performance, log/edit/delete sets, swap exercises,
+  and run a persistent rest timer.
+- **Programs and library:** build reusable training templates, reorder sessions,
+  edit targets, and manage custom exercises without losing history.
+- **History and stats:** review completed sessions, muscle-group volume, and
+  estimated one-rep-max trends.
+- **Coach and AI Memory:** chat over a bounded training context and explicitly
+  approve every proposed data change.
+- **Settings:** export/import validated JSON backups, request persistent browser
+  storage, pair a cloud mirror, and optionally connect Oura recovery data.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    User[Phone or desktop] --> PWA[React PWA]
+    PWA <--> IDB[(IndexedDB / Dexie)]
+    PWA <--> Edge[Cloudflare Pages Functions]
+    Edge <--> D1[(Cloudflare D1)]
+    Edge <--> Oura[Oura API]
+    Bridge[Local automation bridge] <--> Edge
+    Bridge <--> Codex[Codex App Server]
+```
+
+IndexedDB remains the trusted workout store. D1 holds an authenticated snapshot
+mirror plus the Coach queue, transcript, action reservations, and receipts. The
+bridge receives a narrowly scoped automation credential; the constrained Codex
+subprocess receives neither that secret nor network/tool access. See
+[automation/README.md](automation/README.md) for the detailed bridge and daily
+briefing design.
+
+## Engineering highlights
+
+- **Offline and resilient:** route chunks and assets are precached, active
+  workouts survive reloads, and backup imports validate the complete graph before
+  replacing any local data.
+- **Race-safe cloud writes:** snapshot compare-and-swap, reservation ownership,
+  logout fencing, and exact receipt replay prevent duplicate or stale Coach
+  actions.
+- **Safe rendering:** assistant Markdown supports GFM tables and links without
+  accepting raw HTML, while user-authored messages remain plain text.
+- **Release discipline:** the repository runs TypeScript, ESLint, Vitest, Python
+  automation tests, SQLite smoke tests, migration checks, shell validation, an
+  npm security audit, and a production build in CI.
 
 ## Stack
 
 - React 19, TypeScript, Vite, Tailwind CSS, and React Router
-- IndexedDB via Dexie for offline-first local workout data
-- Cloudflare Pages Functions and D1 for cloud sync and Coach coordination
-- Vitest for application and backend validation
-- PWA support through `vite-plugin-pwa`
+- Dexie and IndexedDB for local-first persistence
+- Cloudflare Pages Functions and D1 for the cloud boundary
+- Vitest plus Python/SQLite validation for application and backend behavior
+- `vite-plugin-pwa` for the manifest, service worker, and installable experience
 
 ## Local development
 
-Prerequisites: Node.js 20+ and npm.
+Requirements: Node.js 22.22 or newer, npm 10.9 or newer, and Python 3.10 or
+newer for the automation tests.
 
 ```bash
 npm ci
 npm run dev
 ```
 
-Useful checks:
+Run the same core gate used by CI:
 
 ```bash
-npm test
-npm run typecheck
-npm run build
-npx tsc -p tsconfig.functions.json --noEmit
+npm run validate
+npm audit --audit-level=high
 ```
 
-## Cloud setup and deployment
+For local Pages Functions, copy `.dev.vars.example` to `.dev.vars`, use only
+local throwaway values, build the app, and run Wrangler against an isolated D1
+directory.
 
-The Pages/D1 configuration is in [wrangler.toml](wrangler.toml). Create the D1
-database, update its ID in that file, then apply migrations:
+## Cloud deployment
+
+The production configuration is in [wrangler.toml](wrangler.toml). Runtime
+secrets belong in Cloudflare, never in Git:
 
 ```bash
-npx wrangler d1 migrations apply workout-tracker --remote
+npx --yes wrangler@4.119.0 pages secret put CLOUD_PAIRING_SECRET \
+  --project-name workout-tracker
+npx --yes wrangler@4.119.0 pages secret put CLOUD_AUTOMATION_SECRET \
+  --project-name workout-tracker
 ```
 
-Set these runtime secrets with Wrangler; never commit them:
+Apply pending D1 migrations before deploying code that depends on them, then use
+the pinned deployment script:
 
 ```bash
-npx wrangler pages secret put CLOUD_PAIRING_SECRET --project-name workout-tracker
-npx wrangler pages secret put CLOUD_AUTOMATION_SECRET --project-name workout-tracker
+npx --yes wrangler@4.119.0 d1 migrations apply workout-tracker --remote
+npm run deploy
 ```
 
-Build and deploy:
+## Security, privacy, and scope
 
-```bash
-npm run build
-npx wrangler pages deploy dist --project-name workout-tracker --branch main
-```
-
-## Data and security notes
-
-Local automation state, logs, environment files, and build output are excluded
-from version control. Cloud writes use snapshot version checks, and AI action
-receipts are verified before they become final. The local Codex bridge receives
-no cloud secret and runs with constrained capabilities.
+- Workout data is local by default. The cloud feature is a version-checked
+  single-user mirror, not an automatic multi-device merge service.
+- Oura's OAuth access token is stored only in that browser's local storage and is
+  sent through an allowlisted same-origin proxy; disconnecting removes it.
+- Local automation state, logs, credentials, database snapshots, and build output
+  are ignored by Git.
+- The coaching and recovery features are informational training tools, not
+  medical advice.
 
 ## License
 
-No license has been selected yet. Until one is added, the repository's source
-code is not licensed for third-party reuse.
+No license has been selected. Until one is added, the source is publicly viewable
+but is not licensed for third-party reuse.

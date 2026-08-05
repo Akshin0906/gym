@@ -43,8 +43,13 @@ insight.
 
 ## Install or update
 
+The daily briefing optionally consumes a separate local Oura companion checkout.
+Point the first install at that checkout; later updates can reuse the staged copy
+under the private runtime directory.
+
 ```bash
-/Users/Apple/Documents/gym/automation/manage_daily_briefing.sh install
+WORKOUT_OURA_SOURCE=/absolute/path/to/oura-codex-health \
+  ./automation/manage_daily_briefing.sh install
 ```
 
 The same command with `update` stages and validates a new release, coordinates
@@ -56,19 +61,19 @@ Useful commands:
 
 ```bash
 # Verify the Codex binary, ChatGPT login, credentials, Oura state, and files.
-/Users/Apple/Documents/gym/automation/manage_daily_briefing.sh doctor
+./automation/manage_daily_briefing.sh doctor
 
 # Show the durable runner status and both launch agents.
-/Users/Apple/Documents/gym/automation/manage_daily_briefing.sh status
+./automation/manage_daily_briefing.sh status
 
 # Run immediately, bypassing only the clock gate.
-/Users/Apple/Documents/gym/automation/manage_daily_briefing.sh run-now
+./automation/manage_daily_briefing.sh run-now
 
 # Generate and validate without publishing.
-/Users/Apple/Documents/gym/automation/manage_daily_briefing.sh run-now --dry-run
+./automation/manage_daily_briefing.sh run-now --dry-run
 
 # Intentionally replace today's briefing.
-/Users/Apple/Documents/gym/automation/manage_daily_briefing.sh run-now --force
+./automation/manage_daily_briefing.sh run-now --force
 ```
 
 `sync_launchd_runtime.sh` remains as a compatibility alias for `update`.
@@ -116,7 +121,7 @@ For a manual run, environment variables can override them:
 ```bash
 WORKOUT_CODEX_MODEL=gpt-5.6-sol \
 WORKOUT_CODEX_REASONING_EFFORT=xhigh \
-/Users/Apple/Documents/gym/automation/manage_daily_briefing.sh run-now
+./automation/manage_daily_briefing.sh run-now
 ```
 
 The runner discovers the CLI from `WORKOUT_CODEX_BIN`, the current ChatGPT app,
@@ -125,10 +130,9 @@ the legacy Codex app, then `PATH`. This prevents another app-rename failure.
 ## Validation
 
 ```bash
-python3 -m unittest discover \
-  -s /Users/Apple/Documents/gym/automation/tests -v
-bash -n /Users/Apple/Documents/gym/automation/*.sh
-plutil -lint /Users/Apple/Documents/gym/automation/*.plist
+python3 -m unittest discover -s automation/tests -v
+bash -n automation/*.sh
+plutil -lint automation/*.plist
 ```
 
 ## Local Coach chat bridge
@@ -169,9 +173,9 @@ an OpenAI API key.
 Install or update it independently from the daily briefing:
 
 ```bash
-/Users/Apple/Documents/gym/automation/manage_chat_bridge.sh install
-/Users/Apple/Documents/gym/automation/manage_chat_bridge.sh doctor
-/Users/Apple/Documents/gym/automation/manage_chat_bridge.sh status
+./automation/manage_chat_bridge.sh install
+./automation/manage_chat_bridge.sh doctor
+./automation/manage_chat_bridge.sh status
 ```
 
 The launch agent wraps the bridge in `caffeinate -s`, which prevents system

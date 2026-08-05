@@ -4,7 +4,7 @@ import {
   Outlet,
   RouterProvider,
   useLocation,
-} from 'react-router-dom'
+} from 'react-router'
 import { Layout } from './components/Layout'
 import { RouteErrorBoundary, RouteLoading } from './components/RouteFeedback'
 import { TodayScreen } from './screens/TodayScreen'

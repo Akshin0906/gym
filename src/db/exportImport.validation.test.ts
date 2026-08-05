@@ -1,7 +1,12 @@
 import 'fake-indexeddb/auto'
 import { beforeEach, describe, expect, it } from 'vitest'
 import { db } from './schema'
-import { importPayload } from './repositories/exportImport'
+import {
+  assertImportByteLength,
+  importPayload,
+  MAX_IMPORT_BYTES,
+  MAX_IMPORT_ROWS_PER_TABLE,
+} from './repositories/exportImport'
 import type { Exercise } from './types'
 
 function exercise(id = 'exercise-1'): Exercise {
@@ -45,6 +50,21 @@ beforeEach(async () => {
 })
 
 describe('import semantic validation', () => {
+  it('rejects oversized files and oversized tables before changing data', async () => {
+    expect(() => assertImportByteLength(MAX_IMPORT_BYTES + 1)).toThrow(
+      '20 MB or smaller',
+    )
+
+    await db.exercises.add(exercise('existing'))
+    const value = payload()
+    value.data.exercises = new Array(MAX_IMPORT_ROWS_PER_TABLE + 1).fill(null)
+
+    await expect(importPayload(JSON.stringify(value))).rejects.toThrow(
+      '100,000-row limit',
+    )
+    expect(await db.exercises.get('existing')).toBeDefined()
+  })
+
   it('rejects arrays where an object is required', async () => {
     await expect(importPayload(JSON.stringify([]))).rejects.toThrow(
       'Import file is not an object',
