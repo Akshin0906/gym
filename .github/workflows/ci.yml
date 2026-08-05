@@ -13,9 +13,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  validate:
+  application:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 15
 
     steps:
       - name: Check out repository
@@ -38,8 +38,13 @@ jobs:
       - name: Audit dependencies
         run: npm audit --audit-level=high
 
-      - name: Validate application and automation
-        run: npm run validate
+      - name: Validate application
+        run: |
+          npm run lint
+          npm run typecheck
+          npm run typecheck:tests
+          npm test
+          npm run build
 
       - name: Validate scripts and structured files
         run: |
@@ -78,3 +83,21 @@ jobs:
           if foreign_keys:
               raise SystemExit(f'foreign_key_check failed: {foreign_keys!r}')
           PY
+
+  macos-automation:
+    runs-on: macos-14
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Validate macOS automation and backend SQL
+        run: |
+          python3 -m unittest discover -s automation/tests -v
+          python3 -m unittest functions/api/chat/backend_sql_smoke.py -v
