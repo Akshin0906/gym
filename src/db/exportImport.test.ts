@@ -151,6 +151,76 @@ describe('export/import round-trip', () => {
     ).toThrow('futureTable')
   })
 
+  it('round-trips a historical workout with sparse exercise order values', async () => {
+    await db.exercises.bulkAdd([exercise('ex-a'), exercise('ex-b')])
+    await db.workoutSessions.add({
+      id: 'session-sparse-history',
+      sessionTemplateId: null,
+      programId: null,
+      name: 'Historical workout',
+      programName: null,
+      exerciseSnapshot: [
+        {
+          exerciseId: 'ex-a',
+          order: 0,
+          targetSets: 3,
+          targetRepRange: '8-10',
+        },
+        {
+          exerciseId: 'ex-b',
+          order: 2,
+          targetSets: 3,
+          targetRepRange: '10-12',
+        },
+      ],
+      startedAt: 1,
+      completedAt: 2,
+    })
+
+    const payload = await buildExportPayload()
+    expect(
+      payload.data.workoutSessions[0].exerciseSnapshot.map((row) => row.order),
+    ).toEqual([0, 2])
+
+    await importPayload(JSON.stringify(payload))
+    expect(
+      (await db.workoutSessions.get('session-sparse-history'))?.exerciseSnapshot.map(
+        (row) => row.order,
+      ),
+    ).toEqual([0, 2])
+  })
+
+  it('rejects duplicate exercise order values within a workout snapshot', async () => {
+    await db.exercises.bulkAdd([exercise('ex-a'), exercise('ex-b')])
+    await db.workoutSessions.add({
+      id: 'session-duplicate-order',
+      sessionTemplateId: null,
+      programId: null,
+      name: 'Malformed workout',
+      programName: null,
+      exerciseSnapshot: [
+        {
+          exerciseId: 'ex-a',
+          order: 0,
+          targetSets: 3,
+          targetRepRange: '8-10',
+        },
+        {
+          exerciseId: 'ex-b',
+          order: 0,
+          targetSets: 3,
+          targetRepRange: '10-12',
+        },
+      ],
+      startedAt: 1,
+      completedAt: 2,
+    })
+
+    await expect(buildExportPayload()).rejects.toThrow(
+      'Import table "workoutSessions" is missing or malformed',
+    )
+  })
+
   it('refuses to produce a backup containing a corrupt local receipt', async () => {
     await db.chatActionReceipts.add({
       proposalId: 'proposal-corrupt',

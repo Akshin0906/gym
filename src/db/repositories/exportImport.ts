@@ -185,6 +185,10 @@ function hasUniqueStrings(values: string[]): boolean {
   return new Set(values).size === values.length
 }
 
+function hasUniqueNumbers(values: number[]): boolean {
+  return new Set(values).size === values.length
+}
+
 function isRealDate(value: unknown): value is string {
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
     return false
@@ -271,7 +275,10 @@ function isSessionSnapshot(value: unknown): boolean {
     exerciseIds.push(item.exerciseId)
     orders.push(item.order)
   }
-  return hasUniqueStrings(exerciseIds) && hasDenseOrder(orders)
+  // Historical workout snapshots preserve their original sort positions.
+  // Those positions can legitimately contain gaps after a workout was edited,
+  // so require uniqueness without rewriting history into a dense sequence.
+  return hasUniqueStrings(exerciseIds) && hasUniqueNumbers(orders)
 }
 
 function isWorkoutSession(value: unknown): value is WorkoutSession {
