@@ -37,7 +37,7 @@ from zoneinfo import ZoneInfo
 RUNNER_VERSION = "3.1"
 PROMPT_VERSION = "2026-08-05"
 VALIDATOR_COMPATIBILITY_VERSION = "2026-08-05-periodic-deferral-v3"
-DEFAULT_CODEX_MODEL = "gpt-5.6-terra"
+DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 DEFAULT_CODEX_REASONING_EFFORT = "xhigh"
 PACIFIC = ZoneInfo("America/Los_Angeles")
 MODES = {"push", "normal", "light", "deload", "rest"}

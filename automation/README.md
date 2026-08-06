@@ -110,7 +110,7 @@ item.
 
 Launchd uses these safe defaults:
 
-- Model: `gpt-5.6-terra`
+- Model: `gpt-5.6-sol`
 - Reasoning effort: Extra High (`xhigh`)
 - Codex timeout: 20 minutes
 - Oura sync and briefing window: 45 days
@@ -119,7 +119,7 @@ Launchd uses these safe defaults:
 For a manual run, environment variables can override them:
 
 ```bash
-WORKOUT_CODEX_MODEL=gpt-5.6-terra \
+WORKOUT_CODEX_MODEL=gpt-5.6-sol \
 WORKOUT_CODEX_REASONING_EFFORT=xhigh \
 ./automation/manage_daily_briefing.sh run-now
 ```

@@ -197,9 +197,9 @@ def summary_item(
 
 
 class EnvTests(unittest.TestCase):
-    def test_daily_briefing_model_defaults_to_terra_and_allows_override(self) -> None:
+    def test_daily_briefing_model_defaults_to_sol_and_allows_override(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(runner.Config.from_env().codex_model, "gpt-5.6-terra")
+            self.assertEqual(runner.Config.from_env().codex_model, "gpt-5.6-sol")
         with mock.patch.dict(
             os.environ, {"WORKOUT_CODEX_MODEL": "fixture-model"}, clear=True
         ):
@@ -359,7 +359,7 @@ class EnvTests(unittest.TestCase):
             self.assertIn("--ignore-user-config", command)
             self.assertIn("--ignore-rules", command)
             model_index = command.index("--model")
-            self.assertEqual(command[model_index + 1], "gpt-5.6-terra")
+            self.assertEqual(command[model_index + 1], "gpt-5.6-sol")
             configs = [
                 command[index + 1]
                 for index, value in enumerate(command[:-1])

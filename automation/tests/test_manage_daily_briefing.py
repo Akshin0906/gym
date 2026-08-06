@@ -472,7 +472,7 @@ class ManageDailyBriefingTests(unittest.TestCase):
         )
         self.assertEqual(
             daily_plist["EnvironmentVariables"]["WORKOUT_CODEX_MODEL"],
-            "gpt-5.6-terra",
+            "gpt-5.6-sol",
         )
 
         release_id = Path(new_current).name

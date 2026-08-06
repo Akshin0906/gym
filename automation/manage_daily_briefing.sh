@@ -134,7 +134,7 @@ run_installed_runner() {
     WORKOUT_ENV_FILE="$RUNTIME_ROOT/credentials.env" \
     WORKOUT_OURA_ROOT="$OURA_LIVE" \
     WORKOUT_CODEX_HOME="$CODEX_HOME_TARGET" \
-    WORKOUT_CODEX_MODEL="${WORKOUT_CODEX_MODEL:-gpt-5.6-terra}" \
+    WORKOUT_CODEX_MODEL="${WORKOUT_CODEX_MODEL:-gpt-5.6-sol}" \
     WORKOUT_CODEX_REASONING_EFFORT="${WORKOUT_CODEX_REASONING_EFFORT:-xhigh}" \
     "$RUNTIME_ROOT/current/run_codex_daily_briefing.sh" "$@"
 }
