@@ -197,6 +197,14 @@ def summary_item(
 
 
 class EnvTests(unittest.TestCase):
+    def test_daily_briefing_model_defaults_to_terra_and_allows_override(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(runner.Config.from_env().codex_model, "gpt-5.6-terra")
+        with mock.patch.dict(
+            os.environ, {"WORKOUT_CODEX_MODEL": "fixture-model"}, clear=True
+        ):
+            self.assertEqual(runner.Config.from_env().codex_model, "fixture-model")
+
     def test_parse_env_reads_only_exact_key_without_evaluating_shell(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / ".env"
@@ -350,6 +358,8 @@ class EnvTests(unittest.TestCase):
             )
             self.assertIn("--ignore-user-config", command)
             self.assertIn("--ignore-rules", command)
+            model_index = command.index("--model")
+            self.assertEqual(command[model_index + 1], "gpt-5.6-terra")
             configs = [
                 command[index + 1]
                 for index, value in enumerate(command[:-1])
@@ -768,7 +778,7 @@ class OutputValidationTests(unittest.TestCase):
             today=today,
             run_id="test-run",
             prompt_hash="abc123",
-            model="gpt-5.6-sol",
+            model=runner.DEFAULT_CODEX_MODEL,
             reasoning_effort="xhigh",
             codex_version="codex-cli test",
             generated_at=self.updated_at + 1,
@@ -778,11 +788,12 @@ class OutputValidationTests(unittest.TestCase):
         validated = self.validate(model_output(self.updated_at))
         briefing = validated["briefing"]
         self.assertEqual(briefing["source"], "codex-local")
-        self.assertEqual(briefing["model"], "gpt-5.6-sol")
+        self.assertEqual(briefing["model"], runner.DEFAULT_CODEX_MODEL)
         self.assertEqual(briefing["snapshotUpdatedAt"], self.updated_at)
         self.assertEqual(briefing["inputSummary"]["modelReasoningEffort"], "xhigh")
         self.assertEqual(briefing["inputSummary"]["workoutCount"], 1)
         self.assertEqual(briefing["inputSummary"]["newMemoryItemCount"], 1)
+        self.assertEqual(briefing["inputSummary"]["deferredMemoryItemIds"], [])
 
     def test_supervisor_constructs_trusted_memory_state(self) -> None:
         snapshot_start = pacific_ms(2026, 7, 1)
@@ -900,7 +911,7 @@ class OutputValidationTests(unittest.TestCase):
     def test_runner_owns_new_item_metadata_and_timestamps(self) -> None:
         validated = self.validate(model_output(self.updated_at))
         new_item = validated["memory"]["items"][0]
-        self.assertEqual(new_item["model"], "gpt-5.6-sol")
+        self.assertEqual(new_item["model"], runner.DEFAULT_CODEX_MODEL)
         self.assertEqual(new_item["createdAt"], self.updated_at + 1)
         self.assertEqual(new_item["updatedAt"], self.updated_at + 1)
         self.assertEqual(new_item["snapshotUpdatedAt"], self.updated_at)
@@ -977,6 +988,116 @@ class OutputValidationTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(runner.ConfigError, "unknown AI note"):
             self.validate(invalid_note, facts=facts)
+
+    def test_omitted_two_week_summary_is_deferred_without_advancing_cursor(self) -> None:
+        start = pacific_ms(2026, 7, 1)
+        end = pacific_ms(2026, 7, 15)
+        facts = self.facts_with_memory(window_started_at=start)
+
+        validated = self.validate(model_output(self.updated_at), facts=facts)
+
+        self.assertEqual(validated["memory"]["state"]["windowStartedAt"], start)
+        self.assertEqual(
+            validated["briefing"]["inputSummary"]["deferredMemoryItemIds"],
+            [f"two_week:{start}:{end}"],
+        )
+        self.assertEqual(
+            [item["memoryType"] for item in validated["memory"]["items"]],
+            ["workout"],
+        )
+
+    def test_deferred_two_week_summary_blocks_dependent_four_month_rollup(self) -> None:
+        two_week_start = pacific_ms(2026, 7, 18)
+        two_week_end = pacific_ms(2026, 8, 1)
+        four_month_start = pacific_ms(2026, 4, 1)
+        four_month_end = pacific_ms(2026, 8, 1)
+        facts = self.facts_with_memory(
+            window_started_at=two_week_start,
+            four_month_started_at=four_month_start,
+        )
+
+        validated = self.validate(model_output(self.updated_at), facts=facts)
+
+        self.assertEqual(
+            validated["memory"]["state"]["windowStartedAt"], two_week_start
+        )
+        self.assertEqual(
+            validated["memory"]["state"]["fourMonthStartedAt"],
+            four_month_start,
+        )
+        self.assertEqual(
+            validated["briefing"]["inputSummary"]["deferredMemoryItemIds"],
+            [
+                f"two_week:{two_week_start}:{two_week_end}",
+                f"four_month:{four_month_start}:{four_month_end}",
+            ],
+        )
+
+        invalid = model_output(self.updated_at)
+        invalid["memory"]["newItems"].append(
+            summary_item(
+                "four_month",
+                four_month_start,
+                four_month_end,
+                source_summary_ids=[
+                    f"two_week:{two_week_start}:{two_week_end}"
+                ],
+            )
+        )
+        with self.assertRaisesRegex(runner.ConfigError, "deferred summary"):
+            self.validate(invalid, facts=facts)
+
+    def test_valid_two_week_can_advance_while_four_month_is_deferred(self) -> None:
+        two_week_start = pacific_ms(2026, 7, 18)
+        two_week_end = pacific_ms(2026, 8, 1)
+        four_month_start = pacific_ms(2026, 4, 1)
+        four_month_end = pacific_ms(2026, 8, 1)
+        facts = self.facts_with_memory(
+            window_started_at=two_week_start,
+            four_month_started_at=four_month_start,
+        )
+        output = model_output(self.updated_at)
+        output["memory"]["newItems"].append(
+            summary_item("two_week", two_week_start, two_week_end)
+        )
+
+        validated = self.validate(output, facts=facts)
+
+        self.assertEqual(
+            validated["memory"]["state"]["windowStartedAt"], two_week_end
+        )
+        self.assertEqual(
+            validated["memory"]["state"]["fourMonthStartedAt"],
+            four_month_start,
+        )
+        self.assertEqual(
+            validated["briefing"]["inputSummary"]["deferredMemoryItemIds"],
+            [f"four_month:{four_month_start}:{four_month_end}"],
+        )
+
+    def test_prompt_includes_supervisor_candidate_plan_as_untrusted_data(self) -> None:
+        start = pacific_ms(2026, 7, 1)
+        facts = self.facts_with_memory(window_started_at=start)
+        with tempfile.TemporaryDirectory() as temp:
+            config = test_config(Path(temp))
+            prompt = runner.build_model_prompt(
+                config,
+                facts=facts,
+                today="2026-08-01",
+                now=dt.datetime(2026, 8, 1, 10, 30, tzinfo=PACIFIC),
+                run_id="test-run",
+                prompt_hash="abc123",
+                snapshot_body={"snapshot": facts.snapshot},
+                memory_body={"revision": 0, "state": None, "items": []},
+                recovery=self.recovery,
+            )
+
+        trusted_start = prompt.index("## Trusted run context")
+        untrusted_start = prompt.index("## Untrusted input data")
+        plan_start = prompt.index('"supervisorCandidatePlan"')
+        self.assertLess(trusted_start, untrusted_start)
+        self.assertLess(untrusted_start, plan_start)
+        self.assertIn(f'"id":"two_week:{start}:{pacific_ms(2026, 7, 15)}"', prompt)
 
     def test_existing_exact_summary_advances_cursor_without_duplicate(self) -> None:
         start = pacific_ms(2026, 7, 18)
@@ -1101,7 +1222,7 @@ class OutputValidationTests(unittest.TestCase):
             snapshot_updated_at=self.updated_at,
             memory_revision=0,
             prompt_hash="abc123",
-            model="gpt-5.6-sol",
+            model=runner.DEFAULT_CODEX_MODEL,
             reasoning_effort="xhigh",
         )
         with self.assertRaises(runner.ConfigError):
@@ -1111,7 +1232,7 @@ class OutputValidationTests(unittest.TestCase):
                 snapshot_updated_at=self.updated_at + 1,
                 memory_revision=0,
                 prompt_hash="abc123",
-                model="gpt-5.6-sol",
+                model=runner.DEFAULT_CODEX_MODEL,
                 reasoning_effort="xhigh",
             )
 
@@ -1124,7 +1245,7 @@ class OutputValidationTests(unittest.TestCase):
                 snapshot_updated_at=self.updated_at,
                 memory_revision=0,
                 prompt_hash="abc123",
-                model="gpt-5.6-sol",
+                model=runner.DEFAULT_CODEX_MODEL,
                 reasoning_effort="medium",
             )
 
@@ -1147,7 +1268,7 @@ class OutputValidationTests(unittest.TestCase):
                         snapshot_updated_at=self.updated_at,
                         memory_revision=0,
                         prompt_hash="abc123",
-                        model="gpt-5.6-sol",
+                        model=runner.DEFAULT_CODEX_MODEL,
                         reasoning_effort="xhigh",
                     )
 

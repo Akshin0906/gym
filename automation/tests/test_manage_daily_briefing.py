@@ -470,6 +470,10 @@ class ManageDailyBriefingTests(unittest.TestCase):
             daily_plist["EnvironmentVariables"]["WORKOUT_CODEX_HOME"],
             str(codex_home),
         )
+        self.assertEqual(
+            daily_plist["EnvironmentVariables"]["WORKOUT_CODEX_MODEL"],
+            "gpt-5.6-terra",
+        )
 
         release_id = Path(new_current).name
         bundle = self.runtime / "rollback-bundles" / release_id

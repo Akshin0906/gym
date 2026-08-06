@@ -34,10 +34,10 @@ from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 
-RUNNER_VERSION = "3.0"
-PROMPT_VERSION = "2026-08-01"
-VALIDATOR_COMPATIBILITY_VERSION = "2026-08-01-atomic-v2"
-DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
+RUNNER_VERSION = "3.1"
+PROMPT_VERSION = "2026-08-05"
+VALIDATOR_COMPATIBILITY_VERSION = "2026-08-05-periodic-deferral-v3"
+DEFAULT_CODEX_MODEL = "gpt-5.6-terra"
 DEFAULT_CODEX_REASONING_EFFORT = "xhigh"
 PACIFIC = ZoneInfo("America/Los_Angeles")
 MODES = {"push", "normal", "light", "deload", "rest"}
@@ -548,6 +548,15 @@ class SnapshotFacts:
     ai_memory_summaries: list[dict[str, Any]]
 
 
+@dataclasses.dataclass(frozen=True)
+class MemoryCandidatePlan:
+    revision: int
+    existing_items: list[dict[str, Any]]
+    existing_ids: set[str]
+    trusted_state: dict[str, Any]
+    candidates: list[dict[str, Any]]
+
+
 def validate_snapshot(body: Any, today: dt.date) -> SnapshotFacts:
     envelope = require_object(body, "snapshot response")
     snapshot = require_object(envelope.get("snapshot"), "snapshot")
@@ -907,6 +916,7 @@ def run_oura(config: Config, run_dir: Path, now: dt.datetime, logger: logging.Lo
 def build_model_prompt(
     config: Config,
     *,
+    facts: SnapshotFacts,
     today: str,
     now: dt.datetime,
     run_id: str,
@@ -930,6 +940,9 @@ def build_model_prompt(
         "snapshotResponse": snapshot_body,
         "memoryResponse": memory_body,
         "recovery": recovery,
+        "supervisorCandidatePlan": prompt_memory_candidate_plan(
+            derive_memory_candidate_plan(facts, memory_body, today=today)
+        ),
     }
     return (
         f"{instructions}\n\n"
@@ -1348,6 +1361,225 @@ def trusted_memory_state(
     }
 
 
+def derive_memory_candidate_plan(
+    facts: SnapshotFacts,
+    memory_body: Any,
+    *,
+    today: str,
+) -> MemoryCandidatePlan:
+    """Derive candidate identities and provenance without trusting model output."""
+    memory_envelope = require_object(memory_body, "memory response")
+    revision = memory_envelope.get("revision")
+    if (
+        not isinstance(revision, int)
+        or isinstance(revision, bool)
+        or revision < 0
+        or revision >= MAX_SAFE_INTEGER
+    ):
+        raise ConfigError("Cloud memory response has an invalid revision")
+
+    existing_items_raw = memory_envelope.get("items")
+    if not isinstance(existing_items_raw, list):
+        raise ConfigError("Cloud memory items must be an array")
+    existing_items = [
+        require_object(item, "existing memory item") for item in existing_items_raw
+    ]
+    existing_ids: set[str] = set()
+    for item in existing_items:
+        item_id = require_bounded_string(
+            item.get("id"), "existing memory item id", 180
+        )
+        if item_id in existing_ids:
+            raise ConfigError(f"Cloud memory has duplicate item id: {item_id}")
+        existing_ids.add(item_id)
+
+    sessions = canonical_completed_sessions(facts)
+    notes = canonical_ai_notes(facts)
+    note_ids = [item["id"] for item in notes]
+    summaries = trusted_summary_records(facts, existing_items)
+    trusted_state = trusted_memory_state(
+        facts, memory_envelope, sessions, today=today
+    )
+    candidates: list[dict[str, Any]] = []
+    if trusted_state["paused"]:
+        return MemoryCandidatePlan(
+            revision=revision,
+            existing_items=existing_items,
+            existing_ids=existing_ids,
+            trusted_state=trusted_state,
+            candidates=candidates,
+        )
+
+    existing_workout_sources = {
+        item.get("sourceWorkoutSessionId")
+        for item in existing_items
+        if item.get("memoryType") == "workout"
+        and isinstance(item.get("sourceWorkoutSessionId"), str)
+        and item.get("sourceWorkoutSessionId").strip()
+    }
+    for session in sessions:
+        session_id = session["id"]
+        if session_id in existing_workout_sources:
+            continue
+        candidates.append(
+            {
+                "expected": {
+                    "id": f"workout:{session_id}",
+                    "memoryType": "workout",
+                    "periodStartAt": session["startedAt"],
+                    "periodEndAt": session["completedAt"],
+                    "sourceWorkoutSessionId": session_id,
+                    "sourceSessionIds": [session_id],
+                    "sourceNoteIds": [],
+                    "sourceSummaryIds": [],
+                },
+                "allowedNoteIds": note_ids,
+                "periodic": False,
+                "dependsOn": [],
+                "cursorField": None,
+                "cursorValue": None,
+            }
+        )
+
+    today_start = pacific_date_start_ms(today)
+    periods = {
+        (item["memoryType"], item["periodStartAt"], item["periodEndAt"])
+        for item in summaries
+    }
+    planned_summary_ids: set[str] = set()
+
+    two_week_start = advance_existing_periods(
+        trusted_state["windowStartedAt"],
+        memory_type="two_week",
+        today_start=today_start,
+        periods=periods,
+    )
+    trusted_state["windowStartedAt"] = two_week_start
+    two_week_end = add_calendar_days_ms(two_week_start, 14)
+    if two_week_end <= today_start:
+        source_sessions = [
+            item["id"]
+            for item in sessions
+            if two_week_start <= item["completedAt"] < two_week_end
+        ]
+        source_notes = [
+            item["id"]
+            for item in notes
+            if two_week_start <= item["createdAt"] < two_week_end
+        ]
+        item_id = f"two_week:{two_week_start}:{two_week_end}"
+        expected = {
+            "id": item_id,
+            "memoryType": "two_week",
+            "periodStartAt": two_week_start,
+            "periodEndAt": two_week_end,
+            "sourceWorkoutSessionId": None,
+            "sourceSessionIds": source_sessions,
+            "sourceNoteIds": source_notes,
+            "sourceSummaryIds": [],
+        }
+        candidates.append(
+            {
+                "expected": expected,
+                "allowedNoteIds": source_notes,
+                "periodic": True,
+                "dependsOn": [],
+                "cursorField": "windowStartedAt",
+                "cursorValue": two_week_end,
+            }
+        )
+        summaries.append(
+            {
+                "id": item_id,
+                "memoryType": "two_week",
+                "periodStartAt": two_week_start,
+                "periodEndAt": two_week_end,
+            }
+        )
+        planned_summary_ids.add(item_id)
+
+    four_month_start = advance_existing_periods(
+        trusted_state["fourMonthStartedAt"],
+        memory_type="four_month",
+        today_start=today_start,
+        periods=periods,
+    )
+    trusted_state["fourMonthStartedAt"] = four_month_start
+    four_month_end = add_calendar_months_ms(four_month_start, 4)
+    if four_month_end <= today_start:
+        source_summaries = [
+            item["id"]
+            for item in sorted(
+                summaries,
+                key=lambda summary: (
+                    summary["periodStartAt"],
+                    summary["periodEndAt"],
+                    summary["id"],
+                ),
+            )
+            if item["memoryType"] == "two_week"
+            and four_month_start <= item["periodStartAt"]
+            and item["periodEndAt"] <= four_month_end
+        ]
+        item_id = f"four_month:{four_month_start}:{four_month_end}"
+        candidates.append(
+            {
+                "expected": {
+                    "id": item_id,
+                    "memoryType": "four_month",
+                    "periodStartAt": four_month_start,
+                    "periodEndAt": four_month_end,
+                    "sourceWorkoutSessionId": None,
+                    "sourceSessionIds": [],
+                    "sourceNoteIds": [],
+                    "sourceSummaryIds": source_summaries,
+                },
+                "allowedNoteIds": None,
+                "periodic": True,
+                "dependsOn": [
+                    summary_id
+                    for summary_id in source_summaries
+                    if summary_id in planned_summary_ids
+                ],
+                "cursorField": "fourMonthStartedAt",
+                "cursorValue": four_month_end,
+            }
+        )
+
+    return MemoryCandidatePlan(
+        revision=revision,
+        existing_items=existing_items,
+        existing_ids=existing_ids,
+        trusted_state=trusted_state,
+        candidates=candidates,
+    )
+
+
+def prompt_memory_candidate_plan(plan: MemoryCandidatePlan) -> list[dict[str, Any]]:
+    bullet_limits = {
+        "workout": {"minimum": 1, "maximum": 3},
+        "two_week": {"minimum": 1, "maximum": 1},
+        "four_month": {"minimum": 2, "maximum": 2},
+    }
+    result: list[dict[str, Any]] = []
+    for candidate in plan.candidates:
+        expected = candidate["expected"]
+        result.append(
+            {
+                "id": expected["id"],
+                "memoryType": expected["memoryType"],
+                "periodStartAt": expected["periodStartAt"],
+                "periodEndAt": expected["periodEndAt"],
+                "sourceWorkoutSessionId": expected["sourceWorkoutSessionId"],
+                "sourceSessionIds": expected["sourceSessionIds"],
+                "allowedSourceNoteIds": candidate["allowedNoteIds"] or [],
+                "sourceSummaryIds": expected["sourceSummaryIds"],
+                "requiredBulletCount": bullet_limits[expected["memoryType"]],
+            }
+        )
+    return result
+
+
 def advance_existing_periods(
     start: int,
     *,
@@ -1477,27 +1709,9 @@ def validate_model_output(
     if set(root) != {"briefing", "memory"}:
         raise ConfigError("Codex output must contain only briefing and memory")
 
-    memory_envelope = require_object(memory_body, "memory response")
-    expected_memory_revision = memory_envelope.get("revision")
-    if (
-        not isinstance(expected_memory_revision, int)
-        or isinstance(expected_memory_revision, bool)
-        or expected_memory_revision < 0
-        or expected_memory_revision >= MAX_SAFE_INTEGER
-    ):
-        raise ConfigError("Cloud memory response has an invalid revision")
-    existing_items_raw = memory_envelope.get("items")
-    if not isinstance(existing_items_raw, list):
-        raise ConfigError("Cloud memory items must be an array")
-    existing_items = [require_object(item, "existing memory item") for item in existing_items_raw]
-    existing_ids: set[str] = set()
-    for item in existing_items:
-        item_id = require_bounded_string(
-            item.get("id"), "existing memory item id", 180
-        )
-        if item_id in existing_ids:
-            raise ConfigError(f"Cloud memory has duplicate item id: {item_id}")
-        existing_ids.add(item_id)
+    plan = derive_memory_candidate_plan(facts, memory_body, today=today)
+    expected_memory_revision = plan.revision
+    existing_items = plan.existing_items
 
     memory_out = require_object(root.get("memory"), "memory")
     if set(memory_out) != {"newItems"}:
@@ -1511,146 +1725,55 @@ def validate_model_output(
     for raw_item in new_items_raw:
         item = require_object(raw_item, "memory item")
         item_id = require_string(item.get("id"), "memory item id")
-        if item_id in existing_ids:
+        if item_id in plan.existing_ids:
             raise ConfigError(f"Codex returned existing memory item as new: {item_id}")
         if item_id in raw_by_id:
             raise ConfigError(f"Codex returned duplicate memory item: {item_id}")
         raw_by_id[item_id] = item
 
     generated_timestamp = require_epoch_ms(generated_at, "generated_at")
-    sessions = canonical_completed_sessions(facts)
-    notes = canonical_ai_notes(facts)
-    note_ids = [item["id"] for item in notes]
-    summaries = trusted_summary_records(facts, existing_items)
-    trusted_state = trusted_memory_state(
-        facts, memory_envelope, sessions, today=today
-    )
+    trusted_state = dict(plan.trusted_state)
     new_items: list[dict[str, Any]] = []
+    deferred_memory_item_ids: list[str] = []
+    satisfied_candidate_ids: set[str] = set()
 
     if trusted_state["paused"] and raw_by_id:
         raise ConfigError("Paused memory cannot add new items")
     if not trusted_state["paused"]:
-        existing_workout_sources = {
-            item.get("sourceWorkoutSessionId")
-            for item in existing_items
-            if item.get("memoryType") == "workout"
-            and isinstance(item.get("sourceWorkoutSessionId"), str)
-            and item.get("sourceWorkoutSessionId").strip()
-        }
-
-        def take(
-            expected: dict[str, Any], *, allowed_notes: list[str] | None = None
-        ) -> dict[str, Any]:
+        for candidate in plan.candidates:
+            expected = candidate["expected"]
             item_id = expected["id"]
             raw_item = raw_by_id.pop(item_id, None)
+            missing_dependencies = [
+                dependency
+                for dependency in candidate["dependsOn"]
+                if dependency not in satisfied_candidate_ids
+            ]
+            if missing_dependencies:
+                if raw_item is not None:
+                    raise ConfigError(
+                        f"Memory item {item_id} depends on a deferred summary"
+                    )
+                deferred_memory_item_ids.append(item_id)
+                continue
             if raw_item is None:
+                if candidate["periodic"]:
+                    deferred_memory_item_ids.append(item_id)
+                    continue
                 raise ConfigError(f"Codex omitted required memory item: {item_id}")
-            return validate_memory_item(
+            new_item = validate_memory_item(
                 raw_item,
                 expected=expected,
                 snapshot_updated_at=facts.updated_at,
                 generated_at=generated_timestamp,
                 model=model,
-                allowed_note_ids=allowed_notes,
+                allowed_note_ids=candidate["allowedNoteIds"],
             )
-
-        for session in sessions:
-            session_id = session["id"]
-            if session_id in existing_workout_sources:
-                continue
-            expected = {
-                "id": f"workout:{session_id}",
-                "memoryType": "workout",
-                "periodStartAt": session["startedAt"],
-                "periodEndAt": session["completedAt"],
-                "sourceWorkoutSessionId": session_id,
-                "sourceSessionIds": [session_id],
-                "sourceNoteIds": [],
-                "sourceSummaryIds": [],
-            }
-            new_items.append(take(expected, allowed_notes=note_ids))
-
-        today_start = pacific_date_start_ms(today)
-        periods = {
-            (item["memoryType"], item["periodStartAt"], item["periodEndAt"])
-            for item in summaries
-        }
-        two_week_start = advance_existing_periods(
-            trusted_state["windowStartedAt"],
-            memory_type="two_week",
-            today_start=today_start,
-            periods=periods,
-        )
-        two_week_end = add_calendar_days_ms(two_week_start, 14)
-        if two_week_end <= today_start:
-            source_sessions = [
-                item["id"]
-                for item in sessions
-                if two_week_start <= item["completedAt"] < two_week_end
-            ]
-            source_notes = [
-                item["id"]
-                for item in notes
-                if two_week_start <= item["createdAt"] < two_week_end
-            ]
-            expected = {
-                "id": f"two_week:{two_week_start}:{two_week_end}",
-                "memoryType": "two_week",
-                "periodStartAt": two_week_start,
-                "periodEndAt": two_week_end,
-                "sourceWorkoutSessionId": None,
-                "sourceSessionIds": source_sessions,
-                "sourceNoteIds": source_notes,
-                "sourceSummaryIds": [],
-            }
-            new_item = take(expected, allowed_notes=source_notes)
             new_items.append(new_item)
-            summaries.append(
-                {
-                    "id": expected["id"],
-                    "memoryType": "two_week",
-                    "periodStartAt": two_week_start,
-                    "periodEndAt": two_week_end,
-                }
-            )
-            two_week_start = two_week_end
-        trusted_state["windowStartedAt"] = two_week_start
-
-        four_month_start = advance_existing_periods(
-            trusted_state["fourMonthStartedAt"],
-            memory_type="four_month",
-            today_start=today_start,
-            periods=periods,
-        )
-        four_month_end = add_calendar_months_ms(four_month_start, 4)
-        if four_month_end <= today_start:
-            source_summaries = [
-                item["id"]
-                for item in sorted(
-                    summaries,
-                    key=lambda summary: (
-                        summary["periodStartAt"],
-                        summary["periodEndAt"],
-                        summary["id"],
-                    ),
-                )
-                if item["memoryType"] == "two_week"
-                and four_month_start <= item["periodStartAt"]
-                and item["periodEndAt"] <= four_month_end
-            ]
-            expected = {
-                "id": f"four_month:{four_month_start}:{four_month_end}",
-                "memoryType": "four_month",
-                "periodStartAt": four_month_start,
-                "periodEndAt": four_month_end,
-                "sourceWorkoutSessionId": None,
-                "sourceSessionIds": [],
-                "sourceNoteIds": [],
-                "sourceSummaryIds": source_summaries,
-            }
-            new_items.append(take(expected))
-            four_month_start = four_month_end
-        trusted_state["fourMonthStartedAt"] = four_month_start
+            satisfied_candidate_ids.add(item_id)
+            cursor_field = candidate["cursorField"]
+            if cursor_field is not None:
+                trusted_state[cursor_field] = candidate["cursorValue"]
 
     if raw_by_id:
         unexpected = ", ".join(sorted(raw_by_id))
@@ -1731,6 +1854,7 @@ def validate_model_output(
             "usedOura": recovery_status == "fresh",
             "memoryItemCount": len(existing_items) + len(new_items),
             "newMemoryItemCount": len(new_items),
+            "deferredMemoryItemIds": deferred_memory_item_ids,
             "recoveryStatus": recovery_status,
             "ouraObservedAt": max(observed_candidates) if observed_candidates else None,
             "runId": run_id,
@@ -2397,6 +2521,7 @@ def run(config: Config, args: argparse.Namespace) -> int:
         check_codex_login(config, codex)
         prompt = build_model_prompt(
             config,
+            facts=facts,
             today=today,
             now=now,
             run_id=run_id,
@@ -2432,6 +2557,14 @@ def run(config: Config, args: argparse.Namespace) -> int:
             codex_version=codex_version,
             generated_at=int(now.timestamp() * 1000),
         )
+        deferred_memory_item_ids = validated["briefing"]["inputSummary"][
+            "deferredMemoryItemIds"
+        ]
+        if deferred_memory_item_ids:
+            logger.warning(
+                "Deferred periodic memory candidates without blocking the briefing: %s",
+                ", ".join(deferred_memory_item_ids),
+            )
         atomic_write_json(run_dir / "validated-result.json", validated)
         with contextlib.suppress(FileNotFoundError):
             (run_dir / "codex-events.jsonl").unlink()
@@ -2446,6 +2579,7 @@ def run(config: Config, args: argparse.Namespace) -> int:
             recoveryStatus=recovery_status,
             model=config.codex_model,
             reasoningEffort=config.codex_effort,
+            deferredMemoryItemIds=deferred_memory_item_ids,
             log=str(log_path),
         )
 
@@ -2499,6 +2633,7 @@ def run(config: Config, args: argparse.Namespace) -> int:
             model=config.codex_model,
             reasoningEffort=config.codex_effort,
             newMemoryItemCount=len(validated["manifest"]["newMemoryItemIds"]),
+            deferredMemoryItemIds=deferred_memory_item_ids,
             log=str(log_path),
         )
         logger.info("Daily briefing and memory were published and verified")
