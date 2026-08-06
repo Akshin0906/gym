@@ -873,6 +873,9 @@ async function handlePutSnapshot(ctx: PagesContext): Promise<Response> {
 
 export function assertBriefingSections(raw: unknown): string {
   if (!isObject(raw)) throw new Error('sections must be an object')
+  // Keep the cloud envelope backward-compatible with installed runner
+  // rollbacks. The current model schema and supervisor enforce tighter copy
+  // limits before publishing.
   const todaysCall = assertTrimmedString(
     raw.todaysCall,
     'sections.todaysCall',

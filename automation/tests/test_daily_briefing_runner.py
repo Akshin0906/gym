@@ -150,8 +150,6 @@ def model_output(updated_at: int) -> dict:
                     "The latest completed session is available.",
                     "Recent logged work supports the programmed progression.",
                 ],
-                "recoveryStatus": "fresh",
-                "ouraRecovery": "Readiness and sleep are fresh enough to support the normal session.",
                 "trainingTrend": "Recent training is stable enough to progress from performance.",
                 "watchOuts": [],
             },
@@ -712,6 +710,55 @@ class InputValidationTests(unittest.TestCase):
         self.assertEqual(sanitized["status"], "stale")
         self.assertTrue(sanitized["latestReadiness"]["isStale"])
 
+    def test_recovery_summary_uses_neutral_trusted_wording(self) -> None:
+        fresh = {
+            "status": "fresh",
+            "latestReadiness": {"score": 80, "ageHours": 4.0},
+            "latestSleep": {
+                "score": 75,
+                "totalSleepHours": 6.2,
+                "ageHours": 4.0,
+            },
+        }
+        stale = {
+            "status": "stale",
+            "latestReadiness": {"score": 80, "ageHours": 26.5},
+            "latestSleep": {"score": 75, "ageHours": 26.0},
+        }
+
+        self.assertEqual(
+            runner.trusted_recovery_summary(fresh),
+            "Oura estimate: 6.2 h sleep and readiness score 80; use as context, not a diagnosis.",
+        )
+        self.assertEqual(
+            runner.trusted_recovery_summary(stale),
+            "Oura is stale (26.5 h old); use workout history for this call.",
+        )
+        self.assertEqual(
+            runner.trusted_recovery_summary({"status": "unavailable"}),
+            "Oura unavailable; use workout history only.",
+        )
+
+    def test_recovery_sanitizer_drops_impossible_scores_and_sleep_duration(self) -> None:
+        now = dt.datetime(2026, 8, 1, 12, 0, tzinfo=PACIFIC)
+        raw = {
+            "latestReadiness": {
+                "score": 101,
+                "observedAt": "2026-08-01T08:00:00-07:00",
+            },
+            "latestSleep": {
+                "score": -1,
+                "totalSleepHours": 25,
+                "observedAt": "2026-08-01T08:00:00-07:00",
+            },
+        }
+
+        sanitized = runner.sanitize_recovery(raw, now)
+
+        self.assertIsNone(sanitized["latestReadiness"]["score"])
+        self.assertIsNone(sanitized["latestSleep"]["score"])
+        self.assertIsNone(sanitized["latestSleep"]["totalSleepHours"])
+
 
 class OutputValidationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -767,6 +814,7 @@ class OutputValidationTests(unittest.TestCase):
         *,
         facts: runner.SnapshotFacts | None = None,
         today: str = "2026-08-01",
+        generated_at: int | None = None,
     ) -> dict:
         memory_body = dict(memory) if memory is not None else {"state": None, "items": []}
         memory_body.setdefault("revision", 0)
@@ -781,7 +829,9 @@ class OutputValidationTests(unittest.TestCase):
             model=runner.DEFAULT_CODEX_MODEL,
             reasoning_effort="xhigh",
             codex_version="codex-cli test",
-            generated_at=self.updated_at + 1,
+            generated_at=(
+                generated_at if generated_at is not None else self.updated_at + 1
+            ),
         )
 
     def test_supervisor_constructs_all_briefing_metadata(self) -> None:
@@ -1099,6 +1149,37 @@ class OutputValidationTests(unittest.TestCase):
         self.assertLess(untrusted_start, plan_start)
         self.assertIn(f'"id":"two_week:{start}:{pacific_ms(2026, 7, 15)}"', prompt)
 
+        instructions = config.prompt_file.read_text(encoding="utf-8")
+        self.assertIn("exercise performance must match a movement in today's session", instructions)
+        self.assertIn("Use one reason when that is all the relevant evidence", instructions)
+
+    def test_prompt_redacts_stale_recovery_measurements(self) -> None:
+        stale = {
+            "generatedAt": "2026-08-01T10:30:00-07:00",
+            "status": "stale",
+            "staleAfterHours": 24,
+            "latestReadiness": {"score": 80, "ageHours": 26.5},
+            "latestSleep": {"totalSleepHours": 6.2, "ageHours": 26.0},
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            config = test_config(Path(temp))
+            prompt = runner.build_model_prompt(
+                config,
+                facts=self.facts,
+                today="2026-08-01",
+                now=dt.datetime(2026, 8, 1, 10, 30, tzinfo=PACIFIC),
+                run_id="test-run",
+                prompt_hash="abc123",
+                snapshot_body={"snapshot": self.facts.snapshot},
+                memory_body={"revision": 0, "state": None, "items": []},
+                recovery=stale,
+            )
+
+        self.assertIn('"status":"stale"', prompt)
+        self.assertIn('"latestReadiness":null', prompt)
+        self.assertIn('"latestSleep":null', prompt)
+        self.assertNotIn('"ageHours":26.5', prompt)
+
     def test_existing_exact_summary_advances_cursor_without_duplicate(self) -> None:
         start = pacific_ms(2026, 7, 18)
         end = pacific_ms(2026, 8, 1)
@@ -1208,11 +1289,105 @@ class OutputValidationTests(unittest.TestCase):
         )
         self.assertEqual(existing["bullets"], ["Original bullet"])
 
-    def test_recovery_status_must_match_trusted_input(self) -> None:
+    def test_supervisor_owns_recovery_status_and_presentation(self) -> None:
+        validated = self.validate(model_output(self.updated_at))
+        sections = validated["briefing"]["sections"]
+        self.assertEqual(sections["recoveryStatus"], "fresh")
+        self.assertEqual(
+            sections["ouraRecovery"],
+            "Oura estimate: sleep score 75 and readiness score 80; use as context, not a diagnosis.",
+        )
+
+        for field in ("recoveryStatus", "ouraRecovery"):
+            with self.subTest(field=field):
+                output = model_output(self.updated_at)
+                output["briefing"]["sections"][field] = "model-controlled"
+                with self.assertRaisesRegex(runner.ConfigError, "invalid shape"):
+                    self.validate(output)
+
+    def test_briefing_copy_is_rejected_instead_of_silently_truncated(self) -> None:
+        mutations = {
+            "headline": lambda output: output["briefing"].__setitem__(
+                "headline", "h" * (runner.BRIEFING_HEADLINE_MAX + 1)
+            ),
+            "today's call": lambda output: output["briefing"]["sections"].__setitem__(
+                "todaysCall", "c" * (runner.BRIEFING_TODAYS_CALL_MAX + 1)
+            ),
+            "reason": lambda output: output["briefing"]["sections"]["why"].__setitem__(
+                0, "r" * (runner.BRIEFING_REASON_MAX + 1)
+            ),
+            "trend": lambda output: output["briefing"]["sections"].__setitem__(
+                "trainingTrend", "t" * (runner.BRIEFING_TREND_MAX + 1)
+            ),
+            "watch-out": lambda output: output["briefing"]["sections"].__setitem__(
+                "watchOuts", ["w" * (runner.BRIEFING_WATCH_OUT_MAX + 1)]
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                output = model_output(self.updated_at)
+                mutate(output)
+                with self.assertRaises(runner.ConfigError):
+                    self.validate(output)
+
+    def test_briefing_requires_one_or_two_reasons_and_one_model_guardrail(self) -> None:
+        for reasons in ([], ["one", "two", "three"]):
+            with self.subTest(reasons=reasons):
+                output = model_output(self.updated_at)
+                output["briefing"]["sections"]["why"] = reasons
+                with self.assertRaises(runner.ConfigError):
+                    self.validate(output)
+
         output = model_output(self.updated_at)
-        output["briefing"]["sections"]["recoveryStatus"] = "unavailable"
-        with self.assertRaises(runner.ConfigError):
+        output["briefing"]["sections"]["why"] = ["one"]
+        self.assertEqual(
+            self.validate(output)["briefing"]["sections"]["why"], ["one"]
+        )
+
+        output = model_output(self.updated_at)
+        output["briefing"]["sections"]["why"] = ["same", " same "]
+        self.assertEqual(
+            self.validate(output)["briefing"]["sections"]["why"], ["same"]
+        )
+
+        output = model_output(self.updated_at)
+        output["briefing"]["sections"]["watchOuts"] = ["one", "two"]
+        with self.assertRaisesRegex(runner.ConfigError, "too many items"):
             self.validate(output)
+
+    def test_supervisor_adds_the_stale_snapshot_warning_once(self) -> None:
+        generated = int(
+            (
+                dt.datetime.fromtimestamp(self.updated_at / 1000.0, PACIFIC)
+                + dt.timedelta(hours=49)
+            ).timestamp()
+            * 1000
+        )
+        expected = (
+            "Data last synced 2026-08-01; if you trained since then, open the app "
+            "to sync before relying on this."
+        )
+        output = model_output(self.updated_at)
+        output["briefing"]["sections"]["watchOuts"] = [
+            "Workout data may be stale; sync before relying on this."
+        ]
+
+        validated = self.validate(output, generated_at=generated)
+
+        self.assertEqual(validated["briefing"]["sections"]["watchOuts"], [expected])
+
+    def test_snapshot_warning_starts_only_after_48_hours(self) -> None:
+        snapshot_time = dt.datetime.fromtimestamp(self.updated_at / 1000.0, PACIFIC)
+        at_boundary = int((snapshot_time + dt.timedelta(hours=48)).timestamp() * 1000)
+        after_boundary = int(
+            (snapshot_time + dt.timedelta(hours=48, milliseconds=1)).timestamp()
+            * 1000
+        )
+
+        self.assertIsNone(runner.trusted_snapshot_warning(self.facts, at_boundary))
+        self.assertIsNotNone(
+            runner.trusted_snapshot_warning(self.facts, after_boundary)
+        )
 
     def test_spool_requires_current_snapshot(self) -> None:
         validated = self.validate(model_output(self.updated_at))
@@ -1503,6 +1678,21 @@ class SchemaTests(unittest.TestCase):
         self.assertFalse(memory["additionalProperties"])
         self.assertFalse(item["additionalProperties"])
         self.assertEqual(set(briefing["properties"]), {"headline", "mode", "sections"})
+        self.assertEqual(
+            briefing["properties"]["headline"]["maxLength"],
+            runner.BRIEFING_HEADLINE_MAX,
+        )
+        self.assertEqual(
+            sections["properties"]["todaysCall"]["maxLength"],
+            runner.BRIEFING_TODAYS_CALL_MAX,
+        )
+        self.assertEqual(sections["properties"]["why"]["minItems"], 1)
+        self.assertEqual(sections["properties"]["why"]["maxItems"], 2)
+        self.assertEqual(sections["properties"]["watchOuts"]["maxItems"], 1)
+        # Codex Structured Outputs does not support uniqueItems. The supervisor
+        # safely deduplicates reasons after generation instead.
+        self.assertNotIn("uniqueItems", sections["properties"]["why"])
+        self.assertNotIn("uniqueItems", sections["properties"]["watchOuts"])
         self.assertEqual(set(memory["properties"]), {"newItems"})
         self.assertEqual(
             set(item["properties"]),

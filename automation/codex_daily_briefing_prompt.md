@@ -18,54 +18,54 @@ metadata, and publishing.
 
 ## Briefing goal and voice
 
-Produce one concise pre-training decision that feels like a coach's call rather
-than a data audit. Lead with what to do today and explain only the strongest
-signals that change or support that action.
+Produce one mobile-sized pre-training decision. Put the action first, preserve
+the evidence and material caveat, and remove repetition, generic reassurance,
+and optional background.
 
-- `headline`: a plain action headline, preferably 50-75 characters. Do not prefix a mode label.
-- `todaysCall`: 1-2 short sentences. Name the next programmed session when known, state whether to run it as written/light/push/deload or rest, and give a first-working-set progression rule when training is appropriate.
-- `why`: normally 2 concise bullets; use 3 only when the third changes the call. Every bullet must cite a concrete fact or number and connect it to the action.
-- `ouraRecovery`: exactly one practical sentence. If recovery is unavailable, use `Oura unavailable; use workout history only.`
-- `trainingTrend`: exactly one concise sentence about the recent lifting pattern.
-- `watchOuts`: 0-2 actionable guardrails only.
+- `headline`: 4-8 plain action words, at most 80 characters. Do not prefix a mode.
+- `todaysCall`: at most 280 characters across 1-2 short sentences. Name the next programmed session when known, state the mode in plain language, and give one first-working-set gate. Use supplied target reps or RPE when available. Compare reps and effort only for the same exercise under comparable exposure; otherwise hold load or run the program as written. Never invent a target.
+- `why`: 1-2 non-redundant bullets, each at most 220 characters. Include only facts that materially support or change the call. Every reason must apply directly to today's session, one of its movements, or whole-body safety/recovery. Session-wide feedback may be used as whole-body context, but exercise performance must match a movement in today's session. Use one reason when that is all the relevant evidence; never fill a second slot with an unrelated exercise or body region. Each bullet must name a supplied date, value, or count and explain how it affects the call. Do not use filler such as “the latest session is available.”
+- `trainingTrend`: one sentence, at most 200 characters. Claim a direction only from repeated comparable sessions; otherwise use `Not enough comparable sessions to call a trend.`
+- `watchOuts`: 0-1 genuine safety or execution guardrail, at most 220 characters. Do not repeat the first-set gate or add a data-sync warning; the supervisor owns snapshot-age wording.
 - Do not mention prompts, schemas, automation, exports, internal policy names, rejected modes, or generic encouragement.
+- Do not repeat Oura numbers in model-authored fields; the supervisor displays current recovery estimates separately.
+- Describe measurements as recorded values or device estimates. Never claim that the data prove recovery, diagnose a condition, reveal “CNS fatigue,” or quantify injury risk.
 - When snapshot AI Memory is not paused, treat `data.aiNotes` as explicit
   user-authored context for future Insights. Use recent relevant notes when they
-  affect the call, but do not let an old note override newer workout feedback or
-  recovery evidence. Do not use AI notes while memory is paused.
+  affect the call, but do not let an old note override newer workout feedback.
+  Do not use AI notes while memory is paused.
 
-If the workout snapshot's source date is more than 48 hours old but still within
-the supervisor's accepted window, mention it once in `watchOuts` as:
-`Data last synced YYYY-MM-DD; if you trained since then, open the app to sync before relying on this.`
-Do not mention snapshot age elsewhere.
+## Evidence hierarchy
 
-## Recovery rules
+Use the strongest available evidence in this order:
 
-The supplied `recovery.status` is authoritative:
+1. Explicit recent injury, illness, pain, or safety-red-flag reports.
+2. Recent `sessionPlanned`, `sessionFeel`, and logged-set RPE.
+3. Same-exercise performance across comparable sessions.
+4. Recent completed-set volume relative to the user's own history.
+5. Current Oura total sleep and readiness as supporting context only.
 
-- `fresh`: sleep and readiness may influence the training mode.
-- `stale`: do not change the mode because of Oura; report the stale observation briefly.
-- `unavailable`: do not change the mode because of Oura; use the exact unavailable sentence above.
-
-Use only Oura sleep and readiness. Do not use activity, steps, calories, stress,
-or strain-like metrics as training evidence. Low sleep is a guardrail by itself;
-scale down only when workout feedback or another strong signal supports it.
+No single score establishes readiness, fatigue, injury, or the need to deload.
+`recovery.status: fresh` means the readings are current, not that recovery is
+good. Stale or unavailable Oura must not change the mode. Prefer total sleep
+duration over proprietary scores. The adult 7-hour recommendation concerns
+habitual health; do not turn one wearable night into an acute training cutoff.
+Use only sleep and readiness—not activity, steps, calories, stress, or
+strain-like metrics. When evidence is mixed or sparse, choose `normal`.
 
 ## Training mode policy
 
 Choose exactly one:
 
-- `push`: recovery is fresh/good, recent session feedback is strong, key lifts are flat-to-up, and target-muscle volume is not already at a recent high.
-- `normal`: default when the evidence does not justify a deviation; run the program as written.
-- `light`: an acute scale-back day, such as fresh readiness at or below 65 or either of the last 1-2 sessions scoring 1-2 for planned execution or feel. Keep the session; reduce load roughly 10-15% or remove one set per exercise.
-- `deload`: multi-day cumulative fatigue, such as at least 3 of the last 5 sessions scoring 1-2, rising volume with flat/down key lifts, or fresh readiness below 70 for at least 5 days. Reduce working sets roughly 40-50% for 5-7 days.
-- `rest`: do not train today because recent user-authored context reports an acute injury, severe or unexplained pain, fever or acute illness, chest pain, fainting, severe dizziness, or another clear safety red flag. State the relevant reported fact without diagnosing it and recommend appropriate professional or urgent medical care when warranted. Never choose `rest` from Oura readiness or sleep alone.
+- `push`: take only a progression already earned by strong recent feedback and stable-to-improving comparable performance. A high Oura score never adds bonus load or sets.
+- `normal`: run the program as written and let the first working set confirm load. This is the default.
+- `light`: keep the scheduled movements but hold load, leave clear reps in reserve, or remove one hard set when recent feedback or comparable performance shows an acute off day.
+- `deload`: use only when repeated poor feedback and declining comparable performance show cumulative fatigue across multiple recent sessions. Reduce hard-set volume and effort; do not invent a precise percentage or duration.
+- `rest`: use only when recent user-authored context explicitly reports acute injury, severe or unexplained pain, fever or acute illness, chest pain, fainting, severe dizziness, or another clear safety red flag. State what the user reported without diagnosing it and recommend appropriate professional or urgent care when warranted.
 
-When signals conflict, recent user feedback beats Oura, an acute low-readiness
-signal beats a long trend, one poor session is `light` at most, and a prior
-deload call should not repeat unless the data worsened. Choose `rest` only for
-explicit injury, illness, or red-flag evidence; otherwise prefer `light` or
-`deload` when training should be reduced.
+Recent user feedback outweighs Oura. One poor session is `light` at most. Never
+choose `rest`, `light`, or `deload` from Oura alone, and never repeat a prior
+deload call unless newer data still support it.
 
 ## Memory procedure
 
@@ -104,9 +104,7 @@ Return exactly:
     "mode": "push | normal | light | deload | rest",
     "sections": {
       "todaysCall": "practical recommendation",
-      "why": ["concrete reason", "concrete reason"],
-      "recoveryStatus": "fresh | stale | unavailable",
-      "ouraRecovery": "one sentence",
+      "why": ["recent feedback reason", "comparable performance reason"],
       "trainingTrend": "one sentence",
       "watchOuts": []
     }
@@ -116,6 +114,10 @@ Return exactly:
   }
 }
 ```
+
+The trusted supervisor adds `recoveryStatus`, the neutral `ouraRecovery`
+sentence, and any stale-snapshot warning to the persisted briefing after your
+output passes validation.
 
 The empty `newItems` array above illustrates shape only; populate it with every
 candidate in `supervisorCandidatePlan`. Populate every content value from the

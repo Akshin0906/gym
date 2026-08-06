@@ -1,5 +1,5 @@
 import { type ReactNode, useCallback, useEffect, useState } from 'react'
-import { ChevronDown } from 'lucide-react'
+import { AlertTriangle, ChevronDown, Moon, TrendingUp } from 'lucide-react'
 import { db } from '../db/schema'
 import { getLatestDailyBriefing } from '../db/repositories/dailyBriefings'
 import type {
@@ -21,6 +21,14 @@ const MODE_COLOR: Record<RecommendationMode, string> = {
   light: 'oklch(0.72 0.10 220)',
   deload: 'oklch(0.55 0.04 250)',
   rest: 'oklch(0.66 0.17 25)',
+}
+
+const MODE_LABEL: Record<RecommendationMode, string> = {
+  push: 'Push',
+  normal: 'Normal',
+  light: 'Light',
+  deload: 'Deload',
+  rest: 'Rest',
 }
 
 // The system prompt forbids markdown, but the model occasionally leaks
@@ -96,45 +104,54 @@ export function RecommendationBanner() {
 
   const latest = state.briefing
   const briefingStale = isBriefingStale(latest.briefingDate)
-  const recoveryStale =
-    latest.sections.recoveryStatus === 'stale' ||
-    latest.sections.recoveryStatus === 'unavailable'
   const dotColor = MODE_COLOR[latest.mode]
   const dateLabel = briefingDateLabel(latest)
+  const recoveryLabel = recoveryStatusLabel(latest.sections.recoveryStatus)
 
   return (
     <div className="card overflow-hidden">
-      <div className="px-4 py-3 flex items-center gap-3">
-        <button
-          type="button"
-          onClick={() => setExpanded((e) => !e)}
-          className="flex items-center gap-3 flex-1 text-left min-w-0"
-          aria-expanded={expanded}
-        >
-          <span
-            className="w-2.5 h-2.5 rounded-full flex-shrink-0"
-            style={{ background: dotColor }}
-            aria-label={`mode: ${latest.mode}`}
-          />
-          <span className="text-sm font-medium truncate flex-1">
+      <button
+        type="button"
+        onClick={() => setExpanded((e) => !e)}
+        className="w-full px-4 py-3.5 flex items-center gap-3 text-left transition-colors hover:bg-[var(--color-surface-2)]"
+        aria-expanded={expanded}
+      >
+        <span className="min-w-0 flex-1">
+          <span className="flex items-center gap-2 flex-wrap">
+            <span className="text-[10px] font-bold uppercase tracking-widest text-[var(--color-fg-faint)]">
+              AI briefing
+            </span>
+            <span
+              className="inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider"
+              style={{ color: dotColor, borderColor: dotColor }}
+            >
+              <span
+                aria-hidden
+                className="h-1.5 w-1.5 rounded-full"
+                style={{ background: dotColor }}
+              />
+              {MODE_LABEL[latest.mode]}
+            </span>
+            {recoveryLabel && (
+              <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--color-fg-faint)]">
+                {recoveryLabel}
+              </span>
+            )}
+            {briefingStale && (
+              <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--color-fg-faint)] nums">
+                Briefing {displayDate(latest.briefingDate)}
+              </span>
+            )}
+          </span>
+          <span className="mt-1.5 block text-[15px] font-semibold leading-snug text-[var(--color-fg)]">
             {renderInline(latest.headline)}
           </span>
-          {recoveryStale && (
-            <span className="text-[10px] font-bold uppercase tracking-widest text-[var(--color-fg-faint)] nums">
-              Stale
-            </span>
-          )}
-          {briefingStale && (
-            <span className="text-[10px] font-bold uppercase tracking-widest text-[var(--color-fg-faint)] nums">
-              {latest.briefingDate}
-            </span>
-          )}
-          <ChevronDown
-            size={14}
-            className={`text-[var(--color-fg-faint)] transition-transform flex-shrink-0 ${expanded ? 'rotate-180' : ''}`}
-          />
-        </button>
-      </div>
+        </span>
+        <ChevronDown
+          size={16}
+          className={`text-[var(--color-fg-faint)] transition-transform shrink-0 ${expanded ? 'rotate-180' : ''}`}
+        />
+      </button>
       {expanded && (
         <BriefingSections
           sections={latest.sections}
@@ -145,17 +162,35 @@ export function RecommendationBanner() {
   )
 }
 
-function briefingDateLabel(briefing: DailyBriefing): string {
-  const base = `${briefing.briefingDate} briefing`
+export function recoveryStatusLabel(
+  status: DailyBriefingSections['recoveryStatus'],
+): string | null {
+  if (status === 'stale') return 'Oura stale'
+  if (status === 'unavailable') return 'No Oura'
+  return null
+}
+
+function displayDate(value: string): string {
+  const parsed = new Date(`${value}T12:00:00Z`)
+  if (Number.isNaN(parsed.getTime())) return value
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'short',
+    day: 'numeric',
+    timeZone: 'UTC',
+  }).format(parsed)
+}
+
+export function briefingDateLabel(briefing: DailyBriefing): string {
+  const base = `${displayDate(briefing.briefingDate)} briefing`
   if (!briefing.snapshotUpdatedAt) return base
 
   const dataDate = pacificDate(new Date(briefing.snapshotUpdatedAt))
   if (!dataDate || dataDate === briefing.briefingDate) return base
 
-  return `${base} - data ${dataDate}`
+  return `${base} · workout data through ${displayDate(dataDate)}`
 }
 
-function BriefingSections({
+export function BriefingSections({
   sections,
   dateLabel,
 }: {
@@ -163,27 +198,88 @@ function BriefingSections({
   dateLabel: string
 }) {
   return (
-    <div className="px-4 pb-3 pt-1 space-y-3 text-sm text-[var(--color-fg-dim)]">
-      <p className="text-[10px] font-bold uppercase tracking-widest text-[var(--color-fg-faint)] nums">
-        {dateLabel}
-      </p>
-      <Section title="Action">{sections.todaysCall}</Section>
+    <div className="border-t border-[var(--color-border)] px-4 py-4 space-y-4 text-sm text-[var(--color-fg-dim)]">
+      <section className="space-y-1.5">
+        <h3 className="text-[11px] font-bold uppercase tracking-widest text-[var(--color-accent)]">
+          Today&apos;s plan
+        </h3>
+        <p className="text-base leading-relaxed text-[var(--color-fg)]">
+          {renderInline(sections.todaysCall)}
+        </p>
+      </section>
       {sections.why.length > 0 && (
-        <Section title="Signals">
+        <Section title="Why this call">
           <BulletList items={sections.why} />
         </Section>
       )}
-      {sections.ouraRecovery && (
-        <Section title="Recovery">{sections.ouraRecovery}</Section>
-      )}
-      {sections.trainingTrend && (
-        <Section title="Trend">{sections.trainingTrend}</Section>
+      {(sections.ouraRecovery || sections.trainingTrend) && (
+        <section className="space-y-2">
+          <h3 className="text-[11px] font-bold uppercase tracking-widest text-[var(--color-fg-faint)]">
+            Data context
+          </h3>
+          <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-2)] divide-y divide-[var(--color-border)]">
+            {sections.ouraRecovery && (
+              <ContextRow icon={<Moon size={15} />} label="Recovery">
+                {sections.ouraRecovery}
+              </ContextRow>
+            )}
+            {sections.trainingTrend && (
+              <ContextRow icon={<TrendingUp size={15} />} label="Training">
+                {sections.trainingTrend}
+              </ContextRow>
+            )}
+          </div>
+        </section>
       )}
       {sections.watchOuts.length > 0 && (
-        <Section title="Guardrails">
-          <BulletList items={sections.watchOuts} />
-        </Section>
+        <section
+          className="rounded-xl border p-3"
+          style={{
+            background: 'oklch(0.25 0.08 60 / 0.35)',
+            borderColor: 'oklch(0.55 0.15 60 / 0.45)',
+          }}
+        >
+          <div className="flex items-start gap-2.5">
+            <AlertTriangle
+              size={16}
+              className="mt-0.5 shrink-0 text-[var(--color-accent)]"
+            />
+            <div className="min-w-0 space-y-1.5">
+              <h3 className="text-[11px] font-bold uppercase tracking-widest text-[var(--color-accent)]">
+                Watch
+              </h3>
+              <BulletList items={sections.watchOuts} />
+            </div>
+          </div>
+        </section>
       )}
+      <p className="text-[10px] font-bold uppercase tracking-widest text-[var(--color-fg-faint)] nums">
+        {dateLabel}
+      </p>
+    </div>
+  )
+}
+
+function ContextRow({
+  icon,
+  label,
+  children,
+}: {
+  icon: ReactNode
+  label: string
+  children: string
+}) {
+  return (
+    <div className="flex items-start gap-2.5 p-3">
+      <span className="mt-0.5 shrink-0 text-[var(--color-fg-faint)]">
+        {icon}
+      </span>
+      <div className="min-w-0">
+        <p className="text-[10px] font-bold uppercase tracking-wider text-[var(--color-fg-faint)]">
+          {label}
+        </p>
+        <p className="mt-0.5 leading-relaxed">{renderInline(children)}</p>
+      </div>
     </div>
   )
 }

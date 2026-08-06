@@ -19,7 +19,7 @@ The job deliberately separates trusted operations from model reasoning:
 5. It invokes `codex exec` with ChatGPT subscription authentication.
 6. Codex runs from an automation-only `CODEX_HOME` with web search and every currently exposed tool-bearing feature disabled, and receives no app secrets or Oura tokens.
 7. Codex returns one JSON object constrained by `codex_daily_briefing_output_schema.json`.
-8. The supervisor deterministically owns memory state/provenance and trusted metadata, audits the Codex JSONL stream for tool use, then spools the result.
+8. The supervisor deterministically owns memory state/provenance, trusted metadata, the Oura summary, and snapshot-age warnings; it audits the Codex JSONL stream for tool use, then spools the result.
 9. One server-side transaction compare-and-sets both the snapshot timestamp and memory revision before writing memory plus the briefing; the supervisor verifies the committed reads.
 
 If upload fails after generation, later same-day or next-day launches retry the
@@ -28,6 +28,38 @@ snapshot or memory revision quarantines the artifact instead of publishing it.
 A transient or server-contract failure on an older spool leaves that artifact
 pending but never blocks today's check or generation. Runs are ephemeral and do
 not create hidden Codex conversation history.
+
+## Evidence and writing policy
+
+The briefing is a decision aid, not a medical assessment. Its content contract
+is intentionally conservative:
+
+- The action appears first, with one or two short supporting reasons and progressive
+  disclosure for detail, following the U.S. Department of Health and Human
+  Services guidance for [brief, actionable health content](https://odphp.health.gov/healthliteracyonline/create-actionable-content).
+- Resistance-training advice favors consistent progressive training and does
+  not presume that advanced or failure-based techniques are necessary, in line
+  with the [2026 ACSM position stand](https://pubmed.ncbi.nlm.nih.gov/41843416/).
+- Recent session feedback is considered before a wearable score. A broad
+  [systematic review of athlete monitoring](https://pubmed.ncbi.nlm.nih.gov/26423706/)
+  found subjective well-being measures often more sensitive and consistent
+  than common objective markers; the app's own feedback sliders are useful
+  context, not independently validated clinical measures.
+- Oura total sleep and readiness are supporting context only. The
+  [AASM/SRS consensus](https://www.aasm.org/resources/pdf/adultsleepdurationconsensus.pdf)
+  recommends at least seven hours of habitual sleep for adults, while consumer
+  wearables remain estimates with device-level variability in a
+  [2026 systematic review](https://pubmed.ncbi.nlm.nih.gov/42175611/).
+- The supervisor, not the model, supplies the neutral Oura sentence and any
+  stale-snapshot warning. A current reading is never described as proof of good
+  recovery, and no proprietary score alone selects `light`, `deload`, or
+  `rest`.
+
+Exact readiness cutoffs and fixed percentage deloads are deliberately omitted;
+the evidence for deload prescription is still limited and largely
+[consensus-based](https://pubmed.ncbi.nlm.nih.gov/37730925/). Explicit recent
+injury, illness, or red-flag symptoms always take priority over performance
+data, without diagnosis.
 
 ## Schedule
 

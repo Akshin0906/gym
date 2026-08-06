@@ -34,9 +34,9 @@ from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 
-RUNNER_VERSION = "3.1"
-PROMPT_VERSION = "2026-08-05"
-VALIDATOR_COMPATIBILITY_VERSION = "2026-08-05-periodic-deferral-v3"
+RUNNER_VERSION = "3.2"
+PROMPT_VERSION = "2026-08-05-evidence-v1"
+VALIDATOR_COMPATIBILITY_VERSION = "2026-08-05-evidence-briefing-v4"
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 DEFAULT_CODEX_REASONING_EFFORT = "xhigh"
 PACIFIC = ZoneInfo("America/Los_Angeles")
@@ -45,6 +45,20 @@ RECOVERY_STATUSES = {"fresh", "stale", "unavailable"}
 MEMORY_TYPES = {"workout", "two_week", "four_month"}
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
 TERMINATION_SIGNALS = frozenset({signal.SIGINT, signal.SIGTERM})
+BRIEFING_HEADLINE_MAX = 80
+BRIEFING_TODAYS_CALL_MAX = 280
+BRIEFING_REASON_MAX = 220
+BRIEFING_RECOVERY_MAX = 180
+BRIEFING_TREND_MAX = 200
+BRIEFING_WATCH_OUT_MAX = 220
+MODEL_WATCH_OUT_MAX = 1
+SNAPSHOT_WARNING_AFTER = dt.timedelta(hours=48)
+MODEL_SYNC_WARNING_MARKERS = (
+    "last synced",
+    "open the app to sync",
+    "sync before relying",
+    "workout data may be stale",
+)
 
 # Codex currently materializes these runtime stores even for an ephemeral,
 # tool-disabled `codex exec`. They are state owned by the dedicated automation
@@ -632,9 +646,16 @@ def sanitized_recovery_record(
     observed = parse_iso_datetime(raw.get("observedAt"))
     if observed is None:
         return None
-    age_hours = max(0.0, (now.astimezone(dt.timezone.utc) - observed.astimezone(dt.timezone.utc)).total_seconds() / 3600.0)
+    age_hours = max(
+        0.0,
+        (
+            now.astimezone(dt.timezone.utc)
+            - observed.astimezone(dt.timezone.utc)
+        ).total_seconds()
+        / 3600.0,
+    )
     score = raw.get("score")
-    if not finite_number(score):
+    if not finite_number(score) or not 0 <= float(score) <= 100:
         score = None
     result: dict[str, Any] = {
         "day": raw.get("day") if isinstance(raw.get("day"), str) else None,
@@ -645,7 +666,11 @@ def sanitized_recovery_record(
     }
     if sleep:
         total = raw.get("totalSleepHours")
-        result["totalSleepHours"] = float(total) if finite_number(total) else None
+        result["totalSleepHours"] = (
+            float(total)
+            if finite_number(total) and 0 <= float(total) <= 24
+            else None
+        )
         bedtime_end = raw.get("bedtimeEnd")
         result["bedtimeEnd"] = bedtime_end if isinstance(bedtime_end, str) else None
     return result
@@ -678,6 +703,91 @@ def unavailable_recovery(now: dt.datetime) -> dict[str, Any]:
         "latestReadiness": None,
         "latestSleep": None,
     }
+
+
+def display_metric(value: Any) -> str | None:
+    if not finite_number(value):
+        return None
+    return f"{float(value):.1f}".rstrip("0").rstrip(".")
+
+
+def trusted_recovery_summary(recovery: dict[str, Any]) -> str:
+    status = recovery.get("status")
+    if status == "unavailable":
+        return "Oura unavailable; use workout history only."
+
+    readiness = recovery.get("latestReadiness")
+    sleep = recovery.get("latestSleep")
+    records = [item for item in (readiness, sleep) if isinstance(item, dict)]
+    if status == "stale":
+        ages = [
+            float(item["ageHours"])
+            for item in records
+            if finite_number(item.get("ageHours"))
+        ]
+        if ages:
+            age = display_metric(max(ages))
+            return f"Oura is stale ({age} h old); use workout history for this call."
+        return "Oura is stale; use workout history for this call."
+
+    if status != "fresh":
+        raise ConfigError("Trusted recovery status is invalid")
+
+    sleep_hours = (
+        display_metric(sleep.get("totalSleepHours"))
+        if isinstance(sleep, dict)
+        else None
+    )
+    sleep_score = (
+        display_metric(sleep.get("score")) if isinstance(sleep, dict) else None
+    )
+    readiness_score = (
+        display_metric(readiness.get("score"))
+        if isinstance(readiness, dict)
+        else None
+    )
+    metrics: list[str] = []
+    if sleep_hours is not None:
+        metrics.append(f"{sleep_hours} h sleep")
+    elif sleep_score is not None:
+        metrics.append(f"sleep score {sleep_score}")
+    if readiness_score is not None:
+        metrics.append(f"readiness score {readiness_score}")
+    if not metrics:
+        return "Oura data are current, but no usable sleep or readiness values were supplied."
+    return (
+        f"Oura estimate: {' and '.join(metrics)}; "
+        "use as context, not a diagnosis."
+    )
+
+
+def model_recovery_context(recovery: dict[str, Any]) -> dict[str, Any]:
+    """Expose measurements to the model only when the full recovery pair is fresh."""
+    if recovery.get("status") == "fresh":
+        return recovery
+    return {
+        "generatedAt": recovery.get("generatedAt"),
+        "status": recovery.get("status"),
+        "staleAfterHours": recovery.get("staleAfterHours"),
+        "latestReadiness": None,
+        "latestSleep": None,
+    }
+
+
+def trusted_snapshot_warning(facts: SnapshotFacts, generated_at: int) -> str | None:
+    generated = dt.datetime.fromtimestamp(generated_at / 1000.0, dt.timezone.utc)
+    snapshot = dt.datetime.fromtimestamp(facts.updated_at / 1000.0, dt.timezone.utc)
+    if generated - snapshot <= SNAPSHOT_WARNING_AFTER:
+        return None
+    return (
+        f"Data last synced {facts.updated_date.isoformat()}; if you trained since then, "
+        "open the app to sync before relying on this."
+    )
+
+
+def is_model_sync_warning(value: str) -> bool:
+    normalized = " ".join(value.lower().split())
+    return any(marker in normalized for marker in MODEL_SYNC_WARNING_MARKERS)
 
 
 class RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -939,7 +1049,7 @@ def build_model_prompt(
     inputs = {
         "snapshotResponse": snapshot_body,
         "memoryResponse": memory_body,
-        "recovery": recovery,
+        "recovery": model_recovery_context(recovery),
         "supervisorCandidatePlan": prompt_memory_candidate_plan(
             derive_memory_candidate_plan(facts, memory_body, today=today)
         ),
@@ -1788,32 +1898,63 @@ def validate_model_output(
     briefing = require_object(root.get("briefing"), "briefing")
     if set(briefing) != {"headline", "mode", "sections"}:
         raise ConfigError("briefing must contain only headline, mode, and sections")
-    headline = require_string(briefing.get("headline"), "briefing.headline")[:200]
+    headline = require_bounded_string(
+        briefing.get("headline"),
+        "briefing.headline",
+        BRIEFING_HEADLINE_MAX,
+    )
     mode = briefing.get("mode")
     if mode not in MODES:
         raise ConfigError("briefing.mode is invalid")
     sections = require_object(briefing.get("sections"), "briefing.sections")
-    if set(sections) != {
-        "todaysCall",
-        "why",
-        "recoveryStatus",
-        "ouraRecovery",
-        "trainingTrend",
-        "watchOuts",
-    }:
+    if set(sections) != {"todaysCall", "why", "trainingTrend", "watchOuts"}:
         raise ConfigError("briefing.sections has an invalid shape")
-    recovery_status = sections.get("recoveryStatus")
-    expected_recovery = recovery.get("status")
+    recovery_status = recovery.get("status")
     if recovery_status not in RECOVERY_STATUSES:
-        raise ConfigError("briefing.sections.recoveryStatus is invalid")
-    if recovery_status != expected_recovery:
-        raise ConfigError("Briefing recovery status does not match trusted recovery input")
-    why = string_list(sections.get("why"), "briefing.sections.why", maximum=3)
-    if not 1 <= len(why) <= 3:
-        raise ConfigError("briefing.sections.why must have 1-3 items")
-    watch_outs = string_list(
-        sections.get("watchOuts"), "briefing.sections.watchOuts", maximum=2
+        raise ConfigError("Trusted recovery status is invalid")
+    why = list(
+        dict.fromkeys(
+            string_list(sections.get("why"), "briefing.sections.why", maximum=2)
+        )
     )
+    if not 1 <= len(why) <= 2:
+        raise ConfigError("briefing.sections.why must have 1-2 items")
+    why = [
+        require_bounded_string(
+            item,
+            f"briefing.sections.why[{index}]",
+            BRIEFING_REASON_MAX,
+        )
+        for index, item in enumerate(why)
+    ]
+    model_watch_outs = string_list(
+        sections.get("watchOuts"),
+        "briefing.sections.watchOuts",
+        maximum=MODEL_WATCH_OUT_MAX,
+    )
+    if len(set(model_watch_outs)) != len(model_watch_outs):
+        raise ConfigError("briefing.sections.watchOuts must contain unique items")
+    model_watch_outs = [
+        require_bounded_string(
+            item,
+            f"briefing.sections.watchOuts[{index}]",
+            BRIEFING_WATCH_OUT_MAX,
+        )
+        for index, item in enumerate(model_watch_outs)
+    ]
+    expected_recovery_summary = require_bounded_string(
+        trusted_recovery_summary(recovery),
+        "trusted recovery summary",
+        BRIEFING_RECOVERY_MAX,
+    )
+    snapshot_warning = trusted_snapshot_warning(facts, generated_timestamp)
+    watch_outs = [
+        item
+        for item in model_watch_outs
+        if item != snapshot_warning and not is_model_sync_warning(item)
+    ]
+    if snapshot_warning is not None:
+        watch_outs.append(snapshot_warning)
 
     latest_completed = max(
         (item["completedAt"] for item in facts.completed_workouts),
@@ -1829,19 +1970,20 @@ def validate_model_output(
         "headline": headline,
         "mode": mode,
         "sections": {
-            "todaysCall": require_string(
-                sections.get("todaysCall"), "briefing.sections.todaysCall"
-            )[:600],
-            "why": [item[:400] for item in why],
+            "todaysCall": require_bounded_string(
+                sections.get("todaysCall"),
+                "briefing.sections.todaysCall",
+                BRIEFING_TODAYS_CALL_MAX,
+            ),
+            "why": why,
             "recoveryStatus": recovery_status,
-            "ouraRecovery": require_string(
-                sections.get("ouraRecovery"),
-                "briefing.sections.ouraRecovery",
-            )[:500],
-            "trainingTrend": require_string(
-                sections.get("trainingTrend"), "briefing.sections.trainingTrend"
-            )[:500],
-            "watchOuts": [item[:400] for item in watch_outs],
+            "ouraRecovery": expected_recovery_summary,
+            "trainingTrend": require_bounded_string(
+                sections.get("trainingTrend"),
+                "briefing.sections.trainingTrend",
+                BRIEFING_TREND_MAX,
+            ),
+            "watchOuts": watch_outs,
         },
         "source": "codex-local",
         "model": model,

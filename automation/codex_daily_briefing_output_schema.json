@@ -9,7 +9,7 @@
       "additionalProperties": false,
       "required": ["headline", "mode", "sections"],
       "properties": {
-        "headline": { "type": "string" },
+        "headline": { "type": "string", "minLength": 1, "maxLength": 80 },
         "mode": {
           "type": "string",
           "enum": ["push", "normal", "light", "deload", "rest"]
@@ -20,26 +20,38 @@
           "required": [
             "todaysCall",
             "why",
-            "recoveryStatus",
-            "ouraRecovery",
             "trainingTrend",
             "watchOuts"
           ],
           "properties": {
-            "todaysCall": { "type": "string" },
+            "todaysCall": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 280
+            },
             "why": {
               "type": "array",
-              "items": { "type": "string" }
+              "minItems": 1,
+              "maxItems": 2,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 220
+              }
             },
-            "recoveryStatus": {
+            "trainingTrend": {
               "type": "string",
-              "enum": ["fresh", "stale", "unavailable"]
+              "minLength": 1,
+              "maxLength": 200
             },
-            "ouraRecovery": { "type": "string" },
-            "trainingTrend": { "type": "string" },
             "watchOuts": {
               "type": "array",
-              "items": { "type": "string" }
+              "maxItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 220
+              }
             }
           }
         }
