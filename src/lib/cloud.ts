@@ -12,6 +12,7 @@ import type {
 
 const STATUS_KEY = 'workout-tracker:cloudSyncStatus'
 const AUTH_PAIRED_KEY = 'workout-tracker:cloudAuthPaired'
+const PENDING_SNAPSHOT_KEY = 'workout-tracker:pendingCloudSnapshot'
 const STATUS_EVENT = 'workout-tracker:cloudSyncStatusChanged'
 const MAX_SNAPSHOT_UPLOAD_ATTEMPTS = 3
 
@@ -19,6 +20,17 @@ export type CloudSnapshotTrigger =
   | 'workout_completed'
   | 'chat_action_applied'
   | 'manual'
+
+type DurableCloudSnapshotTrigger = Exclude<
+  CloudSnapshotTrigger,
+  'chat_action_applied'
+>
+
+interface PendingCloudSnapshot {
+  id: string
+  trigger: DurableCloudSnapshotTrigger
+  queuedAt: number
+}
 
 export interface CloudAuthStatus {
   paired: boolean
@@ -174,6 +186,68 @@ function setCloudAuthPaired(paired: boolean): void {
     window.dispatchEvent(new Event(STATUS_EVENT))
   } catch {
     // localStorage may be unavailable; the server cookie still controls auth.
+  }
+}
+
+function readPendingCloudSnapshot(): PendingCloudSnapshot | null {
+  try {
+    const raw = localStorage.getItem(PENDING_SNAPSHOT_KEY)
+    if (!raw) return null
+    const parsed: unknown = JSON.parse(raw)
+    if (
+      !isObject(parsed) ||
+      typeof parsed.id !== 'string' ||
+      !parsed.id ||
+      (parsed.trigger !== 'workout_completed' && parsed.trigger !== 'manual') ||
+      typeof parsed.queuedAt !== 'number' ||
+      !Number.isFinite(parsed.queuedAt)
+    ) {
+      return null
+    }
+    return {
+      id: parsed.id,
+      trigger: parsed.trigger,
+      queuedAt: parsed.queuedAt,
+    }
+  } catch {
+    return null
+  }
+}
+
+export function hasPendingCloudSnapshotSync(): boolean {
+  return readPendingCloudSnapshot() !== null
+}
+
+function queueCloudSnapshotSync(
+  trigger: CloudSnapshotTrigger,
+): PendingCloudSnapshot | null {
+  // Coach action receipts already provide their own durable, reservation-aware
+  // retry protocol. A generic retry could outlive that reservation, so only
+  // normal phone snapshots use this marker.
+  if (trigger === 'chat_action_applied') return null
+  const pending: PendingCloudSnapshot = {
+    id: crypto.randomUUID(),
+    trigger,
+    queuedAt: Date.now(),
+  }
+  try {
+    localStorage.setItem(PENDING_SNAPSHOT_KEY, JSON.stringify(pending))
+    window.dispatchEvent(new Event(STATUS_EVENT))
+    return pending
+  } catch {
+    // The upload may still succeed even when localStorage is unavailable.
+    return null
+  }
+}
+
+function clearPendingCloudSnapshot(pending: PendingCloudSnapshot | null): void {
+  if (!pending) return
+  try {
+    if (readPendingCloudSnapshot()?.id !== pending.id) return
+    localStorage.removeItem(PENDING_SNAPSHOT_KEY)
+    window.dispatchEvent(new Event(STATUS_EVENT))
+  } catch {
+    // A completed upload is still valid when localStorage is unavailable.
   }
 }
 
@@ -431,6 +505,51 @@ async function currentSnapshotUpdatedAt(): Promise<number | null> {
   return updatedAt
 }
 
+interface CompletedWorkoutSummary {
+  count: number
+  latestCompletedAt: number | null
+}
+
+function completedWorkoutSummary(raw: unknown): CompletedWorkoutSummary {
+  if (!Array.isArray(raw)) {
+    throw new Error('Malformed cloud workout snapshot')
+  }
+  let count = 0
+  let latestCompletedAt: number | null = null
+  for (const item of raw) {
+    if (!isObject(item)) continue
+    const completedAt = item.completedAt
+    if (typeof completedAt !== 'number' || !Number.isFinite(completedAt)) continue
+    count += 1
+    if (latestCompletedAt === null || completedAt > latestCompletedAt) {
+      latestCompletedAt = completedAt
+    }
+  }
+  return { count, latestCompletedAt }
+}
+
+async function currentCloudWorkoutSummary(): Promise<CompletedWorkoutSummary | null> {
+  const res = await fetch('/api/cloud/snapshot', {
+    credentials: 'include',
+    cache: 'no-store',
+  })
+  if (res.status === 401) throw authLostError()
+  if (res.status === 404) return null
+  if (!res.ok) {
+    const detail = await responseDetail(res)
+    throw new Error(
+      `Cloud snapshot recovery check failed (${res.status})${detail ? `: ${detail}` : ''}`,
+    )
+  }
+
+  const body: unknown = await res.json()
+  const snapshot = isObject(body) ? body.snapshot : null
+  const payload = isObject(snapshot) ? snapshot.payload : null
+  const data = isObject(payload) ? payload.data : null
+  if (!isObject(data)) throw new Error('Malformed cloud workout snapshot')
+  return completedWorkoutSummary(data.workoutSessions)
+}
+
 async function responseErrorCode(res: Response): Promise<string | null> {
   try {
     const body: unknown = await res.clone().json()
@@ -443,8 +562,14 @@ async function responseErrorCode(res: Response): Promise<string | null> {
 export async function uploadCloudSnapshot(
   trigger: CloudSnapshotTrigger,
 ): Promise<{ updatedAt: number }> {
+  const pending = queueCloudSnapshotSync(trigger)
   try {
-    if (!isCloudConfigured()) throw authLostError()
+    // The cached pairing bit is advisory. A valid secure server cookie can
+    // outlive localStorage, so repair that state before abandoning an upload.
+    if (!isCloudConfigured()) {
+      const auth = await getCloudAuthStatus()
+      if (!auth.paired) throw authLostError()
+    }
     for (let attempt = 0; attempt < MAX_SNAPSHOT_UPLOAD_ATTEMPTS; attempt += 1) {
       const baseUpdatedAt = await currentSnapshotUpdatedAt()
       const payload = await buildExportPayload()
@@ -493,6 +618,7 @@ export async function uploadCloudSnapshot(
         lastSnapshotTrigger: trigger,
         lastSnapshotError: null,
       })
+      clearPendingCloudSnapshot(pending)
       return { updatedAt }
     }
     throw new Error('Cloud snapshot failed after version retries')
@@ -501,6 +627,37 @@ export async function uploadCloudSnapshot(
     saveStatus({ lastSnapshotError: message })
     throw err
   }
+}
+
+export async function recoverCloudSnapshot(): Promise<boolean> {
+  if (!isCloudConfigured()) return false
+
+  const pending = readPendingCloudSnapshot()
+  if (pending) {
+    await uploadCloudSnapshot(pending.trigger)
+    return true
+  }
+
+  // This repairs workouts completed by an older app build, before durable
+  // pending markers existed. Only move the mirror forward when this device has
+  // a newer completed workout; do not overwrite a newer cloud source.
+  const [cloud, localPayload] = await Promise.all([
+    currentCloudWorkoutSummary(),
+    buildExportPayload(),
+  ])
+  const local = completedWorkoutSummary(localPayload.data.workoutSessions)
+  const cloudLatest = cloud?.latestCompletedAt ?? null
+  const localIsNewer =
+    local.latestCompletedAt !== null &&
+    (cloudLatest === null || local.latestCompletedAt > cloudLatest)
+  const localHasAdditionalLatestWorkout =
+    local.latestCompletedAt !== null &&
+    local.latestCompletedAt === cloudLatest &&
+    local.count > (cloud?.count ?? 0)
+  if (!localIsNewer && !localHasAdditionalLatestWorkout) return false
+
+  await uploadCloudSnapshot('workout_completed')
+  return true
 }
 
 export async function fetchLatestCloudBriefing(): Promise<DailyBriefing | null> {
@@ -591,6 +748,13 @@ export function installCloudBriefingRefresh(): void {
     if (inFlight || document.visibilityState !== 'visible') return
     inFlight = true
     try {
+      try {
+        const auth = await getCloudAuthStatus()
+        if (auth.paired) await recoverCloudSnapshot()
+      } catch {
+        // Recovery status is persisted by the upload path. Briefing and memory
+        // downloads remain independently useful during a transient failure.
+      }
       await Promise.allSettled([
         fetchLatestCloudBriefing(),
         fetchCloudMemory(),
@@ -607,4 +771,5 @@ export function installCloudBriefingRefresh(): void {
     if (document.visibilityState === 'visible') void refresh()
   })
   window.addEventListener('focus', () => void refresh())
+  window.addEventListener('online', () => void refresh())
 }

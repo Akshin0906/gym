@@ -643,10 +643,12 @@ class StatusTests(unittest.TestCase):
             config.credential_file.write_text(
                 "CLOUD_AUTOMATION_SECRET=test-secret\n", encoding="utf-8"
             )
-            today = dt.datetime.now(PACIFIC).date().isoformat()
+            now = dt.datetime.now(PACIFIC)
+            today = now.date().isoformat()
+            updated_at = int(now.timestamp() * 1000)
             existing = {
                 "briefingDate": today,
-                "snapshotUpdatedAt": 123,
+                "snapshotUpdatedAt": updated_at,
                 "inputSummary": {
                     "recoveryStatus": "fresh",
                     "recoveryFreshnessPolicy": runner.RECOVERY_FRESHNESS_POLICY,
@@ -656,7 +658,10 @@ class StatusTests(unittest.TestCase):
                 },
             }
             cloud = mock.Mock()
-            cloud.request.return_value = (200, {"briefing": existing})
+            cloud.request.side_effect = [
+                (200, {"briefing": existing}),
+                (200, snapshot_body(updated_at)),
+            ]
 
             with mock.patch.object(runner, "CloudClient", return_value=cloud):
                 result = runner.run(
@@ -674,6 +679,93 @@ class StatusTests(unittest.TestCase):
             self.assertEqual(status["recoveryEvaluationDate"], today)
             self.assertEqual(status["recoveryReadinessDay"], today)
             self.assertEqual(status["recoverySleepDay"], today)
+            self.assertEqual(status["snapshotUpdatedAt"], updated_at)
+            self.assertEqual(
+                [call.args[:2] for call in cloud.request.call_args_list],
+                [
+                    ("GET", f"/api/cloud/briefing/{today}"),
+                    ("GET", "/api/cloud/snapshot"),
+                ],
+            )
+
+    def test_newer_snapshot_replaces_an_existing_same_day_briefing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config = test_config(root)
+            config.credential_file.write_text(
+                "CLOUD_AUTOMATION_SECRET=test-secret\n", encoding="utf-8"
+            )
+            now = dt.datetime.now(PACIFIC)
+            today = now.date().isoformat()
+            updated_at = int(now.timestamp() * 1000)
+            existing = {
+                "briefingDate": today,
+                "snapshotUpdatedAt": updated_at - 1,
+                "inputSummary": {},
+            }
+            cloud = mock.Mock()
+            cloud.request.side_effect = [
+                (200, {"briefing": existing}),
+                (200, snapshot_body(updated_at)),
+                (200, {"revision": 0, "state": None, "items": []}),
+            ]
+
+            with mock.patch.object(
+                runner, "CloudClient", return_value=cloud
+            ), mock.patch.object(
+                runner,
+                "run_oura",
+                side_effect=RuntimeError("reached recovery refresh"),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "reached recovery refresh"
+                ):
+                    runner.run(
+                        config,
+                        runner.parse_args(["--ignore-schedule", "--dry-run"]),
+                    )
+
+            self.assertEqual(
+                [call.args[:2] for call in cloud.request.call_args_list],
+                [
+                    ("GET", f"/api/cloud/briefing/{today}"),
+                    ("GET", "/api/cloud/snapshot"),
+                    ("GET", "/api/cloud/memory"),
+                ],
+            )
+
+    def test_older_snapshot_cannot_replace_a_same_day_briefing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config = test_config(root)
+            config.credential_file.write_text(
+                "CLOUD_AUTOMATION_SECRET=test-secret\n", encoding="utf-8"
+            )
+            now = dt.datetime.now(PACIFIC)
+            today = now.date().isoformat()
+            updated_at = int(now.timestamp() * 1000)
+            existing = {
+                "briefingDate": today,
+                "snapshotUpdatedAt": updated_at + 1,
+                "inputSummary": {},
+            }
+            cloud = mock.Mock()
+            cloud.request.side_effect = [
+                (200, {"briefing": existing}),
+                (200, snapshot_body(updated_at)),
+            ]
+
+            with mock.patch.object(runner, "CloudClient", return_value=cloud):
+                with self.assertRaisesRegex(
+                    runner.ConfigError,
+                    "Cloud snapshot predates the existing same-day briefing",
+                ):
+                    runner.run(
+                        config,
+                        runner.parse_args(["--ignore-schedule", "--dry-run"]),
+                    )
+
+            self.assertEqual(len(cloud.request.call_args_list), 2)
 
     def test_legacy_existing_briefing_tolerates_missing_diagnostics(self) -> None:
         diagnostics = runner.briefing_recovery_diagnostics(

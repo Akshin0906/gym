@@ -5,6 +5,9 @@ import {
 } from '../db/repositories/exportImport'
 import {
   getCloudSyncStatus,
+  hasPendingCloudSnapshotSync,
+  installCloudBriefingRefresh,
+  recoverCloudSnapshot,
   unpairCloudDevice,
   uploadCloudSnapshot,
 } from './cloud'
@@ -31,7 +34,7 @@ class TestStorage {
   }
 }
 
-function payload(exportedAt: number): ExportPayload {
+function payload(exportedAt: number, completedAt?: number): ExportPayload {
   return {
     schemaVersion: 4,
     exportedAt,
@@ -41,7 +44,21 @@ function payload(exportedAt: number): ExportPayload {
       programs: [],
       sessionTemplates: [],
       templateExercises: [],
-      workoutSessions: [],
+      workoutSessions:
+        completedAt === undefined
+          ? []
+          : [
+              {
+                id: `workout-${completedAt}`,
+                sessionTemplateId: null,
+                programId: null,
+                name: 'Upper',
+                programName: null,
+                exerciseSnapshot: [],
+                startedAt: completedAt,
+                completedAt,
+              },
+            ],
       loggedSets: [],
       recommendations: [],
       dailyBriefings: [],
@@ -63,6 +80,17 @@ function jsonResponse(body: unknown, status = 200): Response {
 function requestHeaders(fetchMock: ReturnType<typeof vi.fn>, index: number) {
   const init = fetchMock.mock.calls[index]?.[1] as RequestInit | undefined
   return new Headers(init?.headers)
+}
+
+function deferred<T>(): {
+  promise: Promise<T>
+  resolve: (value: T) => void
+} {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
 }
 
 describe('cloud snapshot version CAS', () => {
@@ -220,6 +248,139 @@ describe('cloud snapshot version CAS', () => {
 
     expect(storage.getItem(AUTH_PAIRED_KEY)).toBeNull()
     expect(mockedBuildExportPayload).not.toHaveBeenCalled()
+    expect(hasPendingCloudSnapshotSync()).toBe(true)
+  })
+
+  it('self-heals a valid server session when the cached pairing flag is missing', async () => {
+    storage.removeItem(AUTH_PAIRED_KEY)
+    const fetchMock = vi.fn<typeof fetch>()
+    vi.stubGlobal('fetch', fetchMock)
+    mockedBuildExportPayload.mockResolvedValue(payload(1))
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({
+          paired: true,
+          device: {
+            id: 'phone',
+            name: 'Phone PWA',
+            createdAt: 1,
+            lastSeenAt: 2,
+            expiresAt: 3,
+          },
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ snapshot: { updatedAt: 7 } }))
+      .mockResolvedValueOnce(jsonResponse({ snapshot: { updatedAt: 8 } }))
+
+    await expect(uploadCloudSnapshot('workout_completed')).resolves.toEqual({
+      updatedAt: 8,
+    })
+
+    expect(storage.getItem(AUTH_PAIRED_KEY)).toBe('1')
+    expect(hasPendingCloudSnapshotSync()).toBe(false)
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      '/api/auth/cloud',
+      '/api/cloud/snapshot',
+      '/api/cloud/snapshot',
+    ])
+  })
+
+  it('keeps a failed workout snapshot pending and retries it later', async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+    vi.stubGlobal('fetch', fetchMock)
+    mockedBuildExportPayload.mockResolvedValue(payload(1, 20))
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ snapshot: { updatedAt: 7 } }))
+      .mockResolvedValueOnce(
+        jsonResponse({ error: 'temporary_failure' }, 500),
+      )
+      .mockResolvedValueOnce(jsonResponse({ snapshot: { updatedAt: 7 } }))
+      .mockResolvedValueOnce(jsonResponse({ snapshot: { updatedAt: 8 } }))
+
+    await expect(uploadCloudSnapshot('workout_completed')).rejects.toThrow(
+      'Cloud snapshot failed (500)',
+    )
+    expect(hasPendingCloudSnapshotSync()).toBe(true)
+
+    await expect(recoverCloudSnapshot()).resolves.toBe(true)
+
+    expect(hasPendingCloudSnapshotSync()).toBe(false)
+    expect(mockedBuildExportPayload).toHaveBeenCalledTimes(2)
+  })
+
+  it('recovers a newer local workout completed by an older app build', async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+    vi.stubGlobal('fetch', fetchMock)
+    mockedBuildExportPayload.mockResolvedValue(payload(1, 200))
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({
+          snapshot: {
+            payload: {
+              data: {
+                workoutSessions: [{ id: 'older', completedAt: 100 }],
+              },
+            },
+          },
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ snapshot: { updatedAt: 7 } }))
+      .mockResolvedValueOnce(jsonResponse({ snapshot: { updatedAt: 8 } }))
+
+    await expect(recoverCloudSnapshot()).resolves.toBe(true)
+
+    expect(mockedBuildExportPayload).toHaveBeenCalledTimes(2)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(hasPendingCloudSnapshotSync()).toBe(false)
+  })
+
+  it('does not overwrite a cloud mirror with a newer completed workout', async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+    vi.stubGlobal('fetch', fetchMock)
+    mockedBuildExportPayload.mockResolvedValue(payload(1, 100))
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        snapshot: {
+          payload: {
+            data: {
+              workoutSessions: [{ id: 'newer', completedAt: 200 }],
+            },
+          },
+        },
+      }),
+    )
+
+    await expect(recoverCloudSnapshot()).resolves.toBe(false)
+
+    expect(mockedBuildExportPayload).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(hasPendingCloudSnapshotSync()).toBe(false)
+  })
+
+  it('does not clear a newer pending generation when an older upload finishes', async () => {
+    const firstPut = deferred<Response>()
+    const secondPut = deferred<Response>()
+    const fetchMock = vi.fn<typeof fetch>()
+    vi.stubGlobal('fetch', fetchMock)
+    mockedBuildExportPayload.mockResolvedValue(payload(1, 200))
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ snapshot: { updatedAt: 7 } }))
+      .mockImplementationOnce(() => firstPut.promise)
+      .mockResolvedValueOnce(jsonResponse({ snapshot: { updatedAt: 7 } }))
+      .mockImplementationOnce(() => secondPut.promise)
+
+    const first = uploadCloudSnapshot('workout_completed')
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    const second = uploadCloudSnapshot('workout_completed')
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4))
+
+    firstPut.resolve(jsonResponse({ snapshot: { updatedAt: 8 } }))
+    await expect(first).resolves.toEqual({ updatedAt: 8 })
+    expect(hasPendingCloudSnapshotSync()).toBe(true)
+
+    secondPut.resolve(jsonResponse({ snapshot: { updatedAt: 9 } }))
+    await expect(second).resolves.toEqual({ updatedAt: 9 })
+    expect(hasPendingCloudSnapshotSync()).toBe(false)
   })
 
   it('keeps the local pairing active when sign-out is blocked by a reserved action', async () => {
@@ -234,5 +395,34 @@ describe('cloud snapshot version CAS', () => {
     )
 
     expect(storage.getItem(AUTH_PAIRED_KEY)).toBe('1')
+  })
+
+  it('registers snapshot recovery for foreground and online transitions', () => {
+    const addDocumentListener = vi.fn()
+    const addWindowListener = vi.fn()
+    vi.stubGlobal('document', {
+      visibilityState: 'hidden',
+      addEventListener: addDocumentListener,
+    })
+    vi.stubGlobal('window', {
+      dispatchEvent: vi.fn(),
+      addEventListener: addWindowListener,
+      removeEventListener: vi.fn(),
+    })
+
+    installCloudBriefingRefresh()
+
+    expect(addDocumentListener).toHaveBeenCalledWith(
+      'visibilitychange',
+      expect.any(Function),
+    )
+    expect(addWindowListener).toHaveBeenCalledWith(
+      'focus',
+      expect.any(Function),
+    )
+    expect(addWindowListener).toHaveBeenCalledWith(
+      'online',
+      expect.any(Function),
+    )
   })
 })

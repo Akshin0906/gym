@@ -27,7 +27,7 @@ import type {
   SliderValue,
   WorkoutSession,
 } from '../db/types'
-import { isCloudConfigured, uploadCloudSnapshot } from '../lib/cloud'
+import { uploadCloudSnapshot } from '../lib/cloud'
 import { shouldCompleteExerciseAfterRest } from '../lib/workoutFlow'
 import { useUnsavedChangesWarning } from '../lib/useUnsavedChangesWarning'
 import { useActiveWorkout } from '../store/activeWorkout'
@@ -166,11 +166,12 @@ export function ActiveWorkoutScreen() {
     // leave it in limbo. Feedback fields are patched after, or stay null
     // if the user skips.
     await endSession(session.id)
-    completionSyncRef.current = isCloudConfigured()
-      ? uploadCloudSnapshot('workout_completed').catch(() => {
-          // The completed session is durable locally; Settings surfaces sync errors.
-        })
-      : Promise.resolve()
+    completionSyncRef.current = uploadCloudSnapshot('workout_completed').catch(
+      () => {
+        // The completed session and pending-sync marker are durable locally;
+        // startup, foreground, and online recovery will try again.
+      },
+    )
     setFeedbackForSessionId(session.id)
   }
 
@@ -185,11 +186,9 @@ export function ActiveWorkoutScreen() {
       const completionSync = completionSyncRef.current
       void (async () => {
         await completionSync
-        if (isCloudConfigured()) {
-          await uploadCloudSnapshot('workout_completed')
-        }
+        await uploadCloudSnapshot('workout_completed')
       })().catch(() => {
-        // Settings keeps the last sync error; completion should not block.
+        // Settings keeps the last sync error and recovery keeps the retry.
       })
     }
     setActiveSession(null)

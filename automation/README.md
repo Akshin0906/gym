@@ -13,7 +13,7 @@ while plugged in; the display can still sleep.
 The job deliberately separates trusted operations from model reasoning:
 
 1. A Python supervisor acquires an OS-released file lock.
-2. It retries compatible pending uploads, checks for an existing same-day briefing, and validates the cloud snapshot.
+2. It retries compatible pending uploads, validates the current cloud snapshot, and reuses an existing same-day briefing only when it was built from that exact snapshot.
 3. It refreshes Oura through the local OAuth companion and sanitizes recovery data.
 4. It fetches the existing Codex-owned training memory.
 5. It invokes `codex exec` with ChatGPT subscription authentication.
@@ -70,7 +70,9 @@ data, without diagnosis.
 The launch agent tries at 10:30 AM Pacific, then at 11:00 AM, noon, 3:00 PM,
 4:00 PM, 6:00 PM, and 9:00 PM. It also checks once after login. The later
 launches provide bounded upload retries; all attempts are idempotent and stop
-before Codex when a verified briefing already exists.
+before Codex when a verified briefing already matches the current phone
+snapshot. If a completed workout reaches the cloud later that day, the next
+scheduled check replaces the older briefing automatically.
 
 When Oura is stale or unavailable before noon, the early runs wait for the next
 catch-up instead of permanently publishing a recovery-blind briefing. At noon

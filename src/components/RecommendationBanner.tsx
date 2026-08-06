@@ -181,13 +181,32 @@ function displayDate(value: string): string {
 }
 
 export function briefingDateLabel(briefing: DailyBriefing): string {
-  const base = `${displayDate(briefing.briefingDate)} briefing`
-  if (!briefing.snapshotUpdatedAt) return base
+  const labels = [`${displayDate(briefing.briefingDate)} briefing`]
+  const input = briefing.inputSummary
+  const latestCompletedWorkoutAt =
+    input !== null &&
+    typeof input === 'object' &&
+    'latestCompletedWorkoutAt' in input &&
+    typeof input.latestCompletedWorkoutAt === 'number' &&
+    Number.isFinite(input.latestCompletedWorkoutAt)
+      ? input.latestCompletedWorkoutAt
+      : null
 
-  const dataDate = pacificDate(new Date(briefing.snapshotUpdatedAt))
-  if (!dataDate || dataDate === briefing.briefingDate) return base
+  if (latestCompletedWorkoutAt !== null) {
+    const workoutDate = pacificDate(new Date(latestCompletedWorkoutAt))
+    if (workoutDate && workoutDate !== briefing.briefingDate) {
+      labels.push(`workout data through ${displayDate(workoutDate)}`)
+    }
+  }
 
-  return `${base} · workout data through ${displayDate(dataDate)}`
+  if (briefing.snapshotUpdatedAt) {
+    const snapshotDate = pacificDate(new Date(briefing.snapshotUpdatedAt))
+    if (snapshotDate && snapshotDate !== briefing.briefingDate) {
+      labels.push(`snapshot synced ${displayDate(snapshotDate)}`)
+    }
+  }
+
+  return labels.join(' · ')
 }
 
 export function BriefingSections({

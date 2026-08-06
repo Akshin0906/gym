@@ -34,7 +34,7 @@ from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 
-RUNNER_VERSION = "3.3"
+RUNNER_VERSION = "3.4"
 PROMPT_VERSION = "2026-08-05-evidence-v1"
 VALIDATOR_COMPATIBILITY_VERSION = "2026-08-06-oura-calendar-v5"
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
@@ -2679,6 +2679,8 @@ def run(config: Config, args: argparse.Namespace) -> int:
         existing_status, existing_body = cloud.request(
             "GET", f"/api/cloud/briefing/{today}", expected={200, 404}
         )
+        snapshot_body: Any | None = None
+        facts: SnapshotFacts | None = None
         if existing_status == 200 and not args.force:
             existing = require_object(
                 require_object(existing_body, "existing briefing response").get("briefing"),
@@ -2686,23 +2688,44 @@ def run(config: Config, args: argparse.Namespace) -> int:
             )
             if existing.get("briefingDate") != today:
                 raise ConfigError("Existing briefing response has the wrong date")
-            existing_recovery_diagnostics = briefing_recovery_diagnostics(existing)
-            update_status(
-                config,
-                date=today,
-                runId=run_id,
-                stage="complete",
-                outcome="exists",
-                message="A verified same-day briefing already exists",
-                snapshotUpdatedAt=existing.get("snapshotUpdatedAt"),
-                log=str(log_path),
-                **existing_recovery_diagnostics,
+            existing_snapshot_updated_at = require_epoch_ms(
+                existing.get("snapshotUpdatedAt"),
+                "existing briefing.snapshotUpdatedAt",
             )
-            logger.info("A same-day briefing already exists; exiting")
-            return EXIT_OK
+            _, snapshot_body = cloud.request(
+                "GET", "/api/cloud/snapshot", expected={200}
+            )
+            facts = validate_snapshot(snapshot_body, now.date())
+            if existing_snapshot_updated_at == facts.updated_at:
+                existing_recovery_diagnostics = briefing_recovery_diagnostics(existing)
+                update_status(
+                    config,
+                    date=today,
+                    runId=run_id,
+                    stage="complete",
+                    outcome="exists",
+                    message="The same-day briefing matches the latest cloud snapshot",
+                    snapshotUpdatedAt=facts.updated_at,
+                    log=str(log_path),
+                    **existing_recovery_diagnostics,
+                )
+                logger.info(
+                    "The same-day briefing matches the latest cloud snapshot; exiting"
+                )
+                return EXIT_OK
+            if facts.updated_at < existing_snapshot_updated_at:
+                raise ConfigError(
+                    "Cloud snapshot predates the existing same-day briefing"
+                )
+            logger.info(
+                "Cloud snapshot changed after the same-day briefing; regenerating"
+            )
 
-        _, snapshot_body = cloud.request("GET", "/api/cloud/snapshot", expected={200})
-        facts = validate_snapshot(snapshot_body, now.date())
+        if snapshot_body is None or facts is None:
+            _, snapshot_body = cloud.request(
+                "GET", "/api/cloud/snapshot", expected={200}
+            )
+            facts = validate_snapshot(snapshot_body, now.date())
         logger.info("Cloud snapshot is usable; source date %s", facts.updated_date)
 
         _, memory_body = cloud.request("GET", "/api/cloud/memory", expected={200})

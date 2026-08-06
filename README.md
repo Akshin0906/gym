@@ -71,8 +71,9 @@ briefing design.
 ## Engineering highlights
 
 - **Offline and resilient:** route chunks and assets are precached, active
-  workouts survive reloads, and backup imports validate the complete graph before
-  replacing any local data.
+  workouts survive reloads, failed completion snapshots retry after startup,
+  foregrounding, or reconnecting, and backup imports validate the complete graph
+  before replacing any local data.
 - **Race-safe cloud writes:** snapshot compare-and-swap, reservation ownership,
   logout fencing, and exact receipt replay prevent duplicate or stale Coach
   actions.

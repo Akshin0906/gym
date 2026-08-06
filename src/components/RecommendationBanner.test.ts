@@ -59,7 +59,27 @@ describe('RecommendationBanner presentation', () => {
     expect(recoveryStatusLabel(undefined)).toBeNull()
   })
 
-  it('humanizes briefing and workout-data dates without timezone drift', () => {
+  it('uses the completed-workout date instead of the snapshot upload date', () => {
+    const briefing: DailyBriefing = {
+      briefingDate: '2026-08-05',
+      createdAt: Date.parse('2026-08-05T19:00:00Z'),
+      source: 'codex-local',
+      snapshotUpdatedAt: Date.parse('2026-08-01T19:00:00Z'),
+      headline: 'Run Upper as written',
+      mode: 'normal',
+      sections,
+      model: 'gpt-5.6-sol',
+      inputSummary: {
+        latestCompletedWorkoutAt: Date.parse('2026-07-30T23:00:00Z'),
+      },
+    }
+
+    expect(briefingDateLabel(briefing)).toBe(
+      'Aug 5 briefing · workout data through Jul 30 · snapshot synced Aug 1',
+    )
+  })
+
+  it('labels the upload date as a snapshot for legacy briefing data', () => {
     const briefing: DailyBriefing = {
       briefingDate: '2026-08-05',
       createdAt: Date.parse('2026-08-05T19:00:00Z'),
@@ -73,7 +93,7 @@ describe('RecommendationBanner presentation', () => {
     }
 
     expect(briefingDateLabel(briefing)).toBe(
-      'Aug 5 briefing · workout data through Aug 1',
+      'Aug 5 briefing · snapshot synced Aug 1',
     )
   })
 })
