@@ -97,11 +97,19 @@ export const onRequest = async (ctx: PagesContext): Promise<Response> => {
       {
         method: 'GET',
         headers: { Authorization: auth, Accept: 'application/json' },
-        redirect: 'error',
+        // This deployed Workers compatibility runtime supports only `follow`
+        // and `manual`. Manual keeps the bearer token on the fixed Oura origin;
+        // reject redirects below.
+        redirect: 'manual',
       },
     )
   } catch (error) {
     console.error('oura proxy failure', error)
+    return json(502, { error: 'upstream_unavailable' })
+  }
+
+  if (upstream.status >= 300 && upstream.status < 400) {
+    console.error('oura proxy rejected an upstream redirect')
     return json(502, { error: 'upstream_unavailable' })
   }
 

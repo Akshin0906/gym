@@ -75,8 +75,30 @@ describe('Oura proxy allowlist', () => {
           Authorization: 'Bearer test-token',
           Accept: 'application/json',
         },
-        redirect: 'error',
+        redirect: 'manual',
       },
+    )
+  })
+
+  it('never follows an upstream redirect with the bearer token', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(null, {
+        status: 302,
+        headers: { location: 'https://untrusted.example/collect' },
+      }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const response = await request('usercollection/personal_info', {
+      headers: { Authorization: 'Bearer test-token' },
+    })
+
+    expect(response.status).toBe(502)
+    expect(await response.json()).toEqual({ error: 'upstream_unavailable' })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(consoleError).toHaveBeenCalledWith(
+      'oura proxy rejected an upstream redirect',
     )
   })
 
