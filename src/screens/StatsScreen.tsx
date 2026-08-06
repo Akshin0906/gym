@@ -304,7 +304,10 @@ export function StatsScreen() {
                           labelFormatter={(t) =>
                             format(t as number, 'MMM d, yyyy')
                           }
-                          formatter={(v: number) => [`${v} lb`, undefined]}
+                          formatter={(value) => [
+                            typeof value === 'number' ? `${value} lb` : '—',
+                            undefined,
+                          ]}
                         />
                         {selectedExs.length > 1 && (
                           <Legend wrapperStyle={{ fontSize: 11 }} />

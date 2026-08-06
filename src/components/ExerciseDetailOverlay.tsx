@@ -270,7 +270,10 @@ export function ExerciseDetailOverlay({
                       labelFormatter={(t) =>
                         format(t as number, 'MMM d, yyyy')
                       }
-                      formatter={(v: number) => [`${v} lb`, 'est 1RM']}
+                      formatter={(value) => [
+                        typeof value === 'number' ? `${value} lb` : '—',
+                        'est 1RM',
+                      ]}
                     />
                     <Line
                       type="monotone"
