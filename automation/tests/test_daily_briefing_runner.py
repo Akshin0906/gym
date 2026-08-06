@@ -636,6 +636,57 @@ class StatusTests(unittest.TestCase):
             self.assertNotIn("runId", status)
             self.assertNotIn("newMemoryItemCount", status)
 
+    def test_existing_briefing_preserves_recovery_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config = test_config(root)
+            config.credential_file.write_text(
+                "CLOUD_AUTOMATION_SECRET=test-secret\n", encoding="utf-8"
+            )
+            today = dt.datetime.now(PACIFIC).date().isoformat()
+            existing = {
+                "briefingDate": today,
+                "snapshotUpdatedAt": 123,
+                "inputSummary": {
+                    "recoveryStatus": "fresh",
+                    "recoveryFreshnessPolicy": runner.RECOVERY_FRESHNESS_POLICY,
+                    "recoveryEvaluationDate": today,
+                    "recoveryReadinessDay": today,
+                    "recoverySleepDay": today,
+                },
+            }
+            cloud = mock.Mock()
+            cloud.request.return_value = (200, {"briefing": existing})
+
+            with mock.patch.object(runner, "CloudClient", return_value=cloud):
+                result = runner.run(
+                    config, runner.parse_args(["--ignore-schedule", "--dry-run"])
+                )
+
+            self.assertEqual(result, runner.EXIT_OK)
+            status = runner.read_json(config.state_dir / "status.json")
+            self.assertEqual(status["outcome"], "exists")
+            self.assertEqual(status["recoveryStatus"], "fresh")
+            self.assertEqual(
+                status["recoveryFreshnessPolicy"],
+                runner.RECOVERY_FRESHNESS_POLICY,
+            )
+            self.assertEqual(status["recoveryEvaluationDate"], today)
+            self.assertEqual(status["recoveryReadinessDay"], today)
+            self.assertEqual(status["recoverySleepDay"], today)
+
+    def test_legacy_existing_briefing_tolerates_missing_diagnostics(self) -> None:
+        diagnostics = runner.briefing_recovery_diagnostics(
+            {
+                "inputSummary": {
+                    "recoveryStatus": "stale",
+                    "recoveryFreshnessPolicy": "elapsed_hours_v1",
+                }
+            }
+        )
+
+        self.assertEqual(diagnostics, {"recoveryStatus": "stale"})
+
 
 class SchedulingTests(unittest.TestCase):
     def test_daily_gate(self) -> None:
@@ -660,6 +711,26 @@ class SchedulingTests(unittest.TestCase):
             runner.is_before_oura_grace(
                 dt.datetime(2026, 8, 1, 12, 0, tzinfo=PACIFIC), 12
             )
+        )
+
+    def test_ignore_schedule_does_not_override_oura_grace(self) -> None:
+        before_grace = dt.datetime(2026, 8, 1, 9, 0, tzinfo=PACIFIC)
+
+        self.assertTrue(
+            runner.should_wait_for_oura(
+                "stale", before_grace, 12, force=False
+            )
+        )
+        self.assertTrue(
+            runner.should_wait_for_oura(
+                "unavailable", before_grace, 12, force=False
+            )
+        )
+        self.assertFalse(
+            runner.should_wait_for_oura("fresh", before_grace, 12, force=False)
+        )
+        self.assertFalse(
+            runner.should_wait_for_oura("stale", before_grace, 12, force=True)
         )
 
     def test_memory_calendar_windows_follow_pacific_boundaries(self) -> None:
@@ -710,6 +781,173 @@ class InputValidationTests(unittest.TestCase):
         self.assertEqual(sanitized["status"], "stale")
         self.assertTrue(sanitized["latestReadiness"]["isStale"])
 
+    def test_current_pacific_day_is_fresh_despite_midnight_utc_marker(self) -> None:
+        now = dt.datetime(2026, 8, 5, 20, 41, tzinfo=PACIFIC)
+        raw = {
+            "status": "stale",
+            "latestReadiness": {
+                "day": "2026-08-05",
+                "score": 75,
+                "observedAt": "2026-08-05T00:00:00+00:00",
+                "isStale": True,
+            },
+            "latestSleep": {
+                "day": "2026-08-05",
+                "score": 78,
+                "observedAt": "2026-08-05T00:00:00+00:00",
+                "isStale": True,
+            },
+        }
+
+        sanitized = runner.sanitize_recovery(raw, now)
+
+        self.assertEqual(sanitized["status"], "fresh")
+        self.assertFalse(sanitized["latestReadiness"]["isStale"])
+        self.assertIsNone(sanitized["latestReadiness"]["ageHours"])
+        self.assertIsNone(sanitized["latestReadiness"]["observedAt"])
+        self.assertEqual(
+            sanitized["latestReadiness"]["freshnessBasis"], "pacific_day"
+        )
+        self.assertNotIn("staleAfterHours", sanitized)
+
+    def test_prior_pacific_day_is_stale_even_with_recent_timestamp(self) -> None:
+        now = dt.datetime(2026, 8, 2, 0, 30, tzinfo=PACIFIC)
+        raw = {
+            "latestReadiness": {
+                "day": "2026-08-01",
+                "score": 80,
+                "observedAt": "2026-08-02T06:00:00+00:00",
+            },
+            "latestSleep": {
+                "day": "2026-08-01",
+                "score": 75,
+                "observedAt": "2026-08-02T06:00:00+00:00",
+            },
+        }
+
+        sanitized = runner.sanitize_recovery(raw, now)
+
+        self.assertEqual(sanitized["status"], "stale")
+        self.assertTrue(sanitized["latestSleep"]["isStale"])
+
+    def test_mixed_daily_record_days_are_never_fresh(self) -> None:
+        now = dt.datetime(2026, 8, 2, 12, 0, tzinfo=PACIFIC)
+        raw = {
+            "latestReadiness": {
+                "day": "2026-08-01",
+                "score": 80,
+                "observedAt": "2026-08-01T00:00:00+00:00",
+            },
+            "latestSleep": {
+                "day": "2026-08-02",
+                "score": 75,
+                "observedAt": "2026-08-02T00:00:00+00:00",
+            },
+        }
+
+        sanitized = runner.sanitize_recovery(raw, now)
+
+        self.assertEqual(sanitized["status"], "stale")
+        self.assertEqual(sanitized["latestReadiness"]["day"], "2026-08-01")
+        self.assertEqual(sanitized["latestSleep"]["day"], "2026-08-02")
+
+    def test_sleep_uses_actual_bedtime_end_for_observation_metadata(self) -> None:
+        now = dt.datetime(2026, 8, 5, 12, 0, tzinfo=PACIFIC)
+        raw = {
+            "day": "2026-08-05",
+            "score": 78,
+            "observedAt": "2026-08-05T00:00:00+00:00",
+            "bedtimeEnd": "2026-08-05T08:15:34-07:00",
+        }
+
+        sanitized = runner.sanitized_recovery_record(raw, now, sleep=True)
+
+        self.assertIsNotNone(sanitized)
+        self.assertEqual(
+            sanitized["observedAt"], "2026-08-05T08:15:34-07:00"
+        )
+        self.assertEqual(
+            sanitized["bedtimeEnd"], "2026-08-05T08:15:34-07:00"
+        )
+
+    def test_future_recovery_day_is_rejected(self) -> None:
+        now = dt.datetime(2026, 8, 5, 12, 0, tzinfo=PACIFIC)
+        raw = {
+            "day": "2026-08-06",
+            "score": 80,
+            "observedAt": "2026-08-06T00:00:00+00:00",
+        }
+
+        self.assertIsNone(
+            runner.sanitized_recovery_record(raw, now, sleep=False)
+        )
+
+    def test_present_invalid_recovery_day_is_rejected(self) -> None:
+        now = dt.datetime(2026, 8, 5, 12, 0, tzinfo=PACIFIC)
+        for invalid_day in ("2026-02-30", "2026-8-05", "", 20260805):
+            with self.subTest(day=invalid_day):
+                raw = {
+                    "day": invalid_day,
+                    "score": 80,
+                    "observedAt": "2026-08-05T11:00:00-07:00",
+                }
+                self.assertIsNone(
+                    runner.sanitized_recovery_record(raw, now, sleep=False)
+                )
+
+    def test_missing_day_uses_bounded_legacy_timestamp_fallback(self) -> None:
+        now = dt.datetime(2026, 8, 5, 12, 0, tzinfo=PACIFIC)
+        at_boundary = {
+            "score": 80,
+            "observedAt": "2026-08-04T12:00:00-07:00",
+        }
+        beyond_boundary = {
+            "score": 80,
+            "observedAt": "2026-08-04T11:59:59-07:00",
+        }
+        future = {
+            "score": 80,
+            "observedAt": "2026-08-05T12:00:01-07:00",
+        }
+
+        at_boundary_record = runner.sanitized_recovery_record(
+            at_boundary, now, sleep=False
+        )
+        beyond_boundary_record = runner.sanitized_recovery_record(
+            beyond_boundary, now, sleep=False
+        )
+
+        self.assertIsNotNone(at_boundary_record)
+        self.assertFalse(at_boundary_record["isStale"])
+        self.assertEqual(at_boundary_record["ageHours"], 24.0)
+        self.assertEqual(
+            at_boundary_record["freshnessBasis"], "elapsed_hours_legacy"
+        )
+        self.assertIsNotNone(beyond_boundary_record)
+        self.assertTrue(beyond_boundary_record["isStale"])
+        self.assertIsNone(
+            runner.sanitized_recovery_record(future, now, sleep=False)
+        )
+
+    def test_pacific_midnight_and_dst_dates_use_calendar_day(self) -> None:
+        raw = {
+            "day": "2026-11-01",
+            "score": 80,
+            "observedAt": "2026-11-01T00:00:00+00:00",
+        }
+        before_midnight = dt.datetime(2026, 11, 1, 23, 59, tzinfo=PACIFIC)
+        after_midnight = dt.datetime(2026, 11, 2, 0, 0, tzinfo=PACIFIC)
+
+        current = runner.sanitized_recovery_record(
+            raw, before_midnight, sleep=False
+        )
+        prior = runner.sanitized_recovery_record(raw, after_midnight, sleep=False)
+
+        self.assertIsNotNone(current)
+        self.assertFalse(current["isStale"])
+        self.assertIsNotNone(prior)
+        self.assertTrue(prior["isStale"])
+
     def test_recovery_summary_uses_neutral_trusted_wording(self) -> None:
         fresh = {
             "status": "fresh",
@@ -722,8 +960,18 @@ class InputValidationTests(unittest.TestCase):
         }
         stale = {
             "status": "stale",
-            "latestReadiness": {"score": 80, "ageHours": 26.5},
-            "latestSleep": {"score": 75, "ageHours": 26.0},
+            "latestReadiness": {
+                "day": "2026-08-01",
+                "score": 80,
+                "ageHours": None,
+                "isStale": True,
+            },
+            "latestSleep": {
+                "day": "2026-08-01",
+                "score": 75,
+                "ageHours": None,
+                "isStale": True,
+            },
         }
 
         self.assertEqual(
@@ -732,7 +980,24 @@ class InputValidationTests(unittest.TestCase):
         )
         self.assertEqual(
             runner.trusted_recovery_summary(stale),
-            "Oura is stale (26.5 h old); use workout history for this call.",
+            "Oura data are from 2026-08-01; use workout history for this call.",
+        )
+        mismatched = {
+            "status": "stale",
+            "latestReadiness": {
+                "day": "2026-08-01",
+                "score": 80,
+                "isStale": True,
+            },
+            "latestSleep": {
+                "day": "2026-08-02",
+                "score": 75,
+                "isStale": False,
+            },
+        }
+        self.assertEqual(
+            runner.trusted_recovery_summary(mismatched),
+            "Oura daily records do not match (readiness 2026-08-01; sleep 2026-08-02); use workout history for this call.",
         )
         self.assertEqual(
             runner.trusted_recovery_summary({"status": "unavailable"}),
@@ -743,10 +1008,12 @@ class InputValidationTests(unittest.TestCase):
         now = dt.datetime(2026, 8, 1, 12, 0, tzinfo=PACIFIC)
         raw = {
             "latestReadiness": {
+                "day": "2026-08-01",
                 "score": 101,
                 "observedAt": "2026-08-01T08:00:00-07:00",
             },
             "latestSleep": {
+                "day": "2026-08-01",
                 "score": -1,
                 "totalSleepHours": 25,
                 "observedAt": "2026-08-01T08:00:00-07:00",
@@ -755,9 +1022,9 @@ class InputValidationTests(unittest.TestCase):
 
         sanitized = runner.sanitize_recovery(raw, now)
 
-        self.assertIsNone(sanitized["latestReadiness"]["score"])
-        self.assertIsNone(sanitized["latestSleep"]["score"])
-        self.assertIsNone(sanitized["latestSleep"]["totalSleepHours"])
+        self.assertEqual(sanitized["status"], "unavailable")
+        self.assertIsNone(sanitized["latestReadiness"])
+        self.assertIsNone(sanitized["latestSleep"])
 
 
 class OutputValidationTests(unittest.TestCase):
@@ -766,12 +1033,17 @@ class OutputValidationTests(unittest.TestCase):
         self.updated_at = int(now.timestamp() * 1000)
         self.facts = runner.validate_snapshot(snapshot_body(self.updated_at), now.date())
         self.recovery = {
+            "generatedAt": now.isoformat(),
             "status": "fresh",
+            "freshnessPolicy": runner.RECOVERY_FRESHNESS_POLICY,
+            "evaluationDate": "2026-08-01",
             "latestReadiness": {
+                "day": "2026-08-01",
                 "score": 80,
                 "observedAt": "2026-08-01T08:00:00-07:00",
             },
             "latestSleep": {
+                "day": "2026-08-01",
                 "score": 75,
                 "observedAt": "2026-08-01T08:10:00-07:00",
             },
@@ -844,6 +1116,16 @@ class OutputValidationTests(unittest.TestCase):
         self.assertEqual(briefing["inputSummary"]["workoutCount"], 1)
         self.assertEqual(briefing["inputSummary"]["newMemoryItemCount"], 1)
         self.assertEqual(briefing["inputSummary"]["deferredMemoryItemIds"], [])
+        self.assertEqual(
+            briefing["inputSummary"]["recoveryFreshnessPolicy"],
+            runner.RECOVERY_FRESHNESS_POLICY,
+        )
+        self.assertEqual(
+            briefing["inputSummary"]["recoveryReadinessDay"], "2026-08-01"
+        )
+        self.assertEqual(
+            briefing["inputSummary"]["recoverySleepDay"], "2026-08-01"
+        )
 
     def test_supervisor_constructs_trusted_memory_state(self) -> None:
         snapshot_start = pacific_ms(2026, 7, 1)
@@ -1157,7 +1439,8 @@ class OutputValidationTests(unittest.TestCase):
         stale = {
             "generatedAt": "2026-08-01T10:30:00-07:00",
             "status": "stale",
-            "staleAfterHours": 24,
+            "freshnessPolicy": runner.RECOVERY_FRESHNESS_POLICY,
+            "evaluationDate": "2026-08-01",
             "latestReadiness": {"score": 80, "ageHours": 26.5},
             "latestSleep": {"totalSleepHours": 6.2, "ageHours": 26.0},
         }
@@ -1431,6 +1714,8 @@ class OutputValidationTests(unittest.TestCase):
             "promptVersion": "obsolete",
             "runnerVersion": "obsolete",
             "validatorCompatibilityVersion": "obsolete",
+            "recoveryFreshnessPolicy": "obsolete",
+            "recoveryEvaluationDate": "2026-08-02",
         }
         for field, value in mutations.items():
             with self.subTest(field=field):
@@ -1446,6 +1731,53 @@ class OutputValidationTests(unittest.TestCase):
                         model=runner.DEFAULT_CODEX_MODEL,
                         reasoning_effort="xhigh",
                     )
+
+    def test_spool_recovery_diagnostics_match_the_briefing(self) -> None:
+        manifest_mutations = {
+            "recoveryStatus": "invalid",
+            "recoveryReadinessDay": "2026-08-02",
+            "recoverySleepDay": "2026-08-02",
+        }
+        for field, value in manifest_mutations.items():
+            with self.subTest(field=field):
+                validated = self.validate(model_output(self.updated_at))
+                validated["manifest"][field] = value
+                with self.assertRaises(runner.ConfigError):
+                    runner.validate_spool(
+                        validated,
+                        today="2026-08-01",
+                        snapshot_updated_at=self.updated_at,
+                        memory_revision=0,
+                        prompt_hash="abc123",
+                        model=runner.DEFAULT_CODEX_MODEL,
+                        reasoning_effort="xhigh",
+                    )
+
+        validated = self.validate(model_output(self.updated_at))
+        validated["briefing"]["inputSummary"]["recoveryStatus"] = "stale"
+        with self.assertRaisesRegex(runner.ConfigError, "do not match"):
+            runner.validate_spool(
+                validated,
+                today="2026-08-01",
+                snapshot_updated_at=self.updated_at,
+                memory_revision=0,
+                prompt_hash="abc123",
+                model=runner.DEFAULT_CODEX_MODEL,
+                reasoning_effort="xhigh",
+            )
+
+        validated = self.validate(model_output(self.updated_at))
+        validated["briefing"]["sections"]["recoveryStatus"] = "stale"
+        with self.assertRaisesRegex(runner.ConfigError, "presentation"):
+            runner.validate_spool(
+                validated,
+                today="2026-08-01",
+                snapshot_updated_at=self.updated_at,
+                memory_revision=0,
+                prompt_hash="abc123",
+                model=runner.DEFAULT_CODEX_MODEL,
+                reasoning_effort="xhigh",
+            )
 
     def test_rest_is_a_valid_supervisor_mode(self) -> None:
         output = model_output(self.updated_at)

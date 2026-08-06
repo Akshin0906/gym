@@ -50,6 +50,10 @@ is intentionally conservative:
   recommends at least seven hours of habitual sleep for adults, while consumer
   wearables remain estimates with device-level variability in a
   [2026 systematic review](https://pubmed.ncbi.nlm.nih.gov/42175611/).
+- Oura daily summaries are freshness-checked by their `day` in Pacific time,
+  because the API's midnight-UTC timestamps identify a calendar day rather
+  than the time a score was measured. An actual sleep-end timestamp is retained
+  when available.
 - The supervisor, not the model, supplies the neutral Oura sentence and any
   stale-snapshot warning. A current reading is never described as proof of good
   recovery, and no proprietary score alone selects `light`, `deload`, or

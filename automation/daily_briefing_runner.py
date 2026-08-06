@@ -34,14 +34,22 @@ from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 
-RUNNER_VERSION = "3.2"
+RUNNER_VERSION = "3.3"
 PROMPT_VERSION = "2026-08-05-evidence-v1"
-VALIDATOR_COMPATIBILITY_VERSION = "2026-08-05-evidence-briefing-v4"
+VALIDATOR_COMPATIBILITY_VERSION = "2026-08-06-oura-calendar-v5"
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 DEFAULT_CODEX_REASONING_EFFORT = "xhigh"
 PACIFIC = ZoneInfo("America/Los_Angeles")
 MODES = {"push", "normal", "light", "deload", "rest"}
 RECOVERY_STATUSES = {"fresh", "stale", "unavailable"}
+RECOVERY_FRESHNESS_POLICY = "pacific_day_v1"
+RECOVERY_DIAGNOSTIC_FIELDS = (
+    "recoveryStatus",
+    "recoveryFreshnessPolicy",
+    "recoveryEvaluationDate",
+    "recoveryReadinessDay",
+    "recoverySleepDay",
+)
 MEMORY_TYPES = {"workout", "two_week", "four_month"}
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
 TERMINATION_SIGNALS = frozenset({signal.SIGINT, signal.SIGTERM})
@@ -504,6 +512,20 @@ def is_before_oura_grace(now: dt.datetime, grace_hour: int) -> bool:
     return now.hour < grace_hour
 
 
+def should_wait_for_oura(
+    recovery_status: Any,
+    now: dt.datetime,
+    grace_hour: int,
+    *,
+    force: bool,
+) -> bool:
+    return (
+        recovery_status != "fresh"
+        and not force
+        and is_before_oura_grace(now, grace_hour)
+    )
+
+
 def parse_iso_datetime(raw: Any) -> dt.datetime | None:
     if not isinstance(raw, str) or not raw.strip():
         return None
@@ -638,31 +660,76 @@ def validate_snapshot(body: Any, today: dt.date) -> SnapshotFacts:
     )
 
 
+def parse_recovery_day(value: Any) -> dt.date | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", cleaned):
+        return None
+    try:
+        return dt.date.fromisoformat(cleaned)
+    except ValueError:
+        return None
+
+
 def sanitized_recovery_record(
     raw: Any, now: dt.datetime, *, sleep: bool
 ) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
-    observed = parse_iso_datetime(raw.get("observedAt"))
-    if observed is None:
+    local_today = now.astimezone(PACIFIC).date()
+    day_present = "day" in raw
+    record_day = parse_recovery_day(raw.get("day"))
+    if day_present and record_day is None:
         return None
-    age_hours = max(
-        0.0,
-        (
-            now.astimezone(dt.timezone.utc)
-            - observed.astimezone(dt.timezone.utc)
-        ).total_seconds()
-        / 3600.0,
-    )
+    if record_day is not None and record_day > local_today:
+        return None
     score = raw.get("score")
     if not finite_number(score) or not 0 <= float(score) <= 100:
-        score = None
+        return None
+    observed = parse_iso_datetime(raw.get("observedAt"))
+    bedtime_end = parse_iso_datetime(raw.get("bedtimeEnd")) if sleep else None
+    now_utc = now.astimezone(dt.timezone.utc)
+    if any(
+        value is not None and value.astimezone(dt.timezone.utc) > now_utc
+        for value in (observed, bedtime_end)
+    ):
+        return None
+    if bedtime_end is not None:
+        observed = bedtime_end
+    elif record_day is not None and observed is not None:
+        daily_marker = dt.datetime.combine(
+            record_day, dt.time.min, tzinfo=dt.timezone.utc
+        )
+        if observed.astimezone(dt.timezone.utc) == daily_marker:
+            observed = None
+    if observed is None and record_day is None:
+        return None
+    age_hours = None
+    if observed is not None and record_day is None:
+        age_hours = max(
+            0.0,
+            (
+                now_utc - observed.astimezone(dt.timezone.utc)
+            ).total_seconds()
+            / 3600.0,
+        )
     result: dict[str, Any] = {
-        "day": raw.get("day") if isinstance(raw.get("day"), str) else None,
-        "score": score,
-        "observedAt": observed.isoformat(),
-        "ageHours": round(age_hours, 1),
-        "isStale": age_hours > 24.0,
+        "day": record_day.isoformat() if record_day is not None else None,
+        "score": float(score),
+        "observedAt": observed.isoformat() if observed is not None else None,
+        # Oura's daily endpoint timestamps are UTC day markers, not measurement
+        # times. A calendar day therefore owns freshness; elapsed hours are only
+        # meaningful for legacy records that do not include a day.
+        "ageHours": round(age_hours, 1) if age_hours is not None else None,
+        "freshnessBasis": (
+            "pacific_day" if record_day is not None else "elapsed_hours_legacy"
+        ),
+        "isStale": (
+            record_day < local_today
+            if record_day is not None
+            else age_hours is None or age_hours > 24.0
+        ),
     }
     if sleep:
         total = raw.get("totalSleepHours")
@@ -671,8 +738,9 @@ def sanitized_recovery_record(
             if finite_number(total) and 0 <= float(total) <= 24
             else None
         )
-        bedtime_end = raw.get("bedtimeEnd")
-        result["bedtimeEnd"] = bedtime_end if isinstance(bedtime_end, str) else None
+        result["bedtimeEnd"] = (
+            bedtime_end.isoformat() if bedtime_end is not None else None
+        )
     return result
 
 
@@ -682,6 +750,8 @@ def sanitize_recovery(raw: Any, now: dt.datetime) -> dict[str, Any]:
     sleep = sanitized_recovery_record(source.get("latestSleep"), now, sleep=True)
     if readiness is None or sleep is None:
         status = "unavailable"
+    elif readiness["day"] != sleep["day"]:
+        status = "stale"
     elif readiness["isStale"] or sleep["isStale"]:
         status = "stale"
     else:
@@ -689,7 +759,8 @@ def sanitize_recovery(raw: Any, now: dt.datetime) -> dict[str, Any]:
     return {
         "generatedAt": now.isoformat(),
         "status": status,
-        "staleAfterHours": 24,
+        "freshnessPolicy": RECOVERY_FRESHNESS_POLICY,
+        "evaluationDate": now.astimezone(PACIFIC).date().isoformat(),
         "latestReadiness": readiness,
         "latestSleep": sleep,
     }
@@ -699,7 +770,8 @@ def unavailable_recovery(now: dt.datetime) -> dict[str, Any]:
     return {
         "generatedAt": now.isoformat(),
         "status": "unavailable",
-        "staleAfterHours": 24,
+        "freshnessPolicy": RECOVERY_FRESHNESS_POLICY,
+        "evaluationDate": now.astimezone(PACIFIC).date().isoformat(),
         "latestReadiness": None,
         "latestSleep": None,
     }
@@ -720,6 +792,27 @@ def trusted_recovery_summary(recovery: dict[str, Any]) -> str:
     sleep = recovery.get("latestSleep")
     records = [item for item in (readiness, sleep) if isinstance(item, dict)]
     if status == "stale":
+        readiness_day = (
+            readiness.get("day") if isinstance(readiness, dict) else None
+        )
+        sleep_day = sleep.get("day") if isinstance(sleep, dict) else None
+        if readiness_day and sleep_day and readiness_day != sleep_day:
+            return (
+                "Oura daily records do not match "
+                f"(readiness {readiness_day}; sleep {sleep_day}); "
+                "use workout history for this call."
+            )
+        stale_days = [
+            item["day"]
+            for item in records
+            if item.get("isStale") is True
+            and parse_recovery_day(item.get("day")) is not None
+        ]
+        if stale_days:
+            return (
+                f"Oura data are from {min(stale_days)}; "
+                "use workout history for this call."
+            )
         ages = [
             float(item["ageHours"])
             for item in records
@@ -768,10 +861,50 @@ def model_recovery_context(recovery: dict[str, Any]) -> dict[str, Any]:
     return {
         "generatedAt": recovery.get("generatedAt"),
         "status": recovery.get("status"),
-        "staleAfterHours": recovery.get("staleAfterHours"),
+        "freshnessPolicy": recovery.get("freshnessPolicy"),
+        "evaluationDate": recovery.get("evaluationDate"),
         "latestReadiness": None,
         "latestSleep": None,
     }
+
+
+def recovery_status_diagnostics(recovery: dict[str, Any]) -> dict[str, Any]:
+    def record_day(key: str) -> str | None:
+        record = recovery.get(key)
+        if not isinstance(record, dict):
+            return None
+        day = record.get("day")
+        return day if parse_recovery_day(day) is not None else None
+
+    return {
+        "recoveryStatus": recovery.get("status"),
+        "recoveryFreshnessPolicy": recovery.get("freshnessPolicy"),
+        "recoveryEvaluationDate": recovery.get("evaluationDate"),
+        "recoveryReadinessDay": record_day("latestReadiness"),
+        "recoverySleepDay": record_day("latestSleep"),
+    }
+
+
+def briefing_recovery_diagnostics(briefing: dict[str, Any]) -> dict[str, Any]:
+    input_summary = briefing.get("inputSummary")
+    if not isinstance(input_summary, dict):
+        return {}
+
+    diagnostics: dict[str, Any] = {}
+    status = input_summary.get("recoveryStatus")
+    if status in RECOVERY_STATUSES:
+        diagnostics["recoveryStatus"] = status
+    if input_summary.get("recoveryFreshnessPolicy") == RECOVERY_FRESHNESS_POLICY:
+        diagnostics["recoveryFreshnessPolicy"] = RECOVERY_FRESHNESS_POLICY
+    for field in (
+        "recoveryEvaluationDate",
+        "recoveryReadinessDay",
+        "recoverySleepDay",
+    ):
+        value = input_summary.get(field)
+        if parse_recovery_day(value) is not None:
+            diagnostics[field] = value
+    return diagnostics
 
 
 def trusted_snapshot_warning(facts: SnapshotFacts, generated_at: int) -> str | None:
@@ -1965,6 +2098,7 @@ def validate_model_output(
         record = recovery.get(key)
         if isinstance(record, dict) and isinstance(record.get("observedAt"), str):
             observed_candidates.append(record["observedAt"])
+    recovery_diagnostics = recovery_status_diagnostics(recovery)
 
     trusted_briefing = {
         "headline": headline,
@@ -1998,6 +2132,16 @@ def validate_model_output(
             "newMemoryItemCount": len(new_items),
             "deferredMemoryItemIds": deferred_memory_item_ids,
             "recoveryStatus": recovery_status,
+            "recoveryFreshnessPolicy": recovery_diagnostics[
+                "recoveryFreshnessPolicy"
+            ],
+            "recoveryEvaluationDate": recovery_diagnostics[
+                "recoveryEvaluationDate"
+            ],
+            "recoveryReadinessDay": recovery_diagnostics[
+                "recoveryReadinessDay"
+            ],
+            "recoverySleepDay": recovery_diagnostics["recoverySleepDay"],
             "ouraObservedAt": max(observed_candidates) if observed_candidates else None,
             "runId": run_id,
             "runnerVersion": RUNNER_VERSION,
@@ -2015,6 +2159,16 @@ def validate_model_output(
             "snapshotUpdatedAt": facts.updated_at,
             "expectedMemoryRevision": expected_memory_revision,
             "recoveryStatus": recovery_status,
+            "recoveryFreshnessPolicy": recovery_diagnostics[
+                "recoveryFreshnessPolicy"
+            ],
+            "recoveryEvaluationDate": recovery_diagnostics[
+                "recoveryEvaluationDate"
+            ],
+            "recoveryReadinessDay": recovery_diagnostics[
+                "recoveryReadinessDay"
+            ],
+            "recoverySleepDay": recovery_diagnostics["recoverySleepDay"],
             "newMemoryItemIds": [item["id"] for item in new_items],
             "runId": run_id,
             "runnerVersion": RUNNER_VERSION,
@@ -2047,6 +2201,10 @@ def validate_spool(
         "snapshotUpdatedAt",
         "expectedMemoryRevision",
         "recoveryStatus",
+        "recoveryFreshnessPolicy",
+        "recoveryEvaluationDate",
+        "recoveryReadinessDay",
+        "recoverySleepDay",
         "newMemoryItemIds",
         "runId",
         "runnerVersion",
@@ -2095,6 +2253,19 @@ def validate_spool(
         raise ConfigError("Spool model does not match the configured model")
     if manifest.get("reasoningEffort") != reasoning_effort:
         raise ConfigError("Spool reasoning effort does not match the configured effort")
+    if manifest.get("recoveryStatus") not in RECOVERY_STATUSES:
+        raise ConfigError("Spool recovery status is invalid")
+    if manifest.get("recoveryFreshnessPolicy") != RECOVERY_FRESHNESS_POLICY:
+        raise ConfigError("Spool recovery freshness policy is incompatible")
+    recovery_evaluation_date = manifest.get("recoveryEvaluationDate")
+    if recovery_evaluation_date != spool_date:
+        raise ConfigError("Spool recovery evaluation date is incompatible")
+    for field in ("recoveryReadinessDay", "recoverySleepDay"):
+        value = manifest.get(field)
+        if value is not None:
+            parsed_recovery_day = parse_recovery_day(value)
+            if parsed_recovery_day is None or parsed_recovery_day > parsed_date:
+                raise ConfigError(f"Spool {field} is invalid")
     briefing = require_object(spool.get("briefing"), "spool.briefing")
     memory = require_object(spool.get("memory"), "spool.memory")
     if briefing.get("snapshotUpdatedAt") != manifest_snapshot:
@@ -2127,6 +2298,12 @@ def validate_spool(
         raise ConfigError("Spool briefing prompt version is incompatible")
     if input_summary.get("promptHash") != prompt_hash:
         raise ConfigError("Spool briefing prompt fingerprint is incompatible")
+    for field in RECOVERY_DIAGNOSTIC_FIELDS:
+        if input_summary.get(field) != manifest.get(field):
+            raise ConfigError("Spool recovery diagnostics do not match its briefing")
+    sections = require_object(briefing.get("sections"), "spool.briefing.sections")
+    if sections.get("recoveryStatus") != manifest.get("recoveryStatus"):
+        raise ConfigError("Spool recovery status does not match its presentation")
     return spool
 
 
@@ -2509,6 +2686,7 @@ def run(config: Config, args: argparse.Namespace) -> int:
             )
             if existing.get("briefingDate") != today:
                 raise ConfigError("Existing briefing response has the wrong date")
+            existing_recovery_diagnostics = briefing_recovery_diagnostics(existing)
             update_status(
                 config,
                 date=today,
@@ -2518,6 +2696,7 @@ def run(config: Config, args: argparse.Namespace) -> int:
                 message="A verified same-day briefing already exists",
                 snapshotUpdatedAt=existing.get("snapshotUpdatedAt"),
                 log=str(log_path),
+                **existing_recovery_diagnostics,
             )
             logger.info("A same-day briefing already exists; exiting")
             return EXIT_OK
@@ -2557,6 +2736,16 @@ def run(config: Config, args: argparse.Namespace) -> int:
                 quarantine_spool(spool_path, run_id=run_id, reason="obsolete")
                 logger.warning("Discarded an obsolete pending upload")
             else:
+                spool_recovery_diagnostics = {
+                    key: spool["manifest"].get(key)
+                    for key in (
+                        "recoveryStatus",
+                        "recoveryFreshnessPolicy",
+                        "recoveryEvaluationDate",
+                        "recoveryReadinessDay",
+                        "recoverySleepDay",
+                    )
+                }
                 if args.dry_run:
                     update_status(
                         config,
@@ -2567,6 +2756,7 @@ def run(config: Config, args: argparse.Namespace) -> int:
                         message="A validated pending result is ready to publish",
                         snapshotUpdatedAt=facts.updated_at,
                         log=str(log_path),
+                        **spool_recovery_diagnostics,
                     )
                     return EXIT_OK
                 update_status(
@@ -2578,6 +2768,7 @@ def run(config: Config, args: argparse.Namespace) -> int:
                     message="Retrying a previously validated upload",
                     snapshotUpdatedAt=facts.updated_at,
                     log=str(log_path),
+                    **spool_recovery_diagnostics,
                 )
                 try:
                     publish_spool(cloud, spool, logger=logger)
@@ -2616,10 +2807,10 @@ def run(config: Config, args: argparse.Namespace) -> int:
                         outcome="published",
                         message="Published and verified the pending daily briefing",
                         snapshotUpdatedAt=facts.updated_at,
-                        recoveryStatus=spool["manifest"].get("recoveryStatus"),
                         model=spool["manifest"].get("model"),
                         reasoningEffort=spool["manifest"].get("reasoningEffort"),
                         log=str(log_path),
+                        **spool_recovery_diagnostics,
                     )
                     logger.info("Published and verified a pending result")
                     return EXIT_OK
@@ -2639,11 +2830,12 @@ def run(config: Config, args: argparse.Namespace) -> int:
         recovery = run_oura(config, run_dir, now, logger)
         atomic_write_json(run_dir / "recovery-sanitized.json", recovery)
         recovery_status = recovery.get("status")
-        if (
-            recovery_status != "fresh"
-            and not args.force
-            and not args.ignore_schedule
-            and is_before_oura_grace(now, config.oura_grace_hour)
+        recovery_diagnostics = recovery_status_diagnostics(recovery)
+        if should_wait_for_oura(
+            recovery_status,
+            now,
+            config.oura_grace_hour,
+            force=args.force,
         ):
             update_status(
                 config,
@@ -2653,8 +2845,8 @@ def run(config: Config, args: argparse.Namespace) -> int:
                 outcome="waiting",
                 message=f"Oura is {recovery_status}; waiting for a catch-up run before {config.oura_grace_hour:02d}:00",
                 snapshotUpdatedAt=facts.updated_at,
-                recoveryStatus=recovery_status,
                 log=str(log_path),
+                **recovery_diagnostics,
             )
             logger.info("Oura is not fresh; waiting for the catch-up window")
             return EXIT_OK
@@ -2680,10 +2872,10 @@ def run(config: Config, args: argparse.Namespace) -> int:
             outcome="running",
             message="Generating a schema-constrained daily insight",
             snapshotUpdatedAt=facts.updated_at,
-            recoveryStatus=recovery_status,
             model=config.codex_model,
             reasoningEffort=config.codex_effort,
             log=str(log_path),
+            **recovery_diagnostics,
         )
         raw_output, codex_version = invoke_codex(config, codex, run_dir, prompt)
         validated = validate_model_output(
@@ -2718,11 +2910,11 @@ def run(config: Config, args: argparse.Namespace) -> int:
             outcome="running" if not args.dry_run else "dry_run",
             message="The daily insight passed independent validation",
             snapshotUpdatedAt=facts.updated_at,
-            recoveryStatus=recovery_status,
             model=config.codex_model,
             reasoningEffort=config.codex_effort,
             deferredMemoryItemIds=deferred_memory_item_ids,
             log=str(log_path),
+            **recovery_diagnostics,
         )
 
         if args.dry_run:
@@ -2739,10 +2931,10 @@ def run(config: Config, args: argparse.Namespace) -> int:
             outcome="running",
             message="Uploading the validated result",
             snapshotUpdatedAt=facts.updated_at,
-            recoveryStatus=recovery_status,
             model=config.codex_model,
             reasoningEffort=config.codex_effort,
             log=str(log_path),
+            **recovery_diagnostics,
         )
         try:
             publish_spool(cloud, validated, logger=logger)
@@ -2756,10 +2948,10 @@ def run(config: Config, args: argparse.Namespace) -> int:
                 outcome="retry_needed",
                 message="Cloud data changed during generation; a fresh run is required",
                 snapshotUpdatedAt=facts.updated_at,
-                recoveryStatus=recovery_status,
                 model=config.codex_model,
                 reasoningEffort=config.codex_effort,
                 log=str(log_path),
+                **recovery_diagnostics,
             )
             return EXIT_TRANSIENT
         spool_path.unlink()
@@ -2771,12 +2963,12 @@ def run(config: Config, args: argparse.Namespace) -> int:
             outcome="published",
             message="Daily briefing and memory were published and verified",
             snapshotUpdatedAt=facts.updated_at,
-            recoveryStatus=recovery_status,
             model=config.codex_model,
             reasoningEffort=config.codex_effort,
             newMemoryItemCount=len(validated["manifest"]["newMemoryItemIds"]),
             deferredMemoryItemIds=deferred_memory_item_ids,
             log=str(log_path),
+            **recovery_diagnostics,
         )
         logger.info("Daily briefing and memory were published and verified")
         return EXIT_OK
