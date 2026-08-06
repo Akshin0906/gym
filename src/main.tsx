@@ -1,5 +1,6 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
+import { registerSW } from 'virtual:pwa-register'
 import { App } from './App'
 import { seedIfEmpty } from './db/seed'
 import { installCloudBriefingRefresh } from './lib/cloud'
@@ -14,6 +15,12 @@ window.addEventListener('vite:preloadError', (event) => {
   window.location.reload()
 })
 window.setTimeout(() => sessionStorage.removeItem(PRELOAD_RELOAD_KEY), 10_000)
+
+// The generated worker claims open PWA windows immediately. Register through
+// the update-aware client as well so an iOS standalone window reloads its
+// in-memory JavaScript when that worker changes, rather than continuing to run
+// a stale bundle after the new cache is active.
+registerSW()
 
 void (async () => {
   try {

@@ -217,8 +217,57 @@ describe('export/import round-trip', () => {
     })
 
     await expect(buildExportPayload()).rejects.toThrow(
-      'Import table "workoutSessions" is missing or malformed',
+      'Import table "workoutSessions" is missing or malformed (row 1: exerciseSnapshot contains a duplicate order)',
     )
+  })
+
+  it('removes a stale legacy done marker without losing workout history', async () => {
+    await db.exercises.bulkAdd([exercise('ex-a'), exercise('ex-b')])
+    await db.workoutSessions.add({
+      id: 'session-stale-done-marker',
+      sessionTemplateId: null,
+      programId: null,
+      name: 'Legacy swapped workout',
+      programName: null,
+      exerciseSnapshot: [
+        {
+          exerciseId: 'ex-a',
+          order: 0,
+          targetSets: 3,
+          targetRepRange: '8-10',
+        },
+      ],
+      startedAt: 1,
+      completedAt: 2,
+      doneExerciseIds: ['ex-a', 'ex-b'],
+    })
+    await db.loggedSets.add({
+      id: 'set-preserved',
+      workoutSessionId: 'session-stale-done-marker',
+      exerciseId: 'ex-a',
+      setNumber: 1,
+      weightLbs: 100,
+      reps: 8,
+      rpe: null,
+      loggedAt: 2,
+    })
+
+    const payload = await buildExportPayload()
+    expect(payload.data.workoutSessions[0].doneExerciseIds).toEqual(['ex-a'])
+    expect(payload.data.workoutSessions[0].exerciseSnapshot).toHaveLength(1)
+    expect(payload.data.loggedSets).toHaveLength(1)
+
+    // Simulate a raw backup produced by the legacy swap flow rather than only
+    // round-tripping the already-normalized current export.
+    payload.data.workoutSessions[0].doneExerciseIds = ['ex-a', 'ex-b']
+    await importPayload(JSON.stringify(payload))
+    expect(
+      (await db.workoutSessions.get('session-stale-done-marker'))?.doneExerciseIds,
+    ).toEqual(['ex-a'])
+    expect(await db.loggedSets.get('set-preserved')).toMatchObject({
+      weightLbs: 100,
+      reps: 8,
+    })
   })
 
   it('refuses to produce a backup containing a corrupt local receipt', async () => {

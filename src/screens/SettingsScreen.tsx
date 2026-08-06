@@ -64,6 +64,8 @@ import {
 import { useActiveWorkout } from '../store/activeWorkout'
 import { useTimer } from '../store/timer'
 
+const APP_RELEASE = '2026-08-06.2'
+
 export function SettingsScreen() {
   const navigate = useNavigate()
   const fileRef = useRef<HTMLInputElement>(null)
@@ -203,7 +205,7 @@ export function SettingsScreen() {
         <OuraSection />
 
         <section className="pt-4 border-t border-[var(--color-border)] text-xs text-[var(--color-fg-faint)]">
-          <p>Workout Tracker · v0.1.0</p>
+          <p>Workout Tracker · v0.1.0 · release {APP_RELEASE}</p>
           <p className="mt-1">
             IndexedDB primary · cloud snapshot when synced.
           </p>

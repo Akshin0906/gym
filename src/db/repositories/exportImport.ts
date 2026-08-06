@@ -257,45 +257,61 @@ function isTemplateExercise(value: unknown): value is TemplateExercise {
   )
 }
 
-function isSessionSnapshot(value: unknown): boolean {
-  if (!Array.isArray(value)) return false
+function sessionSnapshotValidationIssue(value: unknown): string | null {
+  if (!Array.isArray(value)) return 'exerciseSnapshot is not an array'
   const exerciseIds: string[] = []
   const orders: number[] = []
-  for (const item of value) {
-    if (
-      !isObject(item) ||
-      !isNonEmptyString(item.exerciseId) ||
-      !isNonNegativeInteger(item.order) ||
-      !isNonNegativeInteger(item.targetSets) ||
-      item.targetSets > 100 ||
-      typeof item.targetRepRange !== 'string'
-    ) {
-      return false
+  for (const [index, item] of value.entries()) {
+    const label = `exerciseSnapshot item ${index + 1}`
+    if (!isObject(item)) return `${label} is not an object`
+    if (!isNonEmptyString(item.exerciseId)) {
+      return `${label} has an invalid exerciseId`
+    }
+    if (!isNonNegativeInteger(item.order)) {
+      return `${label} has an invalid order`
+    }
+    if (!isNonNegativeInteger(item.targetSets) || item.targetSets > 100) {
+      return `${label} has invalid targetSets`
+    }
+    if (typeof item.targetRepRange !== 'string') {
+      return `${label} has an invalid targetRepRange`
     }
     exerciseIds.push(item.exerciseId)
     orders.push(item.order)
   }
+  if (!hasUniqueStrings(exerciseIds)) {
+    return 'exerciseSnapshot contains a duplicate exercise'
+  }
+  if (!hasUniqueNumbers(orders)) {
+    return 'exerciseSnapshot contains a duplicate order'
+  }
   // Historical workout snapshots preserve their original sort positions.
   // Those positions can legitimately contain gaps after a workout was edited,
   // so require uniqueness without rewriting history into a dense sequence.
-  return hasUniqueStrings(exerciseIds) && hasUniqueNumbers(orders)
+  return null
 }
 
-function isWorkoutSession(value: unknown): value is WorkoutSession {
-  if (
-    !isObject(value) ||
-    !isNonEmptyString(value.id) ||
-    !(value.sessionTemplateId === null || isNonEmptyString(value.sessionTemplateId)) ||
-    !(value.programId === null || isNonEmptyString(value.programId)) ||
-    !isNonEmptyString(value.name) ||
-    !(value.programName === null || typeof value.programName === 'string') ||
-    !isSessionSnapshot(value.exerciseSnapshot) ||
-    !isFiniteNumber(value.startedAt) ||
-    value.startedAt < 0 ||
-    !isNullableTimestamp(value.completedAt) ||
-    (value.completedAt !== null && value.completedAt < value.startedAt)
-  ) {
-    return false
+function workoutSessionValidationIssue(value: unknown): string | null {
+  if (!isObject(value)) return 'row is not an object'
+  if (!isNonEmptyString(value.id)) return 'id is invalid'
+  if (!(value.sessionTemplateId === null || isNonEmptyString(value.sessionTemplateId))) {
+    return 'sessionTemplateId is invalid'
+  }
+  if (!(value.programId === null || isNonEmptyString(value.programId))) {
+    return 'programId is invalid'
+  }
+  if (!isNonEmptyString(value.name)) return 'name is invalid'
+  if (!(value.programName === null || typeof value.programName === 'string')) {
+    return 'programName is invalid'
+  }
+  const snapshotIssue = sessionSnapshotValidationIssue(value.exerciseSnapshot)
+  if (snapshotIssue) return snapshotIssue
+  if (!isFiniteNumber(value.startedAt) || value.startedAt < 0) {
+    return 'startedAt is invalid'
+  }
+  if (!isNullableTimestamp(value.completedAt)) return 'completedAt is invalid'
+  if (value.completedAt !== null && value.completedAt < value.startedAt) {
+    return 'completedAt precedes startedAt'
   }
   const sliderValues = [value.sessionPlanned, value.sessionFeel]
   if (
@@ -306,20 +322,31 @@ function isWorkoutSession(value: unknown): value is WorkoutSession {
         (!isPositiveInteger(slider) || slider > 5),
     )
   ) {
-    return false
+    return 'session feedback is outside the 1-5 range'
   }
   if (value.doneExerciseIds !== undefined) {
     if (!isStringArray(value.doneExerciseIds) || !hasUniqueStrings(value.doneExerciseIds)) {
-      return false
+      return 'doneExerciseIds is invalid or contains duplicates'
     }
-    const snapshotIds = new Set(
-      (value.exerciseSnapshot as Array<{ exerciseId: string }>).map(
-        (item) => item.exerciseId,
-      ),
-    )
-    if (value.doneExerciseIds.some((id) => !snapshotIds.has(id))) return false
   }
-  return true
+  return null
+}
+
+function isWorkoutSession(value: unknown): value is WorkoutSession {
+  return workoutSessionValidationIssue(value) === null
+}
+
+function normalizeWorkoutSession(value: WorkoutSession): WorkoutSession {
+  if (value.doneExerciseIds === undefined) return value
+  const snapshotIds = new Set(value.exerciseSnapshot.map((item) => item.exerciseId))
+  const doneExerciseIds = value.doneExerciseIds.filter((id) => snapshotIds.has(id))
+  if (doneExerciseIds.length === value.doneExerciseIds.length) return value
+
+  // The original exercise-swap flow could remove an unperformed exercise
+  // without removing its derived completion/collapse marker. The marker is UI
+  // state, not workout history, so discard only stale references in exports and
+  // restored backups while preserving every exercise and logged set.
+  return { ...value, doneExerciseIds }
 }
 
 function isLoggedSet(value: unknown): value is LoggedSet {
@@ -597,6 +624,15 @@ function validatePayload(
         EXPORT_TABLE_INTRODUCED_IN[table] === 1
           ? 'is missing or malformed'
           : 'is malformed'
+      if (table === 'workoutSessions' && Array.isArray(value)) {
+        const invalidIndex = value.findIndex((row) => !isWorkoutSession(row))
+        if (invalidIndex >= 0) {
+          const issue = workoutSessionValidationIssue(value[invalidIndex])
+          throw new Error(
+            `Import table "${table}" ${detail} (row ${invalidIndex + 1}: ${issue ?? 'unknown validation error'})`,
+          )
+        }
+      }
       throw new Error(`Import table "${table}" ${detail}`)
     }
   }
@@ -610,7 +646,9 @@ function validatePayload(
       programs: data.programs as ProgramRow[],
       sessionTemplates: data.sessionTemplates as SessionTemplate[],
       templateExercises: data.templateExercises as TemplateExercise[],
-      workoutSessions: data.workoutSessions as WorkoutSession[],
+      workoutSessions: (data.workoutSessions as WorkoutSession[]).map(
+        normalizeWorkoutSession,
+      ),
       loggedSets: data.loggedSets as LoggedSet[],
       recommendations: (data.recommendations ?? []) as Recommendation[],
       dailyBriefings: (data.dailyBriefings ?? []) as DailyBriefing[],
