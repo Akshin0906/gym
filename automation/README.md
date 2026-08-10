@@ -142,7 +142,9 @@ paths—including image generation, skill search/install, app/browser/computer
 access, shell/unified execution, workspace dependencies, hooks, goals,
 subagents, and memories—are also explicitly disabled. The JSONL audit remains
 the final fail-closed check if a future CLI version nevertheless emits a tool
-item.
+item. The audit permits only one exact, pre-turn Code Mode host-disabled
+compatibility diagnostic emitted by Codex CLI 0.147; every changed diagnostic,
+other error, malformed event lifecycle, or tool item is still rejected.
 
 ## Configuration overrides
 

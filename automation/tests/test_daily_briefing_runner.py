@@ -268,7 +268,9 @@ class EnvTests(unittest.TestCase):
             self.assertEqual(first["CODEX_HOME"], str(codex_home.resolve()))
             self.assertEqual(second, first)
 
-    def test_invoke_codex_revalidates_home_after_runtime_materialization(self) -> None:
+    def test_invoke_codex_accepts_compatibility_diagnostic_and_revalidates_home(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             codex_home = root / "codex-home"
@@ -286,6 +288,14 @@ class EnvTests(unittest.TestCase):
                 create_codex_runtime_state(codex_home)
                 events = [
                     {"type": "thread.started", "thread_id": "thread"},
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "startup-diagnostic",
+                            "type": "error",
+                            "message": runner.CODEX_CODE_MODE_HOST_DISABLED_DIAGNOSTIC,
+                        },
+                    },
                     {"type": "turn.started"},
                     {
                         "type": "item.completed",
@@ -317,6 +327,12 @@ class EnvTests(unittest.TestCase):
 
             self.assertEqual(output, {})
             self.assertEqual(codex_version, "codex-cli test")
+            audit = json.loads(
+                (run_dir / "codex-events-audit.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                audit["compatibilityDiagnostics"], {"codeModeHostDisabled": 1}
+            )
             runner.validate_codex_home(codex_home)
 
     def test_codex_home_rejects_personal_skills_beside_system_skills(self) -> None:
@@ -469,6 +485,279 @@ class CodexEventAuditTests(unittest.TestCase):
             self.assertEqual(audit["itemTypes"]["agent_message"], 1)
             self.assertNotIn("private", audit_path.read_text(encoding="utf-8"))
 
+    def test_exact_pre_turn_code_mode_diagnostic_is_allowed(self) -> None:
+        events = [
+            {"type": "thread.started", "thread_id": "thread"},
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "startup-diagnostic",
+                    "type": "error",
+                    "message": runner.CODEX_CODE_MODE_HOST_DISABLED_DIAGNOSTIC,
+                },
+            },
+            {"type": "turn.started"},
+            {
+                "type": "item.completed",
+                "item": {"id": "answer", "type": "agent_message", "text": "{}"},
+            },
+            {"type": "turn.completed", "usage": {}},
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            event_path = root / "events.jsonl"
+            audit_path = root / "audit.json"
+            event_path.write_text(
+                "\n".join(json.dumps(event) for event in events) + "\n",
+                encoding="utf-8",
+            )
+
+            audit = runner.audit_codex_events(event_path, audit_path)
+
+            self.assertEqual(audit["itemTypes"]["error"], 1)
+            self.assertEqual(
+                audit["compatibilityDiagnostics"], {"codeModeHostDisabled": 1}
+            )
+            self.assertFalse(audit["toolsObserved"])
+            self.assertNotIn(
+                runner.CODEX_CODE_MODE_HOST_DISABLED_DIAGNOSTIC,
+                audit_path.read_text(encoding="utf-8"),
+            )
+
+    def test_code_mode_diagnostic_near_misses_fail_closed(self) -> None:
+        diagnostic_item = {
+            "id": "startup-diagnostic",
+            "type": "error",
+            "message": runner.CODEX_CODE_MODE_HOST_DISABLED_DIAGNOSTIC,
+        }
+        answer = {
+            "type": "item.completed",
+            "item": {"id": "answer", "type": "agent_message", "text": "{}"},
+        }
+        completed = {"type": "turn.completed", "usage": {}}
+        cases = {
+            "changed-message": [
+                {"type": "thread.started", "thread_id": "thread"},
+                {
+                    "type": "item.completed",
+                    "item": {**diagnostic_item, "message": "changed"},
+                },
+                {"type": "turn.started"},
+                answer,
+                completed,
+            ],
+            "missing-message": [
+                {"type": "thread.started", "thread_id": "thread"},
+                {
+                    "type": "item.completed",
+                    "item": {"id": "startup-diagnostic", "type": "error"},
+                },
+                {"type": "turn.started"},
+                answer,
+                completed,
+            ],
+            "extra-key": [
+                {"type": "thread.started", "thread_id": "thread"},
+                {
+                    "type": "item.completed",
+                    "item": {**diagnostic_item, "unexpected": True},
+                },
+                {"type": "turn.started"},
+                answer,
+                completed,
+            ],
+            "extra-event-key": [
+                {"type": "thread.started", "thread_id": "thread"},
+                {
+                    "type": "item.completed",
+                    "item": diagnostic_item,
+                    "unexpected": True,
+                },
+                {"type": "turn.started"},
+                answer,
+                completed,
+            ],
+            "empty-id": [
+                {"type": "thread.started", "thread_id": "thread"},
+                {
+                    "type": "item.completed",
+                    "item": {**diagnostic_item, "id": ""},
+                },
+                {"type": "turn.started"},
+                answer,
+                completed,
+            ],
+            "historical-metadata-error": [
+                {"type": "thread.started", "thread_id": "thread"},
+                {
+                    "type": "item.completed",
+                    "item": {
+                        **diagnostic_item,
+                        "message": (
+                            "Model metadata for `gpt-5.6-sol` not found. Defaulting "
+                            "to fallback metadata; this can degrade performance and "
+                            "cause issues."
+                        ),
+                    },
+                },
+                {"type": "turn.started"},
+                answer,
+                completed,
+            ],
+            "wrong-envelope": [
+                {"type": "thread.started", "thread_id": "thread"},
+                {"type": "item.started", "item": diagnostic_item},
+                {"type": "turn.started"},
+                answer,
+                completed,
+            ],
+            "after-turn-started": [
+                {"type": "thread.started", "thread_id": "thread"},
+                {"type": "turn.started"},
+                {"type": "item.completed", "item": diagnostic_item},
+                answer,
+                completed,
+            ],
+            "duplicate": [
+                {"type": "thread.started", "thread_id": "thread"},
+                {"type": "item.completed", "item": diagnostic_item},
+                {"type": "item.completed", "item": diagnostic_item},
+                {"type": "turn.started"},
+                answer,
+                completed,
+            ],
+        }
+
+        for name, events in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                event_path = root / "events.jsonl"
+                audit_path = root / "audit.json"
+                event_path.write_text(
+                    "\n".join(json.dumps(event) for event in events) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(runner.ConfigError, "forbidden"):
+                    runner.audit_codex_events(event_path, audit_path)
+                self.assertFalse(audit_path.exists())
+
+    def test_allowed_diagnostic_does_not_allow_a_tool_item(self) -> None:
+        events = [
+            {"type": "thread.started", "thread_id": "thread"},
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "startup-diagnostic",
+                    "type": "error",
+                    "message": runner.CODEX_CODE_MODE_HOST_DISABLED_DIAGNOSTIC,
+                },
+            },
+            {"type": "turn.started"},
+            {
+                "type": "item.started",
+                "item": {"id": "tool", "type": "web_search", "query": "gym"},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            event_path = root / "events.jsonl"
+            audit_path = root / "audit.json"
+            event_path.write_text(
+                "\n".join(json.dumps(event) for event in events) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(runner.ConfigError, "forbidden"):
+                runner.audit_codex_events(event_path, audit_path)
+            self.assertFalse(audit_path.exists())
+
+    def test_malformed_event_lifecycle_fails_closed(self) -> None:
+        thread_started = {"type": "thread.started", "thread_id": "thread"}
+        turn_started = {"type": "turn.started"}
+        answer = {
+            "type": "item.completed",
+            "item": {"id": "answer", "type": "agent_message", "text": "{}"},
+        }
+        completed = {"type": "turn.completed", "usage": {}}
+        diagnostic = {
+            "type": "item.completed",
+            "item": {
+                "id": "startup-diagnostic",
+                "type": "error",
+                "message": runner.CODEX_CODE_MODE_HOST_DISABLED_DIAGNOSTIC,
+            },
+        }
+        cases = {
+            "missing-turn-started": [thread_started, answer, completed],
+            "completion-before-answer": [
+                thread_started,
+                turn_started,
+                completed,
+                answer,
+            ],
+            "duplicate-thread": [
+                thread_started,
+                diagnostic,
+                thread_started,
+                turn_started,
+                answer,
+                completed,
+            ],
+            "event-after-completion": [
+                thread_started,
+                turn_started,
+                answer,
+                completed,
+                {"type": "warning", "message": "late"},
+            ],
+            "duplicate-answer": [
+                thread_started,
+                turn_started,
+                answer,
+                answer,
+                completed,
+            ],
+        }
+
+        for name, events in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                event_path = root / "events.jsonl"
+                audit_path = root / "audit.json"
+                event_path.write_text(
+                    "\n".join(json.dumps(event) for event in events) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaises(runner.ConfigError):
+                    runner.audit_codex_events(event_path, audit_path)
+                self.assertFalse(audit_path.exists())
+
+    def test_allowed_diagnostic_does_not_allow_top_level_failure(self) -> None:
+        for failure_type in ("error", "turn.failed"):
+            with self.subTest(failure_type=failure_type), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                event_path = root / "events.jsonl"
+                audit_path = root / "audit.json"
+                events = [
+                    {"type": "thread.started", "thread_id": "thread"},
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "startup-diagnostic",
+                            "type": "error",
+                            "message": runner.CODEX_CODE_MODE_HOST_DISABLED_DIAGNOSTIC,
+                        },
+                    },
+                    {"type": "turn.started"},
+                    {"type": failure_type, "error": {"message": "failed"}},
+                ]
+                event_path.write_text(
+                    "\n".join(json.dumps(event) for event in events) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(runner.TransientError, failure_type):
+                    runner.audit_codex_events(event_path, audit_path)
+                self.assertFalse(audit_path.exists())
+
     def test_any_tool_item_fails_closed_before_output_is_accepted(self) -> None:
         events = [
             {"type": "thread.started", "thread_id": "thread"},
@@ -501,7 +790,7 @@ class CodexEventAuditTests(unittest.TestCase):
             incomplete.write_text(
                 json.dumps({"type": "turn.started"}) + "\n", encoding="utf-8"
             )
-            with self.assertRaisesRegex(runner.ConfigError, "completed answer"):
+            with self.assertRaisesRegex(runner.ConfigError, "event stream"):
                 runner.audit_codex_events(incomplete, root / "audit.json")
 
 

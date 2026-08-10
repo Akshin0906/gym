@@ -34,7 +34,7 @@ from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 
-RUNNER_VERSION = "3.4"
+RUNNER_VERSION = "3.5"
 PROMPT_VERSION = "2026-08-05-evidence-v1"
 VALIDATOR_COMPATIBILITY_VERSION = "2026-08-06-oura-calendar-v5"
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
@@ -107,8 +107,13 @@ CODEX_SYSTEM_SKILL_DIRS = frozenset(
         "skill-installer",
     }
 )
+CODEX_CODE_MODE_HOST_DISABLED_DIAGNOSTIC = (
+    "Code Mode is unavailable because code-mode host is disabled. Code mode will "
+    "fail closed; enable `features.code_mode_host` and install "
+    "`codex-code-mode-host`."
+)
 
-# Audited against `codex features list` in codex-cli 0.146.0-alpha.9.2. The CLI
+# Audited against `codex features list` in codex-cli 0.147.0-alpha.6.5. The CLI
 # still installs bundled system-skill descriptions, but every currently exposed
 # tool-bearing surface that can be disabled is turned off. JSONL auditing is the
 # final fail-closed compatibility check for future CLI changes.
@@ -1227,9 +1232,13 @@ def audit_codex_events(events_path: Path, audit_path: Path) -> dict[str, Any]:
 
     event_types: dict[str, int] = {}
     item_types: dict[str, int] = {}
+    thread_started = False
+    turn_started = False
     completed = False
-    agent_message = False
+    agent_message_count = 0
     line_count = 0
+    previous_event_type: str | None = None
+    code_mode_diagnostic_count = 0
     for line_number, raw_line in enumerate(payload.splitlines(), start=1):
         if not raw_line.strip():
             continue
@@ -1245,11 +1254,23 @@ def audit_codex_events(events_path: Path, audit_path: Path) -> dict[str, Any]:
             event.get("type"), f"Codex event line {line_number}.type"
         )
         event_types[event_type] = event_types.get(event_type, 0) + 1
+        if completed:
+            raise ConfigError("Codex event stream continued after turn completion")
         if event_type in {"error", "turn.failed"}:
             raise TransientError(f"Codex reported {event_type}")
-        if event_type == "turn.completed":
+        if event_type == "thread.started":
+            if thread_started or turn_started or line_count != 1:
+                raise ConfigError("Codex event stream has an invalid thread lifecycle")
+            thread_started = True
+        elif event_type == "turn.started":
+            if not thread_started or turn_started:
+                raise ConfigError("Codex event stream has an invalid turn lifecycle")
+            turn_started = True
+        elif event_type == "turn.completed":
+            if not turn_started or agent_message_count != 1:
+                raise ConfigError("Codex event stream completed without one answer")
             completed = True
-        if event_type.startswith("item."):
+        elif event_type.startswith("item."):
             item = require_object(
                 event.get("item"), f"Codex event line {line_number}.item"
             )
@@ -1257,27 +1278,56 @@ def audit_codex_events(events_path: Path, audit_path: Path) -> dict[str, Any]:
                 item.get("type"), f"Codex event line {line_number}.item.type"
             )
             item_types[item_type] = item_types.get(item_type, 0) + 1
+            if item_type == "error":
+                allowed_code_mode_diagnostic = (
+                    event_type == "item.completed"
+                    and set(event) == {"type", "item"}
+                    and set(item) == {"id", "type", "message"}
+                    and isinstance(item.get("id"), str)
+                    and bool(item["id"].strip())
+                    and item.get("message")
+                    == CODEX_CODE_MODE_HOST_DISABLED_DIAGNOSTIC
+                    and code_mode_diagnostic_count == 0
+                    and thread_started
+                    and not turn_started
+                    and previous_event_type == "thread.started"
+                    and event_types.get("thread.started") == 1
+                    and event_types.get("turn.started", 0) == 0
+                )
+                if not allowed_code_mode_diagnostic:
+                    raise ConfigError(
+                        "Codex used a forbidden or unexpected tool item: error"
+                    )
+                code_mode_diagnostic_count = 1
+                previous_event_type = event_type
+                continue
+            if not turn_started:
+                raise ConfigError("Codex emitted an item before the turn started")
             if item_type not in {"agent_message", "reasoning"}:
                 raise ConfigError(
                     f"Codex used a forbidden or unexpected tool item: {item_type}"
                 )
             if item_type == "agent_message" and event_type == "item.completed":
-                agent_message = True
-        elif event_type not in {
-            "thread.started",
-            "turn.started",
-            "turn.completed",
-            "warning",
-        }:
+                agent_message_count += 1
+                if agent_message_count > 1:
+                    raise ConfigError("Codex event stream contained multiple answers")
+        elif event_type == "warning":
+            if not turn_started:
+                raise ConfigError("Codex emitted a warning before the turn started")
+        else:
             raise ConfigError(f"Unexpected Codex event type: {event_type}")
+        previous_event_type = event_type
 
-    if not completed or not agent_message:
+    if not completed or agent_message_count != 1:
         raise ConfigError("Codex event stream did not contain a completed answer")
     audit = {
         "sha256": sha256_bytes(payload),
         "lineCount": line_count,
         "eventTypes": dict(sorted(event_types.items())),
         "itemTypes": dict(sorted(item_types.items())),
+        "compatibilityDiagnostics": {
+            "codeModeHostDisabled": code_mode_diagnostic_count,
+        },
         "toolsObserved": False,
     }
     atomic_write_json(audit_path, audit)
