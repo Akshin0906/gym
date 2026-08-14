@@ -1,12 +1,19 @@
 import Dexie from 'dexie'
 import { db } from '../schema'
 import { estimated1RM } from '../../lib/analytics'
+import { assertPostWorkoutFeedback } from '../../lib/postWorkoutFeedback'
+import {
+  assertPreWorkoutCheckIn,
+  isPerceivedRecoveryScore,
+} from '../../lib/preWorkoutCheckIn'
 import type {
   LoggedSet,
+  PerceivedRecoveryScore,
+  PostWorkoutFeedbackV2,
+  PreWorkoutCheckInV1,
   Program,
   SessionExerciseSnapshot,
   SessionTemplate,
-  SliderValue,
   WorkoutSession,
 } from '../types'
 
@@ -74,7 +81,11 @@ export async function startSession(
           continue
         }
         await db.workoutSessions.update(s.id, {
-          completedAt: Math.max(lastSet.loggedAt, s.startedAt),
+          completedAt: Math.max(
+            lastSet.loggedAt,
+            s.startedAt,
+            s.preWorkoutCheckIn?.recordedAt ?? 0,
+          ),
         })
       }
 
@@ -105,6 +116,7 @@ export async function startSession(
         exerciseSnapshot: snapshot,
         startedAt: now,
         completedAt: null,
+        preWorkoutCheckIn: null,
       })
     },
   )
@@ -154,20 +166,94 @@ export async function getSession(id: string): Promise<WorkoutSession | undefined
 }
 
 export async function endSession(id: string): Promise<void> {
-  const session = await db.workoutSessions.get(id)
-  if (!session) throw new Error('Session not found')
-  await db.workoutSessions.update(id, {
-    completedAt: Math.max(Date.now(), session.startedAt),
-  })
+  await db.transaction(
+    'rw',
+    [db.workoutSessions, db.loggedSets],
+    async () => {
+      const session = await db.workoutSessions.get(id)
+      if (!session) throw new Error('Session not found')
+      if (session.preWorkoutCheckIn === null) {
+        const setCount = await db.loggedSets
+          .where('workoutSessionId')
+          .equals(id)
+          .count()
+        if (setCount === 0) {
+          throw new Error('Complete or skip the pre-workout check-in first')
+        }
+      }
+      await db.workoutSessions.update(id, {
+        completedAt: Math.max(
+          Date.now(),
+          session.startedAt,
+          session.preWorkoutCheckIn?.recordedAt ?? 0,
+        ),
+      })
+    },
+  )
 }
 
-export async function updateSessionFeedback(
+export async function recordPreWorkoutCheckIn(
   id: string,
-  feedback: { planned: SliderValue | null; feel: SliderValue | null },
+  perceivedRecovery: PerceivedRecoveryScore | null,
+): Promise<PreWorkoutCheckInV1> {
+  if (
+    perceivedRecovery !== null &&
+    !isPerceivedRecoveryScore(perceivedRecovery)
+  ) {
+    throw new Error('Invalid perceived recovery score')
+  }
+
+  return db.transaction(
+    'rw',
+    [db.workoutSessions, db.loggedSets],
+    async () => {
+      const session = await db.workoutSessions.get(id)
+      if (!session) throw new Error('Session not found')
+      if (session.completedAt !== null) {
+        throw new Error('Pre-workout check-in requires an active session')
+      }
+      if (
+        session.preWorkoutCheckIn !== undefined &&
+        session.preWorkoutCheckIn !== null
+      ) {
+        assertPreWorkoutCheckIn(session.preWorkoutCheckIn)
+        return session.preWorkoutCheckIn
+      }
+      if (session.preWorkoutCheckIn === undefined) {
+        throw new Error('Pre-workout check-in is unavailable for this session')
+      }
+      const setCount = await db.loggedSets
+        .where('workoutSessionId')
+        .equals(id)
+        .count()
+      if (setCount > 0) {
+        throw new Error('Pre-workout check-in must precede logged work sets')
+      }
+
+      const checkIn: PreWorkoutCheckInV1 = {
+        version: 1,
+        perceivedRecovery,
+        recordedAt: Math.max(Date.now(), session.startedAt),
+      }
+      assertPreWorkoutCheckIn(checkIn)
+      await db.workoutSessions.update(id, { preWorkoutCheckIn: checkIn })
+      return checkIn
+    },
+  )
+}
+
+export async function updatePostWorkoutFeedback(
+  id: string,
+  feedback: PostWorkoutFeedbackV2,
 ): Promise<void> {
-  await db.workoutSessions.update(id, {
-    sessionPlanned: feedback.planned,
-    sessionFeel: feedback.feel,
+  assertPostWorkoutFeedback(feedback)
+  await db.transaction('rw', db.workoutSessions, async () => {
+    const session = await db.workoutSessions.get(id)
+    if (!session) throw new Error('Session not found')
+    if (session.completedAt === null) {
+      throw new Error('Post-workout feedback requires a completed session')
+    }
+    await db.workoutSessions.update(id, { postWorkoutFeedback: feedback })
   })
 }
 
@@ -276,17 +362,30 @@ export async function logSet(args: {
   await db.transaction('rw', [db.loggedSets, db.workoutSessions], async () => {
     const session = await db.workoutSessions.get(args.sessionId)
     if (!session) throw new Error('Session not found')
+    if (session.completedAt === null && session.preWorkoutCheckIn === null) {
+      const setCount = await db.loggedSets
+        .where('workoutSessionId')
+        .equals(session.id)
+        .count()
+      if (setCount === 0) {
+        throw new Error('Complete or skip the pre-workout check-in first')
+      }
+    }
     const now = Date.now()
+    const earliestLoggedAt = Math.max(
+      session.startedAt,
+      session.preWorkoutCheckIn?.recordedAt ?? 0,
+    )
     let loggedAt: number
     if (session.completedAt !== null) {
-      loggedAt = Math.max(session.completedAt, session.startedAt)
+      loggedAt = Math.max(session.completedAt, earliestLoggedAt)
     } else if (isResumable(session.startedAt, now)) {
-      loggedAt = now
+      loggedAt = Math.max(now, earliestLoggedAt)
     } else {
       // History can expose an abandoned unfinished session from an earlier day.
       // Keep corrections in that session's chronology rather than polluting
       // today's analytics.
-      loggedAt = session.startedAt
+      loggedAt = earliestLoggedAt
       await db.loggedSets
         .where('workoutSessionId')
         .equals(session.id)

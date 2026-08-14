@@ -601,6 +601,22 @@ class SchemaTests(unittest.TestCase):
 
 
 class PromptContractTests(unittest.TestCase):
+    def test_prompt_defines_versioned_pre_workout_recovery(self) -> None:
+        prompt_path = Path(__file__).resolve().parents[1] / "codex_chat_prompt.md"
+        prompt = prompt_path.read_text(encoding="utf-8")
+        self.assertIn("`preWorkoutCheckIn.version: 1`", prompt)
+        self.assertIn("0-10 Perceived Recovery Status", prompt)
+        self.assertIn("within-person context", prompt)
+        self.assertIn("do not infer a neutral score", prompt)
+
+    def test_prompt_defines_versioned_post_workout_feedback(self) -> None:
+        prompt_path = Path(__file__).resolve().parents[1] / "codex_chat_prompt.md"
+        prompt = prompt_path.read_text(encoding="utf-8")
+        self.assertIn("`postWorkoutFeedback.version: 2`", prompt)
+        self.assertIn("`sessionRpe`: immediate whole-session effort", prompt)
+        self.assertIn("`painImpact`", prompt)
+        self.assertIn("Never reinterpret or merge", prompt)
+
     def test_prompt_disambiguates_workouts_and_preserves_history(self) -> None:
         prompt_path = Path(__file__).resolve().parents[1] / "codex_chat_prompt.md"
         prompt = prompt_path.read_text(encoding="utf-8")

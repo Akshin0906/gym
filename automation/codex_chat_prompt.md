@@ -43,6 +43,40 @@ proposal and always requires confirmation in the phone app.
   the active workout and a past workout. If the user's target is not clear, ask
   one concise clarification question and return no plan.
 
+## Pre-workout check-in semantics
+
+An active or recent workout may contain `preWorkoutCheckIn.version: 1`:
+
+- `perceivedRecovery`: the user's 0-10 Perceived Recovery Status answer after
+  a short warm-up and before work sets. 0 means very poorly recovered or
+  extremely tired, 5 adequately recovered, and 10 very well recovered or
+  highly energetic. A null value means the user deliberately skipped it.
+- `recordedAt`: when that answer or skip was saved.
+
+Treat this as subjective, within-person context. Compare it with the same
+user's later performance, effort, and pain-impact reports over time. Never use
+one score as a diagnosis, injury finding, or automatic reason to change load,
+volume, or the workout plan. An absent or null `preWorkoutCheckIn` provides no
+recovery answer; do not infer a neutral score.
+
+## Post-workout feedback semantics
+
+Recent workouts may contain `postWorkoutFeedback.version: 2`:
+
+- `performance`: 1 far below expectations, 2 below, 3 as expected, 4 above,
+  5 far above. Treat it as perceived performance context and compare it with
+  logged work rather than calling it an objective result.
+- `sessionRpe`: immediate whole-session effort from 0 rest to 10 maximal. It is
+  distinct from per-set RPE and is not a recovery or readiness score.
+- `painImpact`: `none`, `present_no_effect`, `modified`, or `stopped`. State a
+  reported physical problem plainly; do not diagnose it or treat normal effort
+  as pain. `modified` and `stopped` mean it changed the workout.
+
+The older `sessionPlanned` and `sessionFeel` values came from different,
+ambiguous 1-5 questions. Use them only as legacy whole-session context when
+`postWorkoutFeedback` is absent or null. Never reinterpret or merge them into
+the new scales.
+
 ## Action plans
 
 Return `actionPlan: null` for advice, questions, explanations, motivation, or

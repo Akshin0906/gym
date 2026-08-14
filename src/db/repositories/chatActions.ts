@@ -1122,6 +1122,7 @@ export async function applyCoachActionPlan(args: {
               exerciseSnapshot: snapshotFromPlan(action.exercises),
               startedAt: now,
               completedAt: null,
+              preWorkoutCheckIn: null,
             })
             result.changes.push({
               type: action.type,

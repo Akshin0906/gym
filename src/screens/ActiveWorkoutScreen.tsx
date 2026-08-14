@@ -6,6 +6,7 @@ import { ExerciseDetailOverlay } from '../components/ExerciseDetailOverlay'
 import { CoachLink, Header } from '../components/Header'
 import { ExercisePickerSheet } from '../components/ExercisePickerSheet'
 import { ProgressRing } from '../components/ProgressRing'
+import { PreWorkoutCheckIn } from '../components/PreWorkoutCheckIn'
 import { SessionFeedback } from '../components/SessionFeedback'
 import { SetLogger } from '../components/SetLogger'
 import { getExercisesByIds } from '../db/repositories/exercises'
@@ -17,14 +18,16 @@ import {
   getResumableSession,
   getSession,
   getSetsForSession,
+  recordPreWorkoutCheckIn,
   setSessionDoneExercises,
-  updateSessionFeedback,
+  updatePostWorkoutFeedback,
 } from '../db/repositories/sessions'
 import type {
   Exercise,
   LoggedSet,
+  PerceivedRecoveryScore,
+  PostWorkoutFeedbackV2,
   SessionExerciseSnapshot,
-  SliderValue,
   WorkoutSession,
 } from '../db/types'
 import { uploadCloudSnapshot } from '../lib/cloud'
@@ -106,7 +109,6 @@ export function ActiveWorkoutScreen() {
   // don't fight that navigation by redirecting to '/'. Only redirect when the
   // screen was opened without an active session (direct nav).
   const hadSessionRef = useRef(false)
-  const completionSyncRef = useRef<Promise<unknown> | null>(null)
   useUnsavedChangesWarning(
     dirtySetDrafts.size > 0 && feedbackForSessionId === null,
     'You have an unlogged set. Leave this workout and discard it?',
@@ -166,33 +168,36 @@ export function ActiveWorkoutScreen() {
     // leave it in limbo. Feedback fields are patched after, or stay null
     // if the user skips.
     await endSession(session.id)
-    completionSyncRef.current = uploadCloudSnapshot('workout_completed').catch(
-      () => {
-        // The completed session and pending-sync marker are durable locally;
-        // startup, foreground, and online recovery will try again.
-      },
-    )
+    void uploadCloudSnapshot('workout_completed').catch(() => {
+      // The completed session and pending-sync marker are durable locally;
+      // startup, foreground, and online recovery will try again.
+    })
     setFeedbackForSessionId(session.id)
   }
 
-  async function handleFeedbackSave(answers: {
-    planned: SliderValue
-    feel: SliderValue
-  }) {
+  async function handleFeedbackSave(answers: PostWorkoutFeedbackV2) {
     if (feedbackForSessionId) {
-      await updateSessionFeedback(feedbackForSessionId, answers)
-      // Let the completion snapshot finish before uploading the feedback update,
-      // so a slower stale request cannot overwrite the newer snapshot.
-      const completionSync = completionSyncRef.current
-      void (async () => {
-        await completionSync
-        await uploadCloudSnapshot('workout_completed')
-      })().catch(() => {
+      await updatePostWorkoutFeedback(feedbackForSessionId, answers)
+      // Queue a new durable generation immediately. If the completion upload is
+      // still in flight, snapshot CAS makes either order converge on this newer
+      // local state while the generation marker survives a tab close.
+      void uploadCloudSnapshot('workout_completed').catch(() => {
         // Settings keeps the last sync error and recovery keeps the retry.
       })
     }
     setActiveSession(null)
     navigate('/history')
+  }
+
+  async function handlePreWorkoutCheckIn(
+    perceivedRecovery: PerceivedRecoveryScore | null,
+  ) {
+    if (!session) return
+    const preWorkoutCheckIn = await recordPreWorkoutCheckIn(
+      session.id,
+      perceivedRecovery,
+    )
+    setSession({ ...session, preWorkoutCheckIn })
   }
 
   function handleFeedbackSkip() {
@@ -246,8 +251,28 @@ export function ActiveWorkoutScreen() {
         <Header title={session.name} subtitle="Session check-in" />
         <SessionFeedback
           sessionName={session.name}
-          onSave={(answers) => void handleFeedbackSave(answers)}
+          onSave={handleFeedbackSave}
           onSkip={handleFeedbackSkip}
+        />
+      </>
+    )
+  }
+  if (
+    session.completedAt === null &&
+    setsBySession.length === 0 &&
+    session.preWorkoutCheckIn === null
+  ) {
+    return (
+      <>
+        <Header
+          title={session.name}
+          subtitle="Pre-workout check-in"
+          back="/"
+        />
+        <PreWorkoutCheckIn
+          sessionName={session.name}
+          onSave={(score) => handlePreWorkoutCheckIn(score)}
+          onSkip={() => handlePreWorkoutCheckIn(null)}
         />
       </>
     )

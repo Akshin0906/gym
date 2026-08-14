@@ -1,5 +1,7 @@
 import { db } from '../schema'
 import { parseCoachActionResultJson } from '../../lib/coachActionResult'
+import { postWorkoutFeedbackValidationIssue } from '../../lib/postWorkoutFeedback'
+import { preWorkoutCheckInValidationIssue } from '../../lib/preWorkoutCheckIn'
 import type {
   AiMemorySettings,
   AiMemorySummary,
@@ -9,6 +11,7 @@ import type {
   Exercise,
   LoggedSet,
   ProgramRow,
+  PreWorkoutCheckInV1,
   Recommendation,
   SessionTemplate,
   TemplateExercise,
@@ -313,6 +316,25 @@ function workoutSessionValidationIssue(value: unknown): string | null {
   if (value.completedAt !== null && value.completedAt < value.startedAt) {
     return 'completedAt precedes startedAt'
   }
+  if (
+    value.preWorkoutCheckIn !== undefined &&
+    value.preWorkoutCheckIn !== null
+  ) {
+    const checkInIssue = preWorkoutCheckInValidationIssue(
+      value.preWorkoutCheckIn,
+    )
+    if (checkInIssue) return `preWorkoutCheckIn ${checkInIssue}`
+    const checkIn = value.preWorkoutCheckIn as PreWorkoutCheckInV1
+    if (checkIn.recordedAt < value.startedAt) {
+      return 'preWorkoutCheckIn recordedAt precedes startedAt'
+    }
+    if (
+      value.completedAt !== null &&
+      checkIn.recordedAt > value.completedAt
+    ) {
+      return 'preWorkoutCheckIn recordedAt follows completedAt'
+    }
+  }
   const sliderValues = [value.sessionPlanned, value.sessionFeel]
   if (
     sliderValues.some(
@@ -323,6 +345,18 @@ function workoutSessionValidationIssue(value: unknown): string | null {
     )
   ) {
     return 'session feedback is outside the 1-5 range'
+  }
+  if (
+    value.postWorkoutFeedback !== undefined &&
+    value.postWorkoutFeedback !== null
+  ) {
+    if (value.completedAt === null) {
+      return 'postWorkoutFeedback requires a completed session'
+    }
+    const feedbackIssue = postWorkoutFeedbackValidationIssue(
+      value.postWorkoutFeedback,
+    )
+    if (feedbackIssue) return `postWorkoutFeedback ${feedbackIssue}`
   }
   if (value.doneExerciseIds !== undefined) {
     if (!isStringArray(value.doneExerciseIds) || !hasUniqueStrings(value.doneExerciseIds)) {
@@ -547,6 +581,23 @@ function assertRelationships(data: ExportPayload['data']): void {
   for (const row of data.loggedSets) {
     if (!workoutIds.has(row.workoutSessionId) || !exerciseIds.has(row.exerciseId)) {
       throw new Error(`Logged set "${row.id}" has a broken reference`)
+    }
+  }
+  const checkInsByWorkout = new Map(
+    data.workoutSessions
+      .filter(
+        (row): row is WorkoutSession & {
+          preWorkoutCheckIn: PreWorkoutCheckInV1
+        } => row.preWorkoutCheckIn !== undefined && row.preWorkoutCheckIn !== null,
+      )
+      .map((row) => [row.id, row.preWorkoutCheckIn] as const),
+  )
+  for (const row of data.loggedSets) {
+    const checkIn = checkInsByWorkout.get(row.workoutSessionId)
+    if (checkIn && row.loggedAt < checkIn.recordedAt) {
+      throw new Error(
+        `Logged set "${row.id}" precedes its pre-workout check-in`,
+      )
     }
   }
 

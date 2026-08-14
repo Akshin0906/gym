@@ -35,7 +35,7 @@ from zoneinfo import ZoneInfo
 
 
 RUNNER_VERSION = "3.5"
-PROMPT_VERSION = "2026-08-05-evidence-v1"
+PROMPT_VERSION = "2026-08-13-pre-workout-prs-v1"
 VALIDATOR_COMPATIBILITY_VERSION = "2026-08-06-oura-calendar-v5"
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 DEFAULT_CODEX_REASONING_EFFORT = "xhigh"

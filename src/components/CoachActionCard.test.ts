@@ -141,6 +141,7 @@ describe('CoachActionCard lifecycle previews', () => {
           name: 'Hotel Workout',
           programName: null,
           startedAt: 1,
+          preWorkoutCheckIn: null,
           doneExerciseIds: [],
           exercises: [
             {

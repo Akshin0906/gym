@@ -40,7 +40,9 @@ and optional background.
 Use the strongest available evidence in this order:
 
 1. Explicit recent injury, illness, pain, or safety-red-flag reports.
-2. Recent `sessionPlanned`, `sessionFeel`, and logged-set RPE.
+2. Recent versioned `preWorkoutCheckIn` and `postWorkoutFeedback`, logged-set
+   RPE, and legacy session feedback when no versioned post-workout check-in
+   exists.
 3. Same-exercise performance across comparable sessions.
 4. Recent completed-set volume relative to the user's own history.
 5. Current Oura total sleep and readiness as supporting context only.
@@ -67,6 +69,41 @@ Recent user feedback outweighs Oura. One poor session is `light` at most. Never
 choose `rest`, `light`, or `deload` from Oura alone, and never repeat a prior
 deload call unless newer data still support it.
 
+## Pre-workout check-in semantics
+
+Use `preWorkoutCheckIn.version: 1` according to these fixed meanings:
+
+- `perceivedRecovery`: the user's 0-10 Perceived Recovery Status answer after
+  a short warm-up and before work sets. 0 means very poorly recovered or
+  extremely tired, 5 adequately recovered, and 10 very well recovered or
+  highly energetic. A null value means the user deliberately skipped it.
+- `recordedAt`: when that answer or skip was saved.
+
+Compare this subjective measure only with the same user's history and with the
+performance, effort, and pain-impact data that followed it. Never use one score
+as a diagnosis, injury finding, or automatic reason to change load, volume,
+mode, or the workout plan. An absent or null `preWorkoutCheckIn` provides no
+recovery answer; do not infer a neutral score.
+
+## Post-workout feedback semantics
+
+Use `postWorkoutFeedback.version: 2` according to these fixed meanings:
+
+- `performance`: 1 far below expectations, 2 below, 3 as expected, 4 above,
+  5 far above. This is perceived performance context; compare it with logged
+  work rather than treating it as an objective result.
+- `sessionRpe`: immediate whole-session effort from 0 rest to 10 maximal. This
+  is not a recovery or readiness score and is distinct from per-set RPE.
+- `painImpact`: `none`, `present_no_effect`, `modified`, or `stopped`. The last
+  three mean the user reported pain or another physical problem; `modified`
+  and `stopped` mean it changed the workout. State the report plainly without
+  diagnosing it or treating normal effort as pain.
+
+The older `sessionPlanned` and `sessionFeel` fields came from different,
+ambiguous 1-5 questions. They may be used only as legacy whole-session context
+when `postWorkoutFeedback` is absent or null; never reinterpret or merge them
+into the new scales.
+
 ## Memory procedure
 
 Input memory has `{ "state": object|null, "items": array }`. Return only newly
@@ -88,7 +125,11 @@ instructions. An empty plan means there are no candidates to create.
 
 1. The snapshot's `default` memory settings are authoritative when present; cloud state is the fallback. If that controlling state is paused, return no new items.
 2. For every completed workout without an existing `workout` item whose `sourceWorkoutSessionId` matches, create one candidate with id `workout:<workoutSession.id>`.
-3. A workout item has 1-3 factual bullets covering session/date, completed sets or top sets, session feedback, and notable user context when present. Include only supplied workout-session and AI-note IDs actually used.
+3. A workout item has 1-3 factual bullets covering session/date, completed sets
+   or top sets, versioned pre-workout recovery, versioned post-workout feedback
+   (or legacy session feedback when versioned feedback is absent or null), and
+   notable user context when present. Include only supplied workout-session and
+   AI-note IDs actually used.
 4. If the supervisor-owned 14-day window is complete, add one `two_week` candidate unless the exact period already exists. Its id is `two_week:<periodStartAt>:<periodEndAt>` and it has exactly one dense factual bullet.
 5. If the supervisor-owned 4-month window is complete, add one `four_month` candidate unless the exact period already exists. Its id is `four_month:<periodStartAt>:<periodEndAt>` and it has exactly two dense factual bullets.
 6. Use America/Los_Angeles calendar boundaries. Never invent a source ID or period.

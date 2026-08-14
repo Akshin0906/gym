@@ -63,6 +63,34 @@ export interface SessionExerciseSnapshot {
 
 export type SliderValue = 1 | 2 | 3 | 4 | 5
 
+export type ZeroToTenRating = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10
+
+export type SessionRpe = ZeroToTenRating
+
+export type PerceivedRecoveryScore = ZeroToTenRating
+
+export interface PreWorkoutCheckInV1 {
+  version: 1
+  // Null records an explicit skip without fabricating a neutral score.
+  perceivedRecovery: PerceivedRecoveryScore | null
+  recordedAt: number
+}
+
+export type SessionPainImpact =
+  | 'none'
+  | 'present_no_effect'
+  | 'modified'
+  | 'stopped'
+
+export interface PostWorkoutFeedbackV2 {
+  version: 2
+  // 1 = far below expectations; 5 = far above expectations.
+  performance: SliderValue
+  // Immediate whole-session rating of perceived exertion (Foster CR-10).
+  sessionRpe: SessionRpe
+  painImpact: SessionPainImpact
+}
+
 export interface WorkoutSession {
   id: string
   sessionTemplateId: string | null
@@ -72,8 +100,12 @@ export interface WorkoutSession {
   exerciseSnapshot: SessionExerciseSnapshot[]
   startedAt: number
   completedAt: number | null
+  // Legacy 1-5 questions retained so historical exports keep their meaning.
   sessionPlanned?: SliderValue | null
   sessionFeel?: SliderValue | null
+  // null = a new session awaiting the check-in; undefined = a legacy session.
+  preWorkoutCheckIn?: PreWorkoutCheckInV1 | null
+  postWorkoutFeedback?: PostWorkoutFeedbackV2 | null
   // Exercises collapsed ("done") in the active screen, in completion order.
   // Not indexed, so no Dexie migration; absent on older sessions.
   doneExerciseIds?: string[]

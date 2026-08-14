@@ -357,17 +357,30 @@ describe('cloud snapshot version CAS', () => {
     expect(hasPendingCloudSnapshotSync()).toBe(false)
   })
 
-  it('does not clear a newer pending generation when an older upload finishes', async () => {
+  it('keeps newer feedback durable and converges after an older upload wins', async () => {
     const firstPut = deferred<Response>()
     const secondPut = deferred<Response>()
     const fetchMock = vi.fn<typeof fetch>()
     vi.stubGlobal('fetch', fetchMock)
-    mockedBuildExportPayload.mockResolvedValue(payload(1, 200))
+    const beforeFeedback = payload(1, 200)
+    const withFeedback = payload(2, 200)
+    withFeedback.data.workoutSessions[0].postWorkoutFeedback = {
+      version: 2,
+      performance: 4,
+      sessionRpe: 7,
+      painImpact: 'none',
+    }
+    mockedBuildExportPayload
+      .mockResolvedValueOnce(beforeFeedback)
+      .mockResolvedValueOnce(withFeedback)
+      .mockResolvedValueOnce(withFeedback)
     fetchMock
       .mockResolvedValueOnce(jsonResponse({ snapshot: { updatedAt: 7 } }))
       .mockImplementationOnce(() => firstPut.promise)
       .mockResolvedValueOnce(jsonResponse({ snapshot: { updatedAt: 7 } }))
       .mockImplementationOnce(() => secondPut.promise)
+      .mockResolvedValueOnce(jsonResponse({ snapshot: { updatedAt: 8 } }))
+      .mockResolvedValueOnce(jsonResponse({ snapshot: { updatedAt: 9 } }))
 
     const first = uploadCloudSnapshot('workout_completed')
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
@@ -378,9 +391,20 @@ describe('cloud snapshot version CAS', () => {
     await expect(first).resolves.toEqual({ updatedAt: 8 })
     expect(hasPendingCloudSnapshotSync()).toBe(true)
 
-    secondPut.resolve(jsonResponse({ snapshot: { updatedAt: 9 } }))
+    secondPut.resolve(
+      jsonResponse({ error: 'snapshot_version_changed' }, 409),
+    )
     await expect(second).resolves.toEqual({ updatedAt: 9 })
     expect(hasPendingCloudSnapshotSync()).toBe(false)
+    expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({
+      body: JSON.stringify(beforeFeedback),
+    })
+    expect(fetchMock.mock.calls[3]?.[1]).toMatchObject({
+      body: JSON.stringify(withFeedback),
+    })
+    expect(fetchMock.mock.calls[5]?.[1]).toMatchObject({
+      body: JSON.stringify(withFeedback),
+    })
   })
 
   it('keeps the local pairing active when sign-out is blocked by a reserved action', async () => {

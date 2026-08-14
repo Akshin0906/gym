@@ -6,6 +6,8 @@ import type {
   DailyBriefing,
   Exercise,
   LoggedSet,
+  PostWorkoutFeedbackV2,
+  PreWorkoutCheckInV1,
   ProgramRow,
   SessionExerciseSnapshot,
   SessionTemplate,
@@ -49,6 +51,7 @@ export interface CoachLiveContext {
     name: string
     programName: string | null
     startedAt: number
+    preWorkoutCheckIn: PreWorkoutCheckInV1 | null
     doneExerciseIds: string[]
     exercises: Array<
       CoachContextPlannedExercise & {
@@ -78,6 +81,8 @@ export interface CoachLiveContext {
     completedAt: number | null
     sessionPlanned: number | null
     sessionFeel: number | null
+    preWorkoutCheckIn: PreWorkoutCheckInV1 | null
+    postWorkoutFeedback: PostWorkoutFeedbackV2 | null
     exercises: Array<{
       exerciseId: string
       exerciseName: string
@@ -433,6 +438,7 @@ export async function buildLiveCoachContext(
           name: active.name,
           programName: active.programName,
           startedAt: active.startedAt,
+          preWorkoutCheckIn: active.preWorkoutCheckIn ?? null,
           doneExerciseIds: active.doneExerciseIds ?? [],
           exercises: active.exerciseSnapshot
             .slice()
@@ -498,6 +504,8 @@ export async function buildLiveCoachContext(
         completedAt: session.completedAt,
         sessionPlanned: session.sessionPlanned ?? null,
         sessionFeel: session.sessionFeel ?? null,
+        preWorkoutCheckIn: session.preWorkoutCheckIn ?? null,
+        postWorkoutFeedback: session.postWorkoutFeedback ?? null,
         exercises: Array.from(grouped.entries()).map(([exerciseId, sets]) => ({
           exerciseId,
           exerciseName: exerciseById.get(exerciseId)?.name ?? '(missing exercise)',

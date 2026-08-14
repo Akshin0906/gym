@@ -592,6 +592,7 @@ describe('workout and program creation', () => {
       sessionTemplateId: null,
       programId: null,
       completedAt: null,
+      preWorkoutCheckIn: null,
     })
     expect(session?.exerciseSnapshot).toHaveLength(2)
   })

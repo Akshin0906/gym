@@ -8,12 +8,15 @@ import type {
   WorkoutSession,
 } from '../types'
 import {
+  endSession,
   getAllSetsForExercise,
   logSet,
+  recordPreWorkoutCheckIn,
   SessionTemplateUnavailableError,
   startSession,
   swapExerciseInSession,
   UnfinishedWorkoutError,
+  updatePostWorkoutFeedback,
   updateSet,
 } from './sessions'
 
@@ -57,6 +60,7 @@ afterEach(() => vi.restoreAllMocks())
 describe('startSession', () => {
   it('requires explicit resolution before replacing an unfinished workout', async () => {
     const firstId = await startSession(null, null)
+    expect((await db.workoutSessions.get(firstId))?.preWorkoutCheckIn).toBeNull()
 
     await expect(startSession(null, null)).rejects.toBeInstanceOf(
       UnfinishedWorkoutError,
@@ -71,6 +75,7 @@ describe('startSession', () => {
 
   it('preserves worked sets and ends the old workout at its last set after confirmation', async () => {
     const firstId = await startSession(null, null)
+    await recordPreWorkoutCheckIn(firstId, null)
     await logSet({
       sessionId: firstId,
       exerciseId: 'bench',
@@ -136,7 +141,294 @@ describe('startSession', () => {
   })
 })
 
+describe('recordPreWorkoutCheckIn', () => {
+  it('stores deliberate zero and remains idempotent before work sets', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(150)
+    await db.workoutSessions.add({
+      ...session('active'),
+      preWorkoutCheckIn: null,
+    })
+
+    await expect(recordPreWorkoutCheckIn('active', 0)).resolves.toEqual({
+      version: 1,
+      perceivedRecovery: 0,
+      recordedAt: 150,
+    })
+    await expect(recordPreWorkoutCheckIn('active', 10)).resolves.toEqual({
+      version: 1,
+      perceivedRecovery: 0,
+      recordedAt: 150,
+    })
+    expect(
+      (await db.workoutSessions.get('active'))?.preWorkoutCheckIn,
+    ).toEqual({
+      version: 1,
+      perceivedRecovery: 0,
+      recordedAt: 150,
+    })
+  })
+
+  it('records an explicit skip without fabricating a neutral score', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(175)
+    await db.workoutSessions.add({
+      ...session('skipped'),
+      preWorkoutCheckIn: null,
+    })
+
+    await recordPreWorkoutCheckIn('skipped', null)
+
+    expect(
+      (await db.workoutSessions.get('skipped'))?.preWorkoutCheckIn,
+    ).toEqual({
+      version: 1,
+      perceivedRecovery: null,
+      recordedAt: 175,
+    })
+  })
+
+  it('stores the high recovery boundary', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(180)
+    await db.workoutSessions.add({
+      ...session('high-recovery'),
+      preWorkoutCheckIn: null,
+    })
+
+    await expect(recordPreWorkoutCheckIn('high-recovery', 10)).resolves.toEqual({
+      version: 1,
+      perceivedRecovery: 10,
+      recordedAt: 180,
+    })
+  })
+
+  it.each([-1, 11, 4.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    'rejects an invalid score without mutating the session',
+    async (score) => {
+      await db.workoutSessions.add({
+        ...session('invalid-pre-check-in'),
+        preWorkoutCheckIn: null,
+      })
+
+      await expect(
+        recordPreWorkoutCheckIn('invalid-pre-check-in', score as never),
+      ).rejects.toThrow('Invalid perceived recovery score')
+      expect(
+        (await db.workoutSessions.get('invalid-pre-check-in'))
+          ?.preWorkoutCheckIn,
+      ).toBeNull()
+    },
+  )
+
+  it('requires an existing active session with no logged work sets', async () => {
+    await db.workoutSessions.bulkAdd([
+      { ...session('worked'), preWorkoutCheckIn: null },
+      {
+        ...session('completed-pre-check-in'),
+        completedAt: 200,
+        preWorkoutCheckIn: null,
+      },
+      session('legacy-pre-check-in'),
+    ])
+    await db.loggedSets.add({
+      id: 'worked-set-before-check-in',
+      workoutSessionId: 'worked',
+      exerciseId: 'bench',
+      setNumber: 1,
+      weightLbs: 100,
+      reps: 8,
+      rpe: null,
+      loggedAt: 150,
+    })
+
+    await expect(recordPreWorkoutCheckIn('missing', 5)).rejects.toThrow(
+      'Session not found',
+    )
+    await expect(
+      recordPreWorkoutCheckIn('completed-pre-check-in', 5),
+    ).rejects.toThrow('requires an active session')
+    await expect(recordPreWorkoutCheckIn('worked', 5)).rejects.toThrow(
+      'must precede logged work sets',
+    )
+    await expect(
+      recordPreWorkoutCheckIn('legacy-pre-check-in', 5),
+    ).rejects.toThrow('unavailable for this session')
+  })
+
+  it('prevents completion while pending and preserves check-in chronology', async () => {
+    await db.workoutSessions.bulkAdd([
+      { ...session('pending'), preWorkoutCheckIn: null },
+      {
+        ...session('answered'),
+        preWorkoutCheckIn: {
+          version: 1,
+          perceivedRecovery: 10,
+          recordedAt: 200,
+        },
+      },
+    ])
+
+    await expect(
+      logSet({
+        sessionId: 'pending',
+        exerciseId: 'bench',
+        weightLbs: 100,
+        reps: 8,
+        rpe: null,
+      }),
+    ).rejects.toThrow('Complete or skip the pre-workout check-in first')
+    await expect(endSession('pending')).rejects.toThrow(
+      'Complete or skip the pre-workout check-in first',
+    )
+
+    vi.spyOn(Date, 'now').mockReturnValue(150)
+    await endSession('answered')
+    expect((await db.workoutSessions.get('answered'))?.completedAt).toBe(200)
+  })
+
+  it('lets a stale-release session with existing work continue and finish', async () => {
+    await db.workoutSessions.add({
+      ...session('stale-release-active'),
+      preWorkoutCheckIn: null,
+    })
+    await db.loggedSets.add({
+      id: 'stale-release-existing-set',
+      workoutSessionId: 'stale-release-active',
+      exerciseId: 'bench',
+      setNumber: 1,
+      weightLbs: 100,
+      reps: 8,
+      rpe: null,
+      loggedAt: 150,
+    })
+
+    await expect(
+      logSet({
+        sessionId: 'stale-release-active',
+        exerciseId: 'bench',
+        weightLbs: 105,
+        reps: 8,
+        rpe: null,
+      }),
+    ).resolves.toMatchObject({ setNumber: 2 })
+    await expect(endSession('stale-release-active')).resolves.toBeUndefined()
+    expect(
+      (await db.workoutSessions.get('stale-release-active'))?.completedAt,
+    ).not.toBeNull()
+  })
+})
+
+describe('updatePostWorkoutFeedback', () => {
+  it('stores deliberate boundary ratings without changing legacy feedback', async () => {
+    await db.workoutSessions.add({
+      ...session('completed'),
+      completedAt: 200,
+      sessionPlanned: 4,
+      sessionFeel: 5,
+    })
+
+    await updatePostWorkoutFeedback('completed', {
+      version: 2,
+      performance: 1,
+      sessionRpe: 0,
+      painImpact: 'none',
+    })
+
+    expect(await db.workoutSessions.get('completed')).toMatchObject({
+      completedAt: 200,
+      sessionPlanned: 4,
+      sessionFeel: 5,
+      postWorkoutFeedback: {
+        version: 2,
+        performance: 1,
+        sessionRpe: 0,
+        painImpact: 'none',
+      },
+    })
+
+    await updatePostWorkoutFeedback('completed', {
+      version: 2,
+      performance: 5,
+      sessionRpe: 10,
+      painImpact: 'stopped',
+    })
+    expect(
+      (await db.workoutSessions.get('completed'))?.postWorkoutFeedback,
+    ).toEqual({
+      version: 2,
+      performance: 5,
+      sessionRpe: 10,
+      painImpact: 'stopped',
+    })
+  })
+
+  it.each([
+    { version: 1, performance: 3, sessionRpe: 5, painImpact: 'none' },
+    { version: 2, performance: 0, sessionRpe: 5, painImpact: 'none' },
+    { version: 2, performance: 6, sessionRpe: 5, painImpact: 'none' },
+    { version: 2, performance: 3, sessionRpe: -1, painImpact: 'none' },
+    { version: 2, performance: 3, sessionRpe: 11, painImpact: 'none' },
+    { version: 2, performance: 3, sessionRpe: 5.5, painImpact: 'none' },
+    { version: 2, performance: 3, sessionRpe: 5, painImpact: 'injury' },
+    { version: 2, performance: 3, sessionRpe: 5, painImpact: ['none'] },
+    { version: 2, performance: 3, sessionRpe: 5, painImpact: { toString: 'none' } },
+    {
+      version: 2,
+      performance: 3,
+      sessionRpe: 5,
+      painImpact: 'none',
+      futureField: true,
+    },
+  ])('rejects malformed feedback without mutating the session', async (feedback) => {
+    await db.workoutSessions.add({ ...session('invalid'), completedAt: 200 })
+
+    await expect(
+      updatePostWorkoutFeedback('invalid', feedback as never),
+    ).rejects.toThrow('Invalid post-workout feedback')
+    expect(
+      (await db.workoutSessions.get('invalid'))?.postWorkoutFeedback,
+    ).toBeUndefined()
+  })
+
+  it('requires an existing completed workout', async () => {
+    const feedback = {
+      version: 2 as const,
+      performance: 3 as const,
+      sessionRpe: 5 as const,
+      painImpact: 'none' as const,
+    }
+    await db.workoutSessions.add(session('active'))
+
+    await expect(updatePostWorkoutFeedback('missing', feedback)).rejects.toThrow(
+      'Session not found',
+    )
+    await expect(updatePostWorkoutFeedback('active', feedback)).rejects.toThrow(
+      'requires a completed session',
+    )
+  })
+})
+
 describe('logSet chronology', () => {
+  it('never logs active work before a check-in after the device clock moves back', async () => {
+    await db.workoutSessions.add({
+      ...session('clock-shifted'),
+      preWorkoutCheckIn: {
+        version: 1,
+        perceivedRecovery: 7,
+        recordedAt: 150,
+      },
+    })
+    vi.spyOn(Date, 'now').mockReturnValue(125)
+
+    const result = await logSet({
+      sessionId: 'clock-shifted',
+      exerciseId: 'bench',
+      weightLbs: 135,
+      reps: 10,
+      rpe: 8,
+    })
+
+    expect((await db.loggedSets.get(result.id))?.loggedAt).toBe(150)
+  })
+
   it('uses a completed session timestamp for a historical correction', async () => {
     await db.workoutSessions.add({
       ...session('historical'),
@@ -186,6 +478,33 @@ describe('logSet chronology', () => {
     nowSpy.mockRestore()
 
     expect((await db.loggedSets.get(result.id))?.loggedAt).toBe(lastLoggedAt)
+  })
+
+  it('never backdates old unfinished-session work before its check-in', async () => {
+    const now = new Date(2026, 5, 21, 12).getTime()
+    const startedAt = new Date(2026, 5, 20, 18).getTime()
+    const recordedAt = new Date(2026, 5, 20, 18, 15).getTime()
+    await db.workoutSessions.add({
+      ...session('checked-in-abandoned'),
+      startedAt,
+      completedAt: null,
+      preWorkoutCheckIn: {
+        version: 1,
+        perceivedRecovery: 6,
+        recordedAt,
+      },
+    })
+    vi.spyOn(Date, 'now').mockReturnValue(now)
+
+    const result = await logSet({
+      sessionId: 'checked-in-abandoned',
+      exerciseId: 'bench',
+      weightLbs: 105,
+      reps: 8,
+      rpe: null,
+    })
+
+    expect((await db.loggedSets.get(result.id))?.loggedAt).toBe(recordedAt)
   })
 })
 

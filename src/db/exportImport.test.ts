@@ -190,6 +190,163 @@ describe('export/import round-trip', () => {
     ).toEqual([0, 2])
   })
 
+  it('round-trips versioned post-workout feedback without changing legacy fields', async () => {
+    await db.workoutSessions.add({
+      id: 'session-feedback',
+      sessionTemplateId: null,
+      programId: null,
+      name: 'Feedback workout',
+      programName: null,
+      exerciseSnapshot: [],
+      startedAt: 1,
+      completedAt: 2,
+      sessionPlanned: 4,
+      sessionFeel: 2,
+      postWorkoutFeedback: {
+        version: 2,
+        performance: 5,
+        sessionRpe: 0,
+        painImpact: 'present_no_effect',
+      },
+    })
+
+    const exported = await buildExportPayload()
+    await importPayload(JSON.stringify(exported))
+
+    expect(await db.workoutSessions.get('session-feedback')).toMatchObject({
+      sessionPlanned: 4,
+      sessionFeel: 2,
+      postWorkoutFeedback: {
+        version: 2,
+        performance: 5,
+        sessionRpe: 0,
+        painImpact: 'present_no_effect',
+      },
+    })
+  })
+
+  it('round-trips answered and deliberately skipped pre-workout check-ins', async () => {
+    await db.workoutSessions.bulkAdd([
+      {
+        id: 'session-ready',
+        sessionTemplateId: null,
+        programId: null,
+        name: 'Ready workout',
+        programName: null,
+        exerciseSnapshot: [],
+        startedAt: 10,
+        completedAt: 30,
+        preWorkoutCheckIn: {
+          version: 1,
+          perceivedRecovery: 0,
+          recordedAt: 20,
+        },
+      },
+      {
+        id: 'session-skipped-readiness',
+        sessionTemplateId: null,
+        programId: null,
+        name: 'Skipped readiness workout',
+        programName: null,
+        exerciseSnapshot: [],
+        startedAt: 40,
+        completedAt: 60,
+        preWorkoutCheckIn: {
+          version: 1,
+          perceivedRecovery: null,
+          recordedAt: 50,
+        },
+      },
+    ])
+
+    const exported = await buildExportPayload()
+    await importPayload(JSON.stringify(exported))
+
+    expect(
+      (await db.workoutSessions.get('session-ready'))?.preWorkoutCheckIn,
+    ).toEqual({
+      version: 1,
+      perceivedRecovery: 0,
+      recordedAt: 20,
+    })
+    expect(
+      (await db.workoutSessions.get('session-skipped-readiness'))
+        ?.preWorkoutCheckIn,
+    ).toEqual({
+      version: 1,
+      perceivedRecovery: null,
+      recordedAt: 50,
+    })
+  })
+
+  it('refuses to export malformed pre-workout check-ins', async () => {
+    await db.workoutSessions.add({
+      id: 'session-invalid-readiness',
+      sessionTemplateId: null,
+      programId: null,
+      name: 'Invalid readiness workout',
+      programName: null,
+      exerciseSnapshot: [],
+      startedAt: 10,
+      completedAt: 30,
+      preWorkoutCheckIn: {
+        version: 1,
+        perceivedRecovery: 11,
+        recordedAt: 20,
+      } as never,
+    })
+
+    await expect(buildExportPayload()).rejects.toThrow(
+      'preWorkoutCheckIn perceivedRecovery must be null or a whole number from 0 to 10',
+    )
+  })
+
+  it('refuses to export malformed post-workout feedback', async () => {
+    await db.workoutSessions.add({
+      id: 'session-invalid-feedback',
+      sessionTemplateId: null,
+      programId: null,
+      name: 'Invalid feedback workout',
+      programName: null,
+      exerciseSnapshot: [],
+      startedAt: 1,
+      completedAt: 2,
+      postWorkoutFeedback: {
+        version: 2,
+        performance: 3,
+        sessionRpe: 11,
+        painImpact: 'none',
+      } as never,
+    })
+
+    await expect(buildExportPayload()).rejects.toThrow(
+      'postWorkoutFeedback sessionRpe must be a whole number from 0 to 10',
+    )
+  })
+
+  it('refuses to export post-workout feedback on an unfinished session', async () => {
+    await db.workoutSessions.add({
+      id: 'unfinished-session-feedback',
+      sessionTemplateId: null,
+      programId: null,
+      name: 'Unfinished feedback workout',
+      programName: null,
+      exerciseSnapshot: [],
+      startedAt: 1,
+      completedAt: null,
+      postWorkoutFeedback: {
+        version: 2,
+        performance: 3,
+        sessionRpe: 5,
+        painImpact: 'none',
+      },
+    })
+
+    await expect(buildExportPayload()).rejects.toThrow(
+      'postWorkoutFeedback requires a completed session',
+    )
+  })
+
   it('rejects duplicate exercise order values within a workout snapshot', async () => {
     await db.exercises.bulkAdd([exercise('ex-a'), exercise('ex-b')])
     await db.workoutSessions.add({

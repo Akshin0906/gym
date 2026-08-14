@@ -1815,6 +1815,10 @@ class OutputValidationTests(unittest.TestCase):
         instructions = config.prompt_file.read_text(encoding="utf-8")
         self.assertIn("exercise performance must match a movement in today's session", instructions)
         self.assertIn("Use one reason when that is all the relevant evidence", instructions)
+        self.assertIn("`preWorkoutCheckIn.version: 1`", instructions)
+        self.assertIn("0-10 Perceived Recovery Status", instructions)
+        self.assertIn("same user's history", instructions)
+        self.assertIn("do not infer a neutral score", instructions)
 
     def test_prompt_redacts_stale_recovery_measurements(self) -> None:
         stale = {

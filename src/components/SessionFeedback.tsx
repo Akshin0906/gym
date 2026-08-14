@@ -1,108 +1,255 @@
 import { useState } from 'react'
 import { CheckCircle2 } from 'lucide-react'
-import type { SliderValue } from '../db/types'
+import type {
+  PostWorkoutFeedbackV2,
+  SessionPainImpact,
+  SessionRpe,
+  SliderValue,
+} from '../db/types'
+import { ErrorAlert } from './Feedback'
 
-const Q1_LABELS = [
-  'Cut it short',
-  'Much harder than expected',
-  'As planned',
-  'Easier than expected',
-  'Better than expected',
-] as const
+const PERFORMANCE_OPTIONS: ReadonlyArray<{
+  value: SliderValue
+  label: string
+}> = [
+  { value: 1, label: 'Far below' },
+  { value: 2, label: 'Below' },
+  { value: 3, label: 'As expected' },
+  { value: 4, label: 'Above' },
+  { value: 5, label: 'Far above' },
+]
 
-const Q2_LABELS = ['Awful', 'Off', 'Neutral', 'Good', 'Great'] as const
+const SESSION_RPE_OPTIONS: ReadonlyArray<{
+  value: SessionRpe
+  label?: string
+}> = [
+  { value: 0, label: 'Rest' },
+  { value: 1, label: 'Very, very easy' },
+  { value: 2, label: 'Easy' },
+  { value: 3, label: 'Moderate' },
+  { value: 4, label: 'Somewhat hard' },
+  { value: 5, label: 'Hard' },
+  { value: 6 },
+  { value: 7, label: 'Very hard' },
+  { value: 8 },
+  { value: 9, label: 'Near maximal' },
+  { value: 10, label: 'Maximal' },
+]
+
+const PAIN_OPTIONS: ReadonlyArray<{
+  value: SessionPainImpact
+  label: string
+}> = [
+  { value: 'none', label: 'No — completed normally' },
+  { value: 'present_no_effect', label: 'Yes — completed normally' },
+  { value: 'modified', label: 'Yes — reduced or modified it' },
+  { value: 'stopped', label: 'Yes — stopped an exercise or workout' },
+]
 
 interface Props {
   sessionName: string
-  onSave: (answers: { planned: SliderValue; feel: SliderValue }) => void
+  onSave: (answers: PostWorkoutFeedbackV2) => Promise<void>
   onSkip: () => void
 }
 
 export function SessionFeedback({ sessionName, onSave, onSkip }: Props) {
-  const [planned, setPlanned] = useState<SliderValue>(3)
-  const [feel, setFeel] = useState<SliderValue>(3)
+  const [performance, setPerformance] = useState<SliderValue | null>(null)
+  const [sessionRpe, setSessionRpe] = useState<SessionRpe | null>(null)
+  const [painImpact, setPainImpact] = useState<SessionPainImpact | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
 
-  function handleSave() {
-    onSave({ planned, feel })
+  const complete =
+    performance !== null && sessionRpe !== null && painImpact !== null
+
+  async function handleSave() {
+    if (!complete || saving) return
+    setSaving(true)
+    setError(null)
+    try {
+      await onSave({ version: 2, performance, sessionRpe, painImpact })
+    } catch {
+      setError(
+        'Your workout is saved, but the check-in was not. Try again or skip it.',
+      )
+      setSaving(false)
+    }
   }
 
+  const selectedRpe = SESSION_RPE_OPTIONS.find(
+    (option) => option.value === sessionRpe,
+  )
+
   return (
-    <div className="px-4 py-6 space-y-6 max-w-md mx-auto">
+    <div className="px-4 py-6 space-y-5 max-w-md mx-auto">
       <header className="space-y-1">
         <p className="text-[11px] font-bold uppercase tracking-widest text-[var(--color-fg-faint)]">
-          Session check-in
+          Post-workout check-in
         </p>
         <h2 className="text-2xl font-bold leading-tight">{sessionName}</h2>
         <p className="text-sm text-[var(--color-fg-faint)]">
-          Optional — skip any time.
+          Three quick ratings help Coach compare performance, effort, and
+          recovery needs. Answer all three or skip.
         </p>
       </header>
 
-      <FeedbackQuestion
-        question="Did the session go as planned?"
-        value={planned}
-        labels={Q1_LABELS}
-        onChange={setPlanned}
-      />
+      <fieldset className="card p-4 space-y-3">
+        <legend className="text-sm font-semibold px-1">
+          Compared with what you expected today, how did you perform?
+        </legend>
+        <div className="grid grid-cols-5 gap-1.5">
+          {PERFORMANCE_OPTIONS.map((option) => (
+            <RadioChoice
+              key={option.value}
+              name="session-performance"
+              value={String(option.value)}
+              checked={performance === option.value}
+              disabled={saving}
+              onChange={() => {
+                setPerformance(option.value)
+                setError(null)
+              }}
+              ariaLabel={`${option.value} of 5 — ${option.label}`}
+              className="min-h-14 px-1 text-[11px] leading-tight"
+            >
+              {option.label}
+            </RadioChoice>
+          ))}
+        </div>
+      </fieldset>
 
-      <FeedbackQuestion
-        question="How did that feel?"
-        value={feel}
-        labels={Q2_LABELS}
-        onChange={setFeel}
-      />
+      <fieldset className="card p-4 space-y-3">
+        <legend className="text-sm font-semibold px-1">
+          How hard was this workout overall?
+        </legend>
+        <p className="text-xs text-[var(--color-fg-faint)]">
+          Rate the whole session, not just the final set.
+        </p>
+        <div className="grid grid-cols-6 gap-1.5">
+          {SESSION_RPE_OPTIONS.map((option) => (
+            <RadioChoice
+              key={option.value}
+              name="session-rpe"
+              value={String(option.value)}
+              checked={sessionRpe === option.value}
+              disabled={saving}
+              onChange={() => {
+                setSessionRpe(option.value)
+                setError(null)
+              }}
+              ariaLabel={`${option.value} of 10${
+                option.label ? ` — ${option.label}` : ''
+              }`}
+              className="min-h-11 px-1 text-sm nums"
+            >
+              {option.value}
+            </RadioChoice>
+          ))}
+        </div>
+        <p
+          aria-live="polite"
+          className="min-h-5 text-center text-sm font-medium text-[var(--color-fg)]"
+        >
+          {selectedRpe
+            ? `${selectedRpe.value} / 10${
+                selectedRpe.label ? ` · ${selectedRpe.label}` : ''
+              }`
+            : 'Choose 0–10'}
+        </p>
+        <p className="text-[11px] leading-relaxed text-center text-[var(--color-fg-faint)]">
+          0 Rest · 3 Moderate · 5 Hard · 7 Very hard · 10 Maximal
+        </p>
+      </fieldset>
 
-      <div className="space-y-3 pt-2">
+      <fieldset className="card p-4 space-y-3">
+        <legend className="text-sm font-semibold px-1">
+          Did you have pain or another physical problem during this workout?
+        </legend>
+        <p className="text-xs text-[var(--color-fg-faint)]">
+          Don’t count normal effort or muscle burn.
+        </p>
+        <div className="grid grid-cols-2 gap-2">
+          {PAIN_OPTIONS.map((option) => (
+            <RadioChoice
+              key={option.value}
+              name="pain-impact"
+              value={option.value}
+              checked={painImpact === option.value}
+              disabled={saving}
+              onChange={() => {
+                setPainImpact(option.value)
+                setError(null)
+              }}
+              ariaLabel={option.label}
+              className="min-h-14 px-2 text-xs leading-snug"
+            >
+              {option.label}
+            </RadioChoice>
+          ))}
+        </div>
+      </fieldset>
+
+      {error && <ErrorAlert message={error} />}
+
+      <div className="space-y-3 pt-1">
         <button
           type="button"
-          onClick={handleSave}
+          onClick={() => void handleSave()}
+          disabled={!complete || saving}
           className="btn-primary w-full"
         >
           <CheckCircle2 size={18} />
-          Save
+          {saving ? 'Saving…' : 'Save check-in'}
         </button>
         <button
           type="button"
           onClick={onSkip}
+          disabled={saving}
           className="btn-ghost w-full justify-center text-sm"
         >
-          Skip
+          Skip check-in
         </button>
       </div>
     </div>
   )
 }
 
-interface FeedbackQuestionProps {
-  question: string
-  value: SliderValue
-  labels: readonly string[]
-  onChange: (v: SliderValue) => void
-}
-
-function FeedbackQuestion({
-  question,
+function RadioChoice({
+  name,
   value,
-  labels,
+  checked,
+  disabled,
   onChange,
-}: FeedbackQuestionProps) {
+  ariaLabel,
+  className,
+  children,
+}: {
+  name: string
+  value: string
+  checked: boolean
+  disabled: boolean
+  onChange: () => void
+  ariaLabel: string
+  className: string
+  children: string | number
+}) {
   return (
-    <fieldset className="card p-4 space-y-3">
-      <legend className="text-sm font-medium px-1">{question}</legend>
+    <label className="min-w-0 cursor-pointer">
       <input
-        type="range"
-        min="1"
-        max="5"
-        step="1"
+        type="radio"
+        name={name}
         value={value}
-        onChange={(e) => onChange(Number(e.target.value) as SliderValue)}
-        aria-label={question}
-        aria-valuetext={labels[value - 1]}
-        className="w-full accent-[var(--color-accent)] cursor-pointer touch-pan-x"
+        checked={checked}
+        disabled={disabled}
+        onChange={onChange}
+        aria-label={ariaLabel}
+        className="peer sr-only"
       />
-      <div className="text-center text-sm text-[var(--color-fg)] font-medium">
-        {labels[value - 1]}
-      </div>
-    </fieldset>
+      <span
+        className={`flex h-full items-center justify-center rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-2)] text-center text-[var(--color-fg-dim)] transition-colors peer-checked:border-[var(--color-accent)] peer-checked:bg-[var(--color-accent-soft)] peer-checked:text-[var(--color-fg)] peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-[var(--color-accent)] peer-disabled:cursor-wait peer-disabled:opacity-60 ${className}`}
+      >
+        {children}
+      </span>
+    </label>
   )
 }

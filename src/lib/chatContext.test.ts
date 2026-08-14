@@ -62,6 +62,87 @@ describe('buildLiveCoachContext', () => {
     )
   })
 
+  it('exposes versioned feedback without invalidating Coach action scopes', async () => {
+    await db.workoutSessions.update('session', { completedAt: 2 })
+    const before = await buildLiveCoachContext()
+
+    await db.workoutSessions.update('session', {
+      postWorkoutFeedback: {
+        version: 2,
+        performance: 1,
+        sessionRpe: 0,
+        painImpact: 'modified',
+      },
+    })
+    const after = await buildLiveCoachContext()
+
+    expect(after.context.recentWorkouts[0]).toMatchObject({
+      id: 'session',
+      sessionPlanned: null,
+      sessionFeel: null,
+      postWorkoutFeedback: {
+        version: 2,
+        performance: 1,
+        sessionRpe: 0,
+        painImpact: 'modified',
+      },
+    })
+    expect(after.context.actionStateHashes).toEqual(
+      before.context.actionStateHashes,
+    )
+    expect(after.stateHash).toBe(before.stateHash)
+  })
+
+  it('exposes pre-workout recovery, including zero and deliberate skip', async () => {
+    const before = await buildLiveCoachContext('session')
+    await db.workoutSessions.update('session', {
+      preWorkoutCheckIn: {
+        version: 1,
+        perceivedRecovery: 0,
+        recordedAt: 1,
+      },
+    })
+    const active = await buildLiveCoachContext('session')
+
+    expect(active.context.activeWorkout?.preWorkoutCheckIn).toEqual({
+      version: 1,
+      perceivedRecovery: 0,
+      recordedAt: 1,
+    })
+    expect(active.context.actionStateHashes).toEqual(
+      before.context.actionStateHashes,
+    )
+    expect(active.stateHash).not.toBe(before.stateHash)
+
+    await db.workoutSessions.update('session', { completedAt: 2 })
+    await db.workoutSessions.add({
+      id: 'skipped-session',
+      sessionTemplateId: null,
+      programId: null,
+      name: 'Skipped check-in workout',
+      programName: null,
+      exerciseSnapshot: [],
+      startedAt: 3,
+      completedAt: 4,
+      preWorkoutCheckIn: {
+        version: 1,
+        perceivedRecovery: null,
+        recordedAt: 3,
+      },
+    })
+    const recent = await buildLiveCoachContext()
+
+    expect(
+      recent.context.recentWorkouts.find((row) => row.id === 'session')
+        ?.preWorkoutCheckIn,
+    ).toEqual({ version: 1, perceivedRecovery: 0, recordedAt: 1 })
+    expect(
+      recent.context.recentWorkouts.find(
+        (row) => row.id === 'skipped-session',
+      )?.preWorkoutCheckIn,
+    ).toEqual({ version: 1, perceivedRecovery: null, recordedAt: 3 })
+  })
+
   it('hashes active logged counts and done flags but ignores unrelated sets', async () => {
     await db.workoutSessions.add({
       id: 'other-session',
