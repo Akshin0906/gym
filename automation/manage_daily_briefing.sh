@@ -484,20 +484,82 @@ PY
   fi
 }
 
+# Modules of the supervisor package. Listed explicitly rather than globbed so a
+# file added to the source tree but never reviewed cannot be staged, and so a
+# file deleted upstream fails the release loudly instead of leaving a stale copy
+# behind in the immutable release directory.
+BRIEFING_MODULES=(
+  __init__.py
+  errors.py
+  constants.py
+  primitives.py
+  models.py
+  textutil.py
+  measurement.py
+  recovery.py
+  cloudclient.py
+  evidence.py
+  memory.py
+  validation.py
+  publishing.py
+)
+
+# Executed inside the staged release directory with a clean environment. It
+# proves the staged tree is self-contained: a module forgotten above fails here
+# rather than at 05:00 tomorrow, and the aligned one-rep-max behaviour is
+# checked against the release copy, not the working tree.
+RELEASE_IMPORT_CHECK='
+import daily_briefing_runner as runner
+assert runner.RUNNER_VERSION, "runner reported no version"
+assert runner.estimated_one_rep_max(100, 1) == 100, "single-rep estimate drifted"
+assert runner.top_estimated_one_rep_max([{"weightLbs": 100, "reps": 5}]) == 116.67
+assert callable(runner.publish_spool)
+assert callable(runner.validate_model_output)
+assert callable(runner.validate_spool)
+assert callable(runner.build_model_input_bundle)
+print(runner.RUNNER_VERSION)
+'
+
 stage_release() {
   local target="$1"
-  mkdir -p "$target"
+  mkdir -p "$target" "$target/briefing" "$target/shared_fixtures"
   install -m 700 "$SCRIPT_DIR/run_codex_daily_briefing.sh" "$target/"
   install -m 600 "$SCRIPT_DIR/daily_briefing_runner.py" "$target/"
   install -m 600 "$SCRIPT_DIR/codex_daily_briefing_prompt.md" "$target/"
   install -m 600 "$SCRIPT_DIR/codex_daily_briefing_output_schema.json" "$target/"
+  install -m 600 "$SCRIPT_DIR/shared_fixtures/calculations.json" "$target/shared_fixtures/"
+  local module
+  for module in "${BRIEFING_MODULES[@]}"; do
+    if [[ ! -f "$SCRIPT_DIR/briefing/$module" ]]; then
+      echo "Missing supervisor module: briefing/$module" >&2
+      return 1
+    fi
+    install -m 600 "$SCRIPT_DIR/briefing/$module" "$target/briefing/"
+  done
   run_tracked /bin/bash -n "$target/run_codex_daily_briefing.sh"
   run_tracked "$PYTHON" -m py_compile "$target/daily_briefing_runner.py"
+  for module in "${BRIEFING_MODULES[@]}"; do
+    run_tracked "$PYTHON" -m py_compile "$target/briefing/$module"
+  done
   run_tracked "$PYTHON" -m json.tool "$target/codex_daily_briefing_output_schema.json" >/dev/null
+  run_tracked "$PYTHON" -m json.tool "$target/shared_fixtures/calculations.json" >/dev/null
   if ! /usr/bin/grep -q 'WORKOUT_CODEX_HOME' "$target/daily_briefing_runner.py"; then
     echo "Daily runner does not implement the required WORKOUT_CODEX_HOME contract." >&2
     return 1
   fi
+  local staged_version
+  if ! staged_version="$(cd "$target" && run_tracked env -i PATH=/usr/bin:/bin HOME="$target" "$PYTHON" -c "$RELEASE_IMPORT_CHECK")"; then
+    echo "Staged daily runner failed its self-contained import check." >&2
+    return 1
+  fi
+  if [[ -z "$staged_version" ]]; then
+    echo "Staged daily runner did not report a version." >&2
+    return 1
+  fi
+  echo "Staged daily runner version $staged_version"
+  # Byte-compiled caches would make the release directory mutable after the
+  # switch, so remove them and keep the immutable-release guarantee.
+  /bin/rm -rf "$target/__pycache__" "$target/briefing/__pycache__"
 }
 
 snapshot_live_state() {

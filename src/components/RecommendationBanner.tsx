@@ -1,7 +1,24 @@
-import { type ReactNode, useCallback, useEffect, useState } from 'react'
-import { AlertTriangle, ChevronDown, Moon, TrendingUp } from 'lucide-react'
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from 'react'
+import {
+  AlertTriangle,
+  ChevronDown,
+  CloudUpload,
+  Moon,
+  RefreshCw,
+  TrendingUp,
+} from 'lucide-react'
 import { db } from '../db/schema'
 import { getLatestDailyBriefing } from '../db/repositories/dailyBriefings'
+import {
+  hasPendingLocalChanges,
+  subscribeLocalSyncState,
+} from '../db/repositories/syncState'
 import type {
   DailyBriefing,
   DailyBriefingSections,
@@ -9,9 +26,16 @@ import type {
 } from '../db/types'
 import {
   fetchLatestCloudBriefing,
-  isBriefingStale,
+  isCloudConfigured,
   pacificDate,
+  subscribeCloudSyncStatus,
+  syncPendingLocalChanges,
 } from '../lib/cloud'
+import {
+  evaluateBriefingFreshness,
+  displayShortDate,
+  type BriefingFreshness,
+} from '../lib/briefingFreshness'
 
 // Pinned mode colors — push and deload sit at opposite ends of the warmth
 // axis so they don't read as the same color in a glanceable dot.
@@ -60,42 +84,83 @@ function renderInline(text: string): ReactNode[] {
 interface State {
   briefing: DailyBriefing | null
   hasWorkouts: boolean
+  freshness: BriefingFreshness | null
 }
 
 export function RecommendationBanner() {
   const [state, setState] = useState<State | null>(null)
   const [expanded, setExpanded] = useState(false)
+  const loadGeneration = useRef(0)
+  const mounted = useRef(false)
 
   const load = useCallback(async () => {
-    const [briefing, hasWorkouts] = await Promise.all([
+    const generation = ++loadGeneration.current
+    const [briefing, completed, pendingLocal] = await Promise.all([
       getLatestDailyBriefing(),
+      // The newest completed workout is the trustworthy local counterpart to
+      // the briefing's own snapshot metadata.
       db.workoutSessions
         .filter((s) => s.completedAt !== null)
-        .count()
-        .then((n) => n > 0),
+        .toArray()
+        .then((rows) =>
+          rows.reduce<number | null>(
+            (latest, row) =>
+              row.completedAt !== null && (latest === null || row.completedAt > latest)
+                ? row.completedAt
+                : latest,
+            null,
+          ),
+        ),
+      hasPendingLocalChanges(),
     ])
-    setState({ briefing: briefing ?? null, hasWorkouts })
+    if (!mounted.current || generation !== loadGeneration.current) return
+    setState({
+      briefing: briefing ?? null,
+      hasWorkouts: completed !== null,
+      freshness: briefing
+        ? evaluateBriefingFreshness({
+            briefing,
+            localLatestCompletedAt: completed,
+            hasPendingLocalChanges: pendingLocal,
+          })
+        : null,
+    })
   }, [])
 
   useEffect(() => {
+    mounted.current = true
+    let cancelled = false
+
     void load()
     void fetchLatestCloudBriefing()
-      .then((briefing) => {
-        if (briefing) {
-          setState((prev) => ({
-            briefing,
-            hasWorkouts: prev?.hasWorkouts ?? true,
-          }))
-        }
-      })
       .catch(() => {
         // Cached briefing remains visible when cloud fetch fails.
       })
+      .finally(() => {
+        // Re-read IndexedDB after the download. This also makes the newest
+        // generation win if the initial cache read finishes out of order.
+        if (!cancelled) void load()
+      })
+
+    // The global foreground refresh may repair the cached auth flag and write
+    // the briefing after this component's first fetch has already returned.
+    // Its status event is emitted only after the IndexedDB upsert completes.
+    const unsubscribeStatus = subscribeCloudSyncStatus(() => void load())
+    // A local edit changes the training-freshness verdict even when the
+    // briefing itself has not changed.
+    const unsubscribeLocal = subscribeLocalSyncState(() => void load())
     const onVis = () => {
       if (document.visibilityState === 'visible') void load()
     }
     document.addEventListener('visibilitychange', onVis)
-    return () => document.removeEventListener('visibilitychange', onVis)
+    return () => {
+      cancelled = true
+      mounted.current = false
+      loadGeneration.current += 1
+      unsubscribeStatus()
+      unsubscribeLocal()
+      document.removeEventListener('visibilitychange', onVis)
+    }
   }, [load])
 
   if (state === null) return null
@@ -103,10 +168,9 @@ export function RecommendationBanner() {
   if (!state.briefing) return null
 
   const latest = state.briefing
-  const briefingStale = isBriefingStale(latest.briefingDate)
+  const freshness = state.freshness
   const dotColor = MODE_COLOR[latest.mode]
   const dateLabel = briefingDateLabel(latest)
-  const recoveryLabel = recoveryStatusLabel(latest.sections.recoveryStatus)
 
   return (
     <div className="card overflow-hidden">
@@ -132,14 +196,9 @@ export function RecommendationBanner() {
               />
               {MODE_LABEL[latest.mode]}
             </span>
-            {recoveryLabel && (
+            {freshness?.recovery.label && (
               <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--color-fg-faint)]">
-                {recoveryLabel}
-              </span>
-            )}
-            {briefingStale && (
-              <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--color-fg-faint)] nums">
-                Briefing {displayDate(latest.briefingDate)}
+                {freshness.recovery.label}
               </span>
             )}
           </span>
@@ -152,6 +211,7 @@ export function RecommendationBanner() {
           className={`text-[var(--color-fg-faint)] transition-transform shrink-0 ${expanded ? 'rotate-180' : ''}`}
         />
       </button>
+      {freshness && <FreshnessRow freshness={freshness} />}
       {expanded && (
         <BriefingSections
           sections={latest.sections}
@@ -162,26 +222,125 @@ export function RecommendationBanner() {
   )
 }
 
-export function recoveryStatusLabel(
-  status: DailyBriefingSections['recoveryStatus'],
-): string | null {
-  if (status === 'stale') return 'Oura stale'
-  if (status === 'unavailable') return 'No Oura'
-  return null
+const TRAINING_TONE: Record<
+  BriefingFreshness['training']['level'],
+  { fg: string; border: string; background: string }
+> = {
+  current: {
+    fg: 'var(--color-fg-faint)',
+    border: 'var(--color-border)',
+    background: 'transparent',
+  },
+  behind: {
+    fg: 'oklch(0.80 0.14 60)',
+    border: 'oklch(0.55 0.15 60 / 0.45)',
+    background: 'oklch(0.25 0.08 60 / 0.35)',
+  },
+  unknown: {
+    fg: 'var(--color-fg-dim)',
+    border: 'var(--color-border)',
+    background: 'transparent',
+  },
 }
 
-function displayDate(value: string): string {
-  const parsed = new Date(`${value}T12:00:00Z`)
-  if (Number.isNaN(parsed.getTime())) return value
-  return new Intl.DateTimeFormat('en-US', {
-    month: 'short',
-    day: 'numeric',
-    timeZone: 'UTC',
-  }).format(parsed)
+// Always visible, above the fold: when the briefing is for, when it was
+// generated, and how current the training data behind it is. These are three
+// separate facts and the card never lets one stand in for another.
+export function FreshnessRow({ freshness }: { freshness: BriefingFreshness }) {
+  const [syncing, setSyncing] = useState(false)
+  const [syncMessage, setSyncMessage] = useState<string | null>(null)
+  const tone = TRAINING_TONE[freshness.training.level]
+
+  async function syncNow() {
+    if (syncing) return
+    setSyncing(true)
+    setSyncMessage(null)
+    try {
+      const outcome = await syncPendingLocalChanges('manual')
+      setSyncMessage(
+        outcome === 'uploaded'
+          ? 'Training data sent. A new briefing follows the next run.'
+          : outcome === 'up_to_date'
+            ? 'Training data already sent; waiting on the next briefing.'
+            : outcome === 'deferred_coach_reservation'
+              ? 'Waiting for a Coach change to finish syncing.'
+              : 'Pair this device in Settings to sync.',
+      )
+    } catch (err) {
+      setSyncMessage(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSyncing(false)
+    }
+  }
+
+  return (
+    <div
+      className="border-t px-4 py-2.5 space-y-2"
+      style={{ borderColor: 'var(--color-border)', background: tone.background }}
+    >
+      <dl className="flex items-center gap-x-4 gap-y-1 flex-wrap text-[11px] leading-tight">
+        <div className="flex items-baseline gap-1.5">
+          <dt className="font-bold uppercase tracking-wider text-[var(--color-fg-faint)]">
+            Briefing
+          </dt>
+          <dd className="nums text-[var(--color-fg-dim)]">
+            {freshness.briefingDateLabel}
+            {freshness.briefingDateIsStale && ' (not today)'}
+          </dd>
+        </div>
+        <div className="flex items-baseline gap-1.5">
+          <dt className="font-bold uppercase tracking-wider text-[var(--color-fg-faint)]">
+            Generated
+          </dt>
+          <dd className="nums text-[var(--color-fg-dim)]">
+            {freshness.generatedAtLabel ?? 'Unknown'}
+          </dd>
+        </div>
+        <div className="flex items-baseline gap-1.5">
+          <dt className="font-bold uppercase tracking-wider text-[var(--color-fg-faint)]">
+            Training data
+          </dt>
+          <dd className="nums" style={{ color: tone.fg }}>
+            {freshness.training.level === 'behind' && (
+              <AlertTriangle
+                size={11}
+                aria-hidden
+                className="inline-block mr-1 -mt-0.5"
+              />
+            )}
+            {freshness.training.summary}
+          </dd>
+        </div>
+      </dl>
+      {freshness.offerSyncAction && isCloudConfigured() && (
+        <button
+          type="button"
+          onClick={() => void syncNow()}
+          disabled={syncing}
+          className="btn-ghost text-[11px] py-1.5 px-2.5"
+        >
+          {syncing ? (
+            <RefreshCw size={12} className="animate-spin" aria-hidden />
+          ) : (
+            <CloudUpload size={12} aria-hidden />
+          )}
+          {syncing ? 'Syncing training data…' : 'Sync training data now'}
+        </button>
+      )}
+      {syncMessage && (
+        <p
+          role="status"
+          className="text-[11px] leading-snug text-[var(--color-fg-dim)]"
+        >
+          {syncMessage}
+        </p>
+      )}
+    </div>
+  )
 }
 
 export function briefingDateLabel(briefing: DailyBriefing): string {
-  const labels = [`${displayDate(briefing.briefingDate)} briefing`]
+  const labels = [`${displayShortDate(briefing.briefingDate)} briefing`]
   const input = briefing.inputSummary
   const latestCompletedWorkoutAt =
     input !== null &&
@@ -195,14 +354,14 @@ export function briefingDateLabel(briefing: DailyBriefing): string {
   if (latestCompletedWorkoutAt !== null) {
     const workoutDate = pacificDate(new Date(latestCompletedWorkoutAt))
     if (workoutDate && workoutDate !== briefing.briefingDate) {
-      labels.push(`workout data through ${displayDate(workoutDate)}`)
+      labels.push(`workout data through ${displayShortDate(workoutDate)}`)
     }
   }
 
   if (briefing.snapshotUpdatedAt) {
     const snapshotDate = pacificDate(new Date(briefing.snapshotUpdatedAt))
     if (snapshotDate && snapshotDate !== briefing.briefingDate) {
-      labels.push(`snapshot synced ${displayDate(snapshotDate)}`)
+      labels.push(`snapshot synced ${displayShortDate(snapshotDate)}`)
     }
   }
 

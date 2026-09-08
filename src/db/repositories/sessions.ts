@@ -1,12 +1,22 @@
 import Dexie from 'dexie'
 import { db } from '../schema'
-import { estimated1RM } from '../../lib/analytics'
+import { estimated1RMForLoad } from '../../lib/analytics'
+import {
+  exerciseLoadConvention,
+  isLoadConvention,
+  isSetKind,
+  resolveSetLoadConvention,
+  setKindOf,
+} from '../../lib/measurement'
 import { assertPostWorkoutFeedback } from '../../lib/postWorkoutFeedback'
+import { assertUnfinishedWorkNote } from '../../lib/unfinishedWork'
+import { mutateLocalData } from './syncState'
 import {
   assertPreWorkoutCheckIn,
   isPerceivedRecoveryScore,
 } from '../../lib/preWorkoutCheckIn'
 import type {
+  LoadConvention,
   LoggedSet,
   PerceivedRecoveryScore,
   PostWorkoutFeedbackV2,
@@ -14,6 +24,9 @@ import type {
   Program,
   SessionExerciseSnapshot,
   SessionTemplate,
+  SetKind,
+  UnfinishedWorkNoteV1,
+  UnfinishedWorkReason,
   WorkoutSession,
 } from '../types'
 
@@ -25,14 +38,14 @@ export async function startSession(
   const newId = crypto.randomUUID()
   const now = Date.now()
 
-  await db.transaction(
-    'rw',
+  await mutateLocalData(
     [
       db.workoutSessions,
       db.loggedSets,
       db.templateExercises,
       db.sessionTemplates,
       db.programs,
+      db.exercises,
     ],
     async () => {
       let authoritativeTemplate = template
@@ -104,8 +117,22 @@ export async function startSession(
             order: te.order,
             targetSets: te.targetSets,
             targetRepRange: te.targetRepRange,
+            ...(te.repBounds !== undefined ? { repBounds: te.repBounds } : {}),
+            ...(te.warmupSets !== undefined
+              ? { warmupSets: te.warmupSets }
+              : {}),
           }))
         : []
+
+      // Freeze the load convention for each planned exercise, including an
+      // explicit `unknown`. Writing it even when nothing is configured is the
+      // point: an absent field is indistinguishable from a legacy row, and a
+      // later edit to the exercise must never change how this session reads.
+      for (const row of snapshot) {
+        row.loadConvention = exerciseLoadConvention(
+          await db.exercises.get(row.exerciseId),
+        )
+      }
 
       await db.workoutSessions.add({
         id: newId,
@@ -166,8 +193,7 @@ export async function getSession(id: string): Promise<WorkoutSession | undefined
 }
 
 export async function endSession(id: string): Promise<void> {
-  await db.transaction(
-    'rw',
+  await mutateLocalData(
     [db.workoutSessions, db.loggedSets],
     async () => {
       const session = await db.workoutSessions.get(id)
@@ -203,8 +229,7 @@ export async function recordPreWorkoutCheckIn(
     throw new Error('Invalid perceived recovery score')
   }
 
-  return db.transaction(
-    'rw',
+  return mutateLocalData(
     [db.workoutSessions, db.loggedSets],
     async () => {
       const session = await db.workoutSessions.get(id)
@@ -247,7 +272,7 @@ export async function updatePostWorkoutFeedback(
   feedback: PostWorkoutFeedbackV2,
 ): Promise<void> {
   assertPostWorkoutFeedback(feedback)
-  await db.transaction('rw', db.workoutSessions, async () => {
+  await mutateLocalData([db.workoutSessions], async () => {
     const session = await db.workoutSessions.get(id)
     if (!session) throw new Error('Session not found')
     if (session.completedAt === null) {
@@ -257,6 +282,10 @@ export async function updatePostWorkoutFeedback(
   })
 }
 
+// Collapse markers are derived UI state that also happens to live in the
+// exported payload. They deliberately do NOT advance the local revision: they
+// change many times per workout, and any real mutation (a set, the completion)
+// carries them to the mirror on the next sync.
 export async function setSessionDoneExercises(
   id: string,
   doneExerciseIds: string[],
@@ -264,8 +293,36 @@ export async function setSessionDoneExercises(
   await db.workoutSessions.update(id, { doneExerciseIds })
 }
 
+// Optional context for planned work that was not completed. Separate from
+// postWorkoutFeedback so existing feedback semantics are untouched, and
+// clearable, because a guess recorded in haste should be removable.
+export async function setUnfinishedWorkReason(
+  id: string,
+  reason: UnfinishedWorkReason | null,
+): Promise<UnfinishedWorkNoteV1 | null> {
+  return mutateLocalData([db.workoutSessions], async () => {
+    const session = await db.workoutSessions.get(id)
+    if (!session) throw new Error('Session not found')
+    if (session.completedAt === null) {
+      throw new Error('Unfinished-work context requires a completed session')
+    }
+    if (reason === null) {
+      await db.workoutSessions.update(id, { unfinishedWork: null })
+      return null
+    }
+    const note: UnfinishedWorkNoteV1 = {
+      version: 1,
+      reason,
+      recordedAt: Math.max(Date.now(), session.completedAt),
+    }
+    assertUnfinishedWorkNote(note)
+    await db.workoutSessions.update(id, { unfinishedWork: note })
+    return note
+  })
+}
+
 export async function deleteSession(id: string): Promise<void> {
-  await db.transaction('rw', [db.workoutSessions, db.loggedSets], async () => {
+  await mutateLocalData([db.workoutSessions, db.loggedSets], async () => {
     await db.loggedSets.where('workoutSessionId').equals(id).delete()
     await db.workoutSessions.delete(id)
   })
@@ -275,7 +332,7 @@ export async function appendExerciseToSession(
   sessionId: string,
   exerciseId: string,
 ): Promise<void> {
-  await db.transaction('rw', db.workoutSessions, async () => {
+  await mutateLocalData([db.workoutSessions, db.exercises], async () => {
     const s = await db.workoutSessions.get(sessionId)
     if (!s) throw new Error('Session not found')
     if (s.exerciseSnapshot.some((x) => x.exerciseId === exerciseId)) return
@@ -289,6 +346,10 @@ export async function appendExerciseToSession(
         order: nextOrder,
         targetSets: 0,
         targetRepRange: '',
+        // Frozen now, because now is when this exercise entered the session.
+        loadConvention: exerciseLoadConvention(
+          await db.exercises.get(exerciseId),
+        ),
       },
     ]
     await db.workoutSessions.update(sessionId, { exerciseSnapshot: snap })
@@ -328,9 +389,12 @@ function assertValidSetValues(values: {
 }): void {
   if (
     values.weightLbs !== undefined &&
-    (!Number.isFinite(values.weightLbs) || values.weightLbs <= 0)
+    !Number.isFinite(values.weightLbs)
   ) {
-    throw new Error('Weight must be a finite number greater than 0')
+    throw new Error('Weight must be a finite number')
+  }
+  if (values.weightLbs !== undefined && values.weightLbs < 0) {
+    throw new Error('Weight cannot be negative')
   }
   if (
     values.reps !== undefined &&
@@ -347,19 +411,52 @@ function assertValidSetValues(values: {
   }
 }
 
+// Zero is a real recorded value for the two conventions where the number is an
+// adjustment rather than the load itself: a bodyweight set with no added weight,
+// and an unassisted rep on an assistance machine. Every other convention — and
+// every legacy row, which reads as `unknown` — still requires a positive load,
+// so nothing that was rejected before is accepted now.
+export function allowsZeroWeight(convention: LoadConvention): boolean {
+  return convention === 'bodyweight' || convention === 'assistance'
+}
+
+export function weightValidationIssue(
+  weightLbs: number,
+  convention: LoadConvention,
+): string | null {
+  if (!Number.isFinite(weightLbs)) return 'Weight must be a finite number'
+  if (weightLbs < 0) return 'Weight cannot be negative'
+  if (weightLbs === 0 && !allowsZeroWeight(convention)) {
+    return 'Weight must be greater than 0'
+  }
+  return null
+}
+
+function assertWeightForConvention(
+  weightLbs: number,
+  convention: LoadConvention,
+): void {
+  const issue = weightValidationIssue(weightLbs, convention)
+  if (issue) throw new Error(issue)
+}
+
 export async function logSet(args: {
   sessionId: string
   exerciseId: string
   weightLbs: number
   reps: number
   rpe: number | null
+  setKind?: SetKind
 }): Promise<LogSetResult> {
   assertValidSetValues(args)
+  if (args.setKind !== undefined && !isSetKind(args.setKind)) {
+    throw new Error('Set kind must be "working" or "warmup"')
+  }
 
   const id = crypto.randomUUID()
   let setNumber = 1
 
-  await db.transaction('rw', [db.loggedSets, db.workoutSessions], async () => {
+  await mutateLocalData([db.loggedSets, db.workoutSessions, db.exercises], async () => {
     const session = await db.workoutSessions.get(args.sessionId)
     if (!session) throw new Error('Session not found')
     if (session.completedAt === null && session.preWorkoutCheckIn === null) {
@@ -406,6 +503,20 @@ export async function logSet(args: {
       .last()
     setNumber = last ? last.setNumber + 1 : 1
 
+    // Record how this number should be read, at the moment it is recorded.
+    //
+    // The session's frozen plan wins: a set logged into a session that was
+    // started before the exercise was reconfigured belongs to that session's
+    // measurement, not to today's. Only work with no frozen plan row (an
+    // exercise added mid-session, or a freestyle workout) reads the exercise,
+    // and that genuinely is the recording moment.
+    const plannedRow = session.exerciseSnapshot.find(
+      (row) => row.exerciseId === args.exerciseId,
+    )
+    const convention = isLoadConvention(plannedRow?.loadConvention)
+      ? plannedRow.loadConvention
+      : exerciseLoadConvention(await db.exercises.get(args.exerciseId))
+    assertWeightForConvention(args.weightLbs, convention)
     await db.loggedSets.add({
       id,
       workoutSessionId: args.sessionId,
@@ -414,6 +525,11 @@ export async function logSet(args: {
       weightLbs: args.weightLbs,
       reps: args.reps,
       rpe: args.rpe,
+      ...(args.setKind !== undefined ? { setKind: args.setKind } : {}),
+      // Always written, never omitted: an explicit `unknown` is a recorded
+      // fact ("nothing was configured then"), and it is what stops a later
+      // metadata edit from reinterpreting this row.
+      loadConvention: convention,
       // Edits made from a completed session's History screen belong to that
       // session's chronology, not to the day the correction was entered.
       loggedAt,
@@ -424,14 +540,35 @@ export async function logSet(args: {
 
 export async function updateSet(
   id: string,
-  patch: { weightLbs?: number; reps?: number; rpe?: number | null },
+  patch: {
+    weightLbs?: number
+    reps?: number
+    rpe?: number | null
+    setKind?: SetKind
+  },
 ): Promise<void> {
   assertValidSetValues(patch)
-  await db.loggedSets.update(id, patch)
+  if (patch.setKind !== undefined && !isSetKind(patch.setKind)) {
+    throw new Error('Set kind must be "working" or "warmup"')
+  }
+  await mutateLocalData([db.loggedSets], async () => {
+    const current = await db.loggedSets.get(id)
+    if (!current) throw new Error('Set not found')
+    if (patch.weightLbs !== undefined) {
+      // Judged against the convention this row was recorded with, so a
+      // bodyweight set may be corrected to 0 while a total-load set may not.
+      assertWeightForConvention(
+        patch.weightLbs,
+        resolveSetLoadConvention(current),
+      )
+    }
+    const updated = await db.loggedSets.update(id, patch)
+    if (updated === 0) throw new Error('Set not found')
+  })
 }
 
 export async function deleteSet(id: string): Promise<void> {
-  await db.transaction('rw', db.loggedSets, async () => {
+  await mutateLocalData([db.loggedSets], async () => {
     const target = await db.loggedSets.get(id)
     if (!target) return
     await db.loggedSets.delete(id)
@@ -458,7 +595,7 @@ export async function deleteSet(id: string): Promise<void> {
 // (session, exercise) group densely so set numbers stay 1-based and contiguous
 // regardless of where the restored set lands.
 export async function restoreSet(set: LoggedSet): Promise<void> {
-  await db.transaction('rw', db.loggedSets, async () => {
+  await mutateLocalData([db.loggedSets], async () => {
     const exists = await db.loggedSets.get(set.id)
     if (exists) return
     await db.loggedSets.add(set)
@@ -525,7 +662,17 @@ export async function getRecentSessionE1RMsForExercise(
     .equals(exerciseId)
     .each((s) => {
       if (excludeSessionId && s.workoutSessionId === excludeSessionId) return
-      const e = estimated1RM(s.weightLbs, s.reps)
+      // Working sets only: a warm-up is not a performance data point.
+      if (setKindOf(s) !== 'working') return
+      // Read with the set's own frozen convention. Machine settings,
+      // assistance, and bodyweight-only loads have no valid one-rep-max
+      // estimate; leaving them out beats charting a fake number.
+      const e = estimated1RMForLoad(
+        s.weightLbs,
+        s.reps,
+        resolveSetLoadConvention(s),
+      )
+      if (e === null) return
       const cur = maxBySession.get(s.workoutSessionId) ?? 0
       if (e > cur) maxBySession.set(s.workoutSessionId, e)
     })
@@ -550,8 +697,7 @@ export async function swapExerciseInSession(
   toExerciseId: string,
 ): Promise<void> {
   if (fromExerciseId === toExerciseId) return
-  await db.transaction(
-    'rw',
+  await mutateLocalData(
     [db.workoutSessions, db.loggedSets, db.exercises],
     async () => {
       const s = await db.workoutSessions.get(sessionId)
@@ -583,7 +729,13 @@ export async function swapExerciseInSession(
       let doneExerciseIds = s.doneExerciseIds ?? []
       if (loggedCount === 0) {
         // No work to preserve: replace in place with identical targets.
-        snapshot[sourceIndex] = { ...source, exerciseId: toExerciseId }
+        snapshot[sourceIndex] = {
+          ...source,
+          exerciseId: toExerciseId,
+          loadConvention: exerciseLoadConvention(
+            await db.exercises.get(toExerciseId),
+          ),
+        }
         doneExerciseIds = doneExerciseIds.filter(
           (id) => id !== fromExerciseId && id !== toExerciseId,
         )
@@ -598,6 +750,9 @@ export async function swapExerciseInSession(
           order: source.order + 1,
           targetSets: Math.max(0, remainingSets),
           targetRepRange: source.targetRepRange,
+          loadConvention: exerciseLoadConvention(
+            await db.exercises.get(toExerciseId),
+          ),
         })
         doneExerciseIds = doneExerciseIds.filter((id) => id !== toExerciseId)
         if (!doneExerciseIds.includes(fromExerciseId)) {

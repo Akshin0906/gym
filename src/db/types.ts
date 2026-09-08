@@ -12,6 +12,33 @@ export type MuscleGroup =
   | 'abs'
   | 'traps'
 
+// How the number stored in `LoggedSet.weightLbs` should be read. Legacy rows
+// predate the field and stay `unknown`, which the math layer treats exactly
+// like `total` so historical charts keep their original interpretation — but
+// it is labelled as an assumption instead of a recorded fact.
+export type LoadConvention =
+  | 'unknown'
+  | 'total'
+  | 'per_dumbbell'
+  | 'machine_setting'
+  | 'bodyweight'
+  | 'assistance'
+
+export const LOAD_CONVENTIONS: readonly LoadConvention[] = [
+  'unknown',
+  'total',
+  'per_dumbbell',
+  'machine_setting',
+  'bodyweight',
+  'assistance',
+]
+
+// Optional advanced metadata. Absent on every legacy exercise; the resolver in
+// lib/measurement.ts fills the compatible defaults rather than guessing units.
+export interface ExerciseMeasurement {
+  loadConvention: LoadConvention
+}
+
 export interface Exercise {
   id: string
   name: string
@@ -22,6 +49,12 @@ export interface Exercise {
   isCustom: boolean
   hiddenFromLibrary: boolean
   createdAt: number
+  // Case/whitespace-folded `name`, maintained by the exercises repository so
+  // uniqueness can be enforced by a single indexed lookup inside one
+  // transaction. Derived local index state: stripped from exports and rebuilt
+  // on import, so backup and cloud payloads keep their existing shape.
+  normalizedName?: string
+  measurement?: ExerciseMeasurement
 }
 
 export interface Program {
@@ -45,6 +78,15 @@ export interface SessionTemplate {
   order: number
 }
 
+// Structured form of `targetRepRange`. The free-text field remains the display
+// source of truth; these bounds exist so attainment math never has to re-parse
+// prose. `null` means "no machine-readable target", which is different from a
+// missing field (legacy row that may still have a parseable text range).
+export interface RepBounds {
+  min: number
+  max: number
+}
+
 export interface TemplateExercise {
   id: string
   sessionTemplateId: string
@@ -52,6 +94,9 @@ export interface TemplateExercise {
   order: number
   targetSets: number
   targetRepRange: string
+  repBounds?: RepBounds | null
+  // Planned warm-up sets, excluded from target attainment. Absent = none known.
+  warmupSets?: number
 }
 
 export interface SessionExerciseSnapshot {
@@ -59,6 +104,11 @@ export interface SessionExerciseSnapshot {
   order: number
   targetSets: number
   targetRepRange: string
+  repBounds?: RepBounds | null
+  warmupSets?: number
+  // Frozen at session start so later edits to the exercise never rewrite how an
+  // old session's numbers should be read.
+  loadConvention?: LoadConvention
 }
 
 export type SliderValue = 1 | 2 | 3 | 4 | 5
@@ -91,6 +141,30 @@ export interface PostWorkoutFeedbackV2 {
   painImpact: SessionPainImpact
 }
 
+// Why planned work was not completed. Deliberately coarse and optional: it is
+// context for the athlete and the Coach, never a clinical judgement, and
+// "not_recorded" is a real answer rather than an absence.
+export type UnfinishedWorkReason =
+  | 'time'
+  | 'equipment'
+  | 'deliberate_change'
+  | 'discomfort'
+  | 'not_recorded'
+
+export const UNFINISHED_WORK_REASONS: readonly UnfinishedWorkReason[] = [
+  'time',
+  'equipment',
+  'deliberate_change',
+  'discomfort',
+  'not_recorded',
+]
+
+export interface UnfinishedWorkNoteV1 {
+  version: 1
+  reason: UnfinishedWorkReason
+  recordedAt: number
+}
+
 export interface WorkoutSession {
   id: string
   sessionTemplateId: string | null
@@ -106,6 +180,9 @@ export interface WorkoutSession {
   // null = a new session awaiting the check-in; undefined = a legacy session.
   preWorkoutCheckIn?: PreWorkoutCheckInV1 | null
   postWorkoutFeedback?: PostWorkoutFeedbackV2 | null
+  // Optional, separate from postWorkoutFeedback so existing feedback semantics
+  // are untouched. Only meaningful when planned work exceeded completed work.
+  unfinishedWork?: UnfinishedWorkNoteV1 | null
   // Exercises collapsed ("done") in the active screen, in completion order.
   // Not indexed, so no Dexie migration; absent on older sessions.
   doneExerciseIds?: string[]
@@ -177,6 +254,8 @@ export interface AiMemorySummary {
   updatedAt: number
 }
 
+export type SetKind = 'working' | 'warmup'
+
 export interface LoggedSet {
   id: string
   workoutSessionId: string
@@ -186,6 +265,51 @@ export interface LoggedSet {
   reps: number
   rpe: number | null
   loggedAt: number
+  // Absent on legacy rows, which are treated as working sets (the behaviour
+  // every existing chart already assumes) but reported as unclassified.
+  setKind?: SetKind
+  // Denormalized from the exercise at log time. Editing an exercise's load
+  // convention later must not silently re-interpret sets already recorded.
+  loadConvention?: LoadConvention
+}
+
+// Device-local mirror bookkeeping. `localRevision` advances inside the same
+// IndexedDB transaction as every trusted local mutation, so a correction to a
+// historical set is just as visible to the uploader as a brand new workout.
+// `syncedRevision` only advances to the revision that was actually captured in
+// the payload the cloud accepted, so an edit made mid-upload stays pending.
+//
+// This is device-local derived state: it is never exported, never uploaded, and
+// never imported. The single-user mirror design is unchanged — there is no
+// merge, only "does this device have local work the mirror has not seen".
+export interface LocalSyncState {
+  id: 'local'
+  localRevision: number
+  syncedRevision: number
+  lastMutationAt: number | null
+  lastSyncedAt: number | null
+  lastSyncedCloudUpdatedAt: number | null
+  lastSyncError: string | null
+  failedAttempts: number
+  // Bumped whenever the local dataset is wholesale replaced (a backup restore).
+  // An upload that was already in flight belongs to the previous dataset, so its
+  // response must not be allowed to mark the restored data as mirrored.
+  datasetEpoch: number
+  // Bumped on every pairing change. An upload or a 401 that crosses a logout,
+  // a re-pair, or a device swap belongs to a session that no longer exists and
+  // must not touch the watermark or fence the new session.
+  authEpoch: number
+  // Earliest time the automatic scheduler may retry, from capped exponential
+  // backoff. Manual and reconnect triggers deliberately ignore it.
+  nextAutoAttemptAt: number | null
+}
+
+// The identity an in-flight cloud operation was started under. Captured with
+// the payload and re-checked before anything is written back, so a late reply
+// from a superseded dataset or session is discarded instead of applied.
+export interface SyncFence {
+  datasetEpoch: number
+  authEpoch: number
 }
 
 // Local idempotency receipt for a confirmed Coach action. The cloud proposal

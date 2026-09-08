@@ -11,15 +11,24 @@ import {
 } from 'recharts'
 import { Header, SettingsLink } from '../components/Header'
 import { CountUp } from '../components/CountUp'
+import { LoadFailure } from '../components/Feedback'
 import { StatsCardSkeleton } from '../components/Skeleton'
 import { listAllExercises } from '../db/repositories/exercises'
 import { listAllSets } from '../db/repositories/sessions'
 import type { Exercise, LoggedSet, MuscleGroup } from '../db/types'
 import {
+  buildWeeklySetCountsSplit,
+  buildWeeklyTonnage,
   buildWeeklyVolume,
-  estimated1RM,
+  estimated1RMForLoad,
   lastNIsoWeeks,
+  summarizeTonnage,
 } from '../lib/analytics'
+import {
+  countWorkingSets,
+  resolveSetLoadConvention,
+  setKindOf,
+} from '../lib/measurement'
 import { MUSCLE_LABEL, MUSCLE_ORDER } from '../lib/muscles'
 import {
   getDailyReadiness,
@@ -78,9 +87,12 @@ export function StatsScreen() {
   const [eligibleExs, setEligibleExs] = useState<Exercise[]>([])
   const [selectedExIds, setSelectedExIds] = useState<Set<string>>(new Set())
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [reloadToken, setReloadToken] = useState(0)
 
   useEffect(() => {
     void (async () => {
+      try {
       const [sets, exs] = await Promise.all([listAllSets(), listAllExercises()])
       const m = new Map<string, Exercise>()
       for (const e of exs) m.set(e.id, e)
@@ -104,9 +116,15 @@ export function StatsScreen() {
         .sort((a, b) => a.name.localeCompare(b.name))
       setEligibleExs(eligible)
       if (eligible.length > 0) setSelectedExIds(new Set([eligible[0].id]))
-      setLoading(false)
+      setLoadError(null)
+      } catch (err) {
+        // A rejected IndexedDB read previously left the skeleton up forever.
+        setLoadError(err instanceof Error ? err.message : String(err))
+      } finally {
+        setLoading(false)
+      }
     })()
-  }, [])
+  }, [reloadToken])
 
   const trendData = useMemo<TrendRow[]>(() => {
     if (selectedExIds.size === 0) return []
@@ -116,7 +134,17 @@ export function StatsScreen() {
     for (const s of allSets) {
       if (!selectedExIds.has(s.exerciseId)) continue
       const day = startOfDay(s.loggedAt).getTime()
-      const e1 = Math.round(estimated1RM(s.weightLbs, s.reps))
+      // Machine settings, assistance, and bodyweight-only loads have no valid
+      // one-rep-max estimate, so they are left off the chart entirely.
+      // Working sets only, read with the set's own frozen convention.
+      if (setKindOf(s) !== 'working') continue
+      const estimate = estimated1RMForLoad(
+        s.weightLbs,
+        s.reps,
+        resolveSetLoadConvention(s),
+      )
+      if (estimate === null) continue
+      const e1 = Math.round(estimate)
       let row = dayMap.get(day)
       if (!row) {
         row = {}
@@ -160,17 +188,67 @@ export function StatsScreen() {
     return MUSCLE_ORDER.filter((m) => present.has(m))
   }, [volumeWeeks])
 
+  const setCountWeeks = useMemo(
+    () => buildWeeklySetCountsSplit(allSets, exMap),
+    [allSets, exMap],
+  )
+
+  const tonnageWeeks = useMemo(() => {
+    const byKey = new Map(
+      buildWeeklyTonnage(allSets, exMap).map((row) => [row.weekKey, row]),
+    )
+    return volumeWeeks.map((week) => byKey.get(week.weekKey) ?? null)
+  }, [allSets, exMap, volumeWeeks])
+
+  const setCountMuscles = useMemo(() => {
+    const present = new Set<MuscleGroup>()
+    for (const row of setCountWeeks) {
+      for (const m of Object.keys(row.direct) as MuscleGroup[]) present.add(m)
+      for (const m of Object.keys(row.secondary) as MuscleGroup[]) present.add(m)
+    }
+    return MUSCLE_ORDER.filter((m) => present.has(m))
+  }, [setCountWeeks])
+
+  const recentSetCountWeeks = useMemo(() => {
+    const byKey = new Map(setCountWeeks.map((row) => [row.weekKey, row]))
+    return volumeWeeks.map(
+      (week) =>
+        byKey.get(week.weekKey) ?? {
+          weekKey: week.weekKey,
+          weekStart: week.weekStart,
+          direct: {},
+          secondary: {},
+        },
+    )
+  }, [setCountWeeks, volumeWeeks])
+
   const summary = useMemo(() => {
     const now = new Date()
     const weekAgo = subDays(now, 7)
     const inWeek = allSets.filter((s) =>
       isWithinInterval(s.loggedAt, { start: weekAgo, end: now }),
     )
-    const volume7d = inWeek.reduce((sum, s) => sum + s.weightLbs * s.reps, 0)
+    const tonnage = summarizeTonnage(inWeek)
     const sessions7d = new Set(inWeek.map((s) => s.workoutSessionId)).size
-    const sets7d = inWeek.length
-    return { volume7d, sessions7d, sets7d }
+    const workingSets7d = countWorkingSets(inWeek)
+    const warmupSets7d = inWeek.length - workingSets7d
+    return { tonnage, sessions7d, workingSets7d, warmupSets7d }
   }, [allSets])
+
+  if (loadError) {
+    return (
+      <>
+        <Header title="Stats" right={<SettingsLink />} />
+        <LoadFailure
+          message={`Could not load your training data: ${loadError}`}
+          onRetry={() => {
+            setLoading(true)
+            setReloadToken((n) => n + 1)
+          }}
+        />
+      </>
+    )
+  }
 
   if (loading) {
     return (
@@ -199,16 +277,25 @@ export function StatsScreen() {
               value={summary.sessions7d}
             />
             <SummaryCard
-              label="Sets"
-              value={summary.sets7d}
+              label="Working sets"
+              value={summary.workingSets7d}
             />
             <SummaryCard
               label="Volume"
-              value={summary.volume7d}
+              value={summary.tonnage.tonnage}
               suffix=" lb·reps"
               format={(n) => n.toLocaleString()}
             />
           </div>
+          <p className="text-[11px] text-[var(--color-fg-faint)] px-1 mt-2">
+            Volume counts each set once.
+            {summary.warmupSets7d > 0 &&
+              ` ${summary.warmupSets7d} warm-up set${summary.warmupSets7d === 1 ? '' : 's'} excluded from the set count.`}
+            {summary.tonnage.excludedSets > 0 &&
+              ` ${summary.tonnage.excludedSets} set${summary.tonnage.excludedSets === 1 ? '' : 's'} excluded from volume (machine setting, assistance, or bodyweight).`}
+            {summary.tonnage.assumedUnitSets > 0 &&
+              ` ${summary.tonnage.assumedUnitSets} set${summary.tonnage.assumedUnitSets === 1 ? '' : 's'} assume pounds because no load unit was recorded.`}
+          </p>
         </section>
 
         <RecoverySection />
@@ -422,34 +509,121 @@ export function StatsScreen() {
                   ))}
                 </tbody>
                 <tfoot>
+                  {/* Not the sum of the rows above. Adding the muscle rows
+                      would count a compound lift's tonnage once for its primary
+                      mover and again at 50% for every secondary. */}
                   <tr className="border-t border-[var(--color-border)]">
                     <th
                       scope="row"
-                      className="sticky left-0 z-10 bg-[var(--color-surface)] text-left font-semibold py-2 pl-3 pr-2"
+                      className="sticky left-0 z-10 bg-[var(--color-surface)] text-left font-semibold py-2 pl-3 pr-2 whitespace-nowrap"
                     >
-                      Total
+                      Total lifted
                     </th>
-                    {volumeWeeks.map((w) => {
-                      const total = tableMuscles.reduce(
-                        (sum, m) => sum + (w.values[m] ?? 0),
-                        0,
-                      )
-                      return (
-                        <td
-                          key={w.weekKey}
-                          className="nums text-right py-2 px-3 font-semibold"
-                        >
-                          {fmtVolume(total)}
-                        </td>
-                      )
-                    })}
+                    {tonnageWeeks.map((row, index) => (
+                      <td
+                        key={volumeWeeks[index].weekKey}
+                        className="nums text-right py-2 px-3 font-semibold"
+                      >
+                        {fmtVolume(row?.tonnage ?? 0)}
+                      </td>
+                    ))}
                   </tr>
                 </tfoot>
               </table>
             )}
           </div>
           <p className="text-[11px] text-[var(--color-fg-faint)] px-1">
-            Volume in lb·reps. Secondary muscles receive 50% credit.
+            Volume in lb·reps. Muscle rows give secondary muscles 50% credit, so
+            they overlap; &ldquo;Total lifted&rdquo; counts each set once and is
+            not the sum of the rows above.
+            {tonnageWeeks.some((row) => (row?.excludedSets ?? 0) > 0) &&
+              ' Sets measured as a machine setting, assistance, or bodyweight are excluded.'}
+          </p>
+        </section>
+
+        <section className="space-y-3">
+          <h2 className="text-[11px] font-bold uppercase tracking-widest text-[var(--color-fg-faint)] px-1">
+            Weekly sets per muscle
+          </h2>
+          <div className="card overflow-x-auto">
+            {setCountMuscles.length === 0 ? (
+              <p className="text-sm text-[var(--color-fg-faint)] p-4 text-center">
+                No data.
+              </p>
+            ) : (
+              <table className="w-full text-sm border-collapse">
+                <caption className="sr-only">
+                  Weekly set counts by muscle group, shown as direct sets where
+                  the muscle was the primary mover plus secondary sets
+                </caption>
+                <thead>
+                  <tr>
+                    <th className="sticky left-0 z-10 bg-[var(--color-surface)] text-left text-[11px] font-bold uppercase tracking-wider text-[var(--color-fg-faint)] py-2 pl-3 pr-2">
+                      Muscle
+                    </th>
+                    {recentSetCountWeeks.map((w) => (
+                      <th
+                        key={w.weekKey}
+                        className="nums text-right text-[11px] font-bold uppercase tracking-wider text-[var(--color-fg-faint)] py-2 px-3 whitespace-nowrap"
+                      >
+                        {format(w.weekStart, 'M/d')}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {setCountMuscles.map((m) => (
+                    <tr key={m} className="border-t border-[var(--color-border)]">
+                      <th
+                        scope="row"
+                        className="sticky left-0 z-10 bg-[var(--color-surface)] text-left font-normal py-2 pl-3 pr-2 whitespace-nowrap"
+                      >
+                        <span className="inline-flex items-center gap-2">
+                          <span
+                            aria-hidden
+                            className="w-2 h-2 rounded-full flex-shrink-0"
+                            style={{ background: MUSCLE_COLORS[m] }}
+                          />
+                          {MUSCLE_LABEL[m]}
+                        </span>
+                      </th>
+                      {recentSetCountWeeks.map((w) => {
+                        const direct = w.direct[m] ?? 0
+                        const secondary = w.secondary[m] ?? 0
+                        return (
+                          <td
+                            key={w.weekKey}
+                            className="nums text-right py-2 px-3 whitespace-nowrap"
+                          >
+                            {direct === 0 && secondary === 0 ? (
+                              <span className="text-[var(--color-fg-faint)]">
+                                –
+                              </span>
+                            ) : (
+                              <>
+                                {direct}
+                                {secondary > 0 && (
+                                  <span className="text-[var(--color-fg-faint)]">
+                                    {' '}
+                                    +{secondary}
+                                  </span>
+                                )}
+                              </>
+                            )}
+                          </td>
+                        )
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+          <p className="text-[11px] text-[var(--color-fg-faint)] px-1">
+            Whole sets, counted once each: the first number is direct work where
+            the muscle was the primary mover, the &ldquo;+n&rdquo; is sets where
+            it was a listed secondary. The two are reported separately rather
+            than blended into one weighted figure.
           </p>
         </section>
       </div>

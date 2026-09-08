@@ -2,6 +2,8 @@ import Dexie from 'dexie'
 import { db } from '../schema'
 import { addAiNote } from './aiMemory'
 import { createCustomExercise } from './exercises'
+import { mutateLocalData } from './syncState'
+import { deriveRepBounds, exerciseLoadConvention } from '../../lib/measurement'
 import {
   hashActiveWorkoutActionState,
   hashAiMemoryActionState,
@@ -11,7 +13,9 @@ import {
 } from '../../lib/chatContext'
 import type {
   Exercise,
+  LoadConvention,
   MuscleGroup,
+  RepBounds,
   SessionExerciseSnapshot,
   SessionTemplate,
   WorkoutSession,
@@ -666,6 +670,13 @@ async function replaceTemplateExercises(
       order,
       targetSets: exercise.targetSets,
       targetRepRange: exercise.repRange,
+      // Structured bounds are derived from the Coach's own text; unparseable
+      // prescriptions stay legacy-shaped rather than getting a guessed range.
+      // A template is a live plan, so it carries no frozen convention — the
+      // session that starts from it freezes the exercise's convention then.
+      ...(coachRepBounds(exercise.repRange) !== undefined
+        ? { repBounds: coachRepBounds(exercise.repRange) }
+        : {}),
     })),
   )
 }
@@ -765,13 +776,66 @@ async function actionStateHashInTransaction(
   }
 }
 
-function snapshotFromPlan(exercises: PlannedExercise[]): SessionExerciseSnapshot[] {
-  return exercises.map((exercise, order) => ({
-    exerciseId: exercise.exerciseId,
-    order,
-    targetSets: exercise.targetSets,
-    targetRepRange: exercise.repRange,
-  }))
+// Structured bounds for a Coach-supplied rep target.
+//
+// Returns the derived bounds when the text parses and `undefined` when it does
+// not — and callers MUST delete any previous `repBounds` in the undefined case.
+// Leaving a stale structured bound behind would silently override the target
+// the Coach just asked for, because structured bounds win over display text.
+function coachRepBounds(repRange: string): RepBounds | undefined {
+  return deriveRepBounds(repRange)
+}
+
+// Apply a new rep target to a plan row, keeping text and structured bounds in
+// step. Written as an explicit delete rather than a spread so the stale-bounds
+// case is impossible to reintroduce by accident.
+function withCoachRepTarget<T extends { targetRepRange: string; repBounds?: RepBounds | null }>(
+  row: T,
+  repRange: string,
+): T {
+  const next = { ...row, targetRepRange: repRange }
+  const bounds = coachRepBounds(repRange)
+  if (bounds === undefined) delete next.repBounds
+  else next.repBounds = bounds
+  return next
+}
+
+// The measurement a NEW plan row must freeze: the destination exercise's
+// current convention, written explicitly (including `unknown`) so a later
+// exercise edit cannot reinterpret it and so a bodyweight or assistance plan
+// accepts a legitimate zero load.
+function frozenConventionFor(exercise: Exercise | undefined): LoadConvention {
+  return exerciseLoadConvention(exercise)
+}
+
+function snapshotFromPlan(
+  exercises: PlannedExercise[],
+  conventions: Map<string, LoadConvention>,
+): SessionExerciseSnapshot[] {
+  return exercises.map((exercise, order) => {
+    const bounds = coachRepBounds(exercise.repRange)
+    return {
+      exerciseId: exercise.exerciseId,
+      order,
+      targetSets: exercise.targetSets,
+      targetRepRange: exercise.repRange,
+      ...(bounds !== undefined ? { repBounds: bounds } : {}),
+      loadConvention: conventions.get(exercise.exerciseId) ?? 'unknown',
+    }
+  })
+}
+
+// Current convention for every exercise a plan mentions, read once.
+async function planLoadConventions(
+  exercises: PlannedExercise[],
+): Promise<Map<string, LoadConvention>> {
+  const ids = Array.from(new Set(exercises.map((row) => row.exerciseId)))
+  const rows = await db.exercises.bulkGet(ids)
+  const map = new Map<string, LoadConvention>()
+  for (const [index, id] of ids.entries()) {
+    map.set(id, frozenConventionFor(rows[index]))
+  }
+  return map
 }
 
 function parseStoredResult(receipt: ChatActionReceipt): CoachActionResult {
@@ -878,8 +942,11 @@ export async function applyCoachActionPlan(args: {
     throw new StaleCoachActionError()
   }
 
-  return db.transaction(
-    'rw',
+  // A confirmed Coach action is a local mutation like any other, so it runs
+  // inside mutateLocalData: the applied change and "the mirror is behind" land
+  // in one transaction. The Coach's own reservation-aware upload still runs
+  // afterwards; the revision simply makes the change durable if it fails.
+  return mutateLocalData(
     [
       db.exercises,
       db.programs,
@@ -953,11 +1020,17 @@ export async function applyCoachActionPlan(args: {
                 `Exercise position ${action.position} is outside this workout`,
               )
             }
+            const addedBounds = coachRepBounds(action.repRange)
             snapshot.splice(action.position, 0, {
               exerciseId: action.exerciseId,
               order: action.position,
               targetSets: action.targetSets,
               targetRepRange: action.repRange,
+              ...(addedBounds !== undefined ? { repBounds: addedBounds } : {}),
+              // Frozen now, from the exercise being added — not inherited and
+              // not left absent, which would resolve to `unknown` and reject a
+              // legitimate zero-load bodyweight or assistance set.
+              loadConvention: frozenConventionFor(exercise),
             })
             const updated = await db.workoutSessions.update(session.id, {
               exerciseSnapshot: denseSnapshot(snapshot),
@@ -1010,12 +1083,18 @@ export async function applyCoachActionPlan(args: {
               .count()
             let doneIds = session.doneExerciseIds ?? []
             if (loggedCount === 0) {
-              snapshot[sourceIndex] = {
-                ...source,
-                exerciseId: action.toExerciseId,
-                targetSets: action.targetSets,
-                targetRepRange: action.repRange,
-              }
+              // Nothing was performed, so this row now describes the NEW
+              // exercise entirely: its measurement and its rep bounds must come
+              // from the replacement, never be inherited from the original.
+              snapshot[sourceIndex] = withCoachRepTarget(
+                {
+                  ...source,
+                  exerciseId: action.toExerciseId,
+                  targetSets: action.targetSets,
+                  loadConvention: frozenConventionFor(toExercise),
+                },
+                action.repRange,
+              )
               doneIds = doneIds.filter(
                 (id) => id !== action.fromExerciseId && id !== action.toExerciseId,
               )
@@ -1024,11 +1103,14 @@ export async function applyCoachActionPlan(args: {
                 ...source,
                 targetSets: loggedCount,
               }
+              const swapBounds = coachRepBounds(action.repRange)
               snapshot.splice(sourceIndex + 1, 0, {
                 exerciseId: action.toExerciseId,
                 order: source.order + 1,
                 targetSets: action.targetSets,
                 targetRepRange: action.repRange,
+                ...(swapBounds !== undefined ? { repBounds: swapBounds } : {}),
+                loadConvention: frozenConventionFor(toExercise),
               })
               doneIds = doneIds.filter((id) => id !== action.toExerciseId)
               if (!doneIds.includes(action.fromExerciseId)) {
@@ -1073,11 +1155,13 @@ export async function applyCoachActionPlan(args: {
                 `${exercise.name} already has ${loggedCount} logged sets`,
               )
             }
-            snapshot[index] = {
-              ...snapshot[index],
-              targetSets: action.targetSets,
-              targetRepRange: action.repRange,
-            }
+            // The historical row keeps its frozen loadConvention — the work
+            // already logged against it was measured that way — but the rep
+            // target is fully replaced, structured bounds included.
+            snapshot[index] = withCoachRepTarget(
+              { ...snapshot[index], targetSets: action.targetSets },
+              action.repRange,
+            )
             const updated = await db.workoutSessions.update(session.id, {
               exerciseSnapshot: snapshot,
             })
@@ -1119,7 +1203,12 @@ export async function applyCoachActionPlan(args: {
               programId: null,
               name: action.name,
               programName: null,
-              exerciseSnapshot: snapshotFromPlan(action.exercises),
+              // A one-time workout is a session, so it freezes each exercise's
+              // current convention exactly as startSession does.
+              exerciseSnapshot: snapshotFromPlan(
+                action.exercises,
+                await planLoadConventions(action.exercises),
+              ),
               startedAt: now,
               completedAt: null,
               preWorkoutCheckIn: null,

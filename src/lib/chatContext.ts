@@ -5,13 +5,17 @@ import type {
   AiNote,
   DailyBriefing,
   Exercise,
+  LoadConvention,
   LoggedSet,
   PostWorkoutFeedbackV2,
   PreWorkoutCheckInV1,
   ProgramRow,
+  RepBounds,
   SessionExerciseSnapshot,
   SessionTemplate,
+  SetKind,
   TemplateExercise,
+  UnfinishedWorkNoteV1,
   WorkoutSession,
 } from '../db/types'
 import type { CoachActionStateHashes } from './chatTypes'
@@ -33,6 +37,10 @@ interface CoachContextSet {
   reps: number
   rpe: number | null
   loggedAt: number
+  // Omitted when unrecorded, so the Coach can tell "warm-up" from "unclassified"
+  // and "assistance" from "assumed pounds" instead of inferring either.
+  setKind?: SetKind
+  loadConvention?: LoadConvention
 }
 
 interface CoachContextPlannedExercise {
@@ -41,6 +49,10 @@ interface CoachContextPlannedExercise {
   order: number
   targetSets: number
   repRange: string
+  repBounds?: RepBounds | null
+  warmupSets?: number
+  loadConvention?: LoadConvention
+  planSource: 'frozen_session' | 'live_template'
 }
 
 export interface CoachLiveContext {
@@ -83,6 +95,10 @@ export interface CoachLiveContext {
     sessionFeel: number | null
     preWorkoutCheckIn: PreWorkoutCheckInV1 | null
     postWorkoutFeedback: PostWorkoutFeedbackV2 | null
+    // Optional context the athlete recorded for planned work that was not
+    // completed. Passed through so the Coach reads the stated reason instead of
+    // inferring one from missing sets.
+    unfinishedWork: UnfinishedWorkNoteV1 | null
     exercises: Array<{
       exerciseId: string
       exerciseName: string
@@ -147,19 +163,45 @@ function setContext(set: LoggedSet): CoachContextSet {
     reps: set.reps,
     rpe: set.rpe,
     loggedAt: set.loggedAt,
+    ...(set.setKind !== undefined ? { setKind: set.setKind } : {}),
+    ...(set.loadConvention !== undefined
+      ? { loadConvention: set.loadConvention }
+      : {}),
   }
 }
 
+// A session snapshot and a program template are different kinds of plan, and
+// the difference matters here.
+//
+// A snapshot is frozen history: its measurement is whatever was recorded when
+// the session started, and falling back to the exercise's current setting would
+// let one edit retroactively change what an old session meant — the same bug
+// the analytics layer had.
+//
+// A template is a live plan for future work, so reading the exercise's current
+// setting is correct: that is the measurement the next session will freeze.
 function plannedExerciseContext(
   snap: SessionExerciseSnapshot | TemplateExercise,
   exercises: Map<string, Exercise>,
+  source: 'frozen_session' | 'live_template',
 ): CoachContextPlannedExercise {
+  const frozen = 'loadConvention' in snap ? snap.loadConvention : undefined
+  const loadConvention =
+    source === 'frozen_session'
+      ? (frozen ?? 'unknown')
+      : (frozen ?? exercises.get(snap.exerciseId)?.measurement?.loadConvention)
   return {
     exerciseId: snap.exerciseId,
     exerciseName: exercises.get(snap.exerciseId)?.name ?? '(missing exercise)',
     order: snap.order,
     targetSets: snap.targetSets,
     repRange: snap.targetRepRange,
+    ...(snap.repBounds !== undefined ? { repBounds: snap.repBounds } : {}),
+    ...(snap.warmupSets !== undefined ? { warmupSets: snap.warmupSets } : {}),
+    ...(loadConvention !== undefined ? { loadConvention } : {}),
+    // Says which of the two the Coach is looking at, so it never treats a
+    // frozen `unknown` as "the exercise has no convention configured".
+    planSource: source,
   }
 }
 
@@ -184,11 +226,17 @@ async function sha256(value: unknown): Promise<string> {
   ).join('')
 }
 
+// Shared by every action-state hash. `measurement` is included because it is an
+// input to the actions themselves: a new or swapped plan row freezes the
+// exercise's current convention, and that convention decides whether a
+// zero-load set is valid. A plan proposed before the convention changed would
+// therefore mean something different if applied after, so it must read stale.
 function exerciseCatalogActionState(exercises: Exercise[]) {
   return exercises.slice().sort(byId).map((exercise) => ({
     id: exercise.id,
     name: exercise.name,
     hiddenFromLibrary: exercise.hiddenFromLibrary,
+    measurement: exercise.measurement ?? null,
   }))
 }
 
@@ -296,6 +344,10 @@ export async function hashExerciseLibraryActionState(
       isCustom: exercise.isCustom,
       hiddenFromLibrary: exercise.hiddenFromLibrary,
       createdAt: exercise.createdAt,
+      // Changing what an exercise's weight number means changes what a Coach
+      // plan written against it would mean, so it belongs in the staleness
+      // fingerprint. `normalizedName` is derived from `name` and is not.
+      measurement: exercise.measurement ?? null,
     })),
   )
 }
@@ -444,7 +496,7 @@ export async function buildLiveCoachContext(
             .slice()
             .sort((a, b) => a.order - b.order)
             .map((snap) => ({
-              ...plannedExerciseContext(snap, exerciseById),
+              ...plannedExerciseContext(snap, exerciseById, 'frozen_session'),
               done: (active.doneExerciseIds ?? []).includes(snap.exerciseId),
               sets: (activeSetsByExercise.get(snap.exerciseId) ?? [])
                 .slice()
@@ -483,7 +535,9 @@ export async function buildLiveCoachContext(
             exercises: (templateExercisesByTemplate.get(template.id) ?? [])
               .slice()
               .sort((a, b) => a.order - b.order)
-              .map((row) => plannedExerciseContext(row, exerciseById)),
+              .map((row) =>
+                plannedExerciseContext(row, exerciseById, 'live_template'),
+              ),
           })),
       })),
     recentWorkouts: rows.recentSessions.map((session) => {
@@ -506,6 +560,7 @@ export async function buildLiveCoachContext(
         sessionFeel: session.sessionFeel ?? null,
         preWorkoutCheckIn: session.preWorkoutCheckIn ?? null,
         postWorkoutFeedback: session.postWorkoutFeedback ?? null,
+        unfinishedWork: session.unfinishedWork ?? null,
         exercises: Array.from(grouped.entries()).map(([exerciseId, sets]) => ({
           exerciseId,
           exerciseName: exerciseById.get(exerciseId)?.name ?? '(missing exercise)',

@@ -1,0 +1,572 @@
+{
+  "$comment": "Reference expectations for calculations that exist in both the TypeScript app (src/lib/analytics.ts, src/lib/measurement.ts) and the Python supervisor (automation/briefing/measurement.py). Exercised by src/lib/sharedFixtures.test.ts and automation/tests/test_shared_fixtures.py. A change here must be made deliberately and both suites must agree.",
+  "version": 1,
+  "estimatedOneRepMax": [
+    {
+      "name": "single rep is the measurement, not an estimate",
+      "weightLbs": 100,
+      "reps": 1,
+      "expected": 100
+    },
+    {
+      "name": "fractional load with a single rep",
+      "weightLbs": 62.5,
+      "reps": 1,
+      "expected": 62.5
+    },
+    {
+      "name": "two reps uses the Epley term",
+      "weightLbs": 100,
+      "reps": 2,
+      "expected": 106.66666666666667
+    },
+    {
+      "name": "five reps",
+      "weightLbs": 225,
+      "reps": 5,
+      "expected": 262.5
+    },
+    {
+      "name": "twelve reps",
+      "weightLbs": 20,
+      "reps": 12,
+      "expected": 28
+    },
+    {
+      "name": "zero reps has no estimate",
+      "weightLbs": 100,
+      "reps": 0,
+      "expected": null
+    },
+    {
+      "name": "negative reps has no estimate",
+      "weightLbs": 100,
+      "reps": -3,
+      "expected": null
+    },
+    {
+      "name": "zero weight has no estimate",
+      "weightLbs": 0,
+      "reps": 5,
+      "expected": null
+    },
+    {
+      "name": "negative weight has no estimate",
+      "weightLbs": -50,
+      "reps": 5,
+      "expected": null
+    },
+    {
+      "name": "missing weight has no estimate",
+      "weightLbs": null,
+      "reps": 5,
+      "expected": null
+    },
+    {
+      "name": "missing reps has no estimate",
+      "weightLbs": 100,
+      "reps": null,
+      "expected": null
+    },
+    {
+      "name": "non-numeric weight has no estimate",
+      "weightLbs": "100",
+      "reps": 5,
+      "expected": null
+    },
+    {
+      "name": "boolean reps has no estimate",
+      "weightLbs": 100,
+      "reps": true,
+      "expected": null
+    }
+  ],
+  "repRangeParsing": [
+    {
+      "name": "hyphen range",
+      "input": "8-12",
+      "expected": {
+        "min": 8,
+        "max": 12
+      }
+    },
+    {
+      "name": "spaced hyphen",
+      "input": "8 - 12",
+      "expected": {
+        "min": 8,
+        "max": 12
+      }
+    },
+    {
+      "name": "en dash",
+      "input": "8\u201312",
+      "expected": {
+        "min": 8,
+        "max": 12
+      }
+    },
+    {
+      "name": "em dash",
+      "input": "8\u201412",
+      "expected": {
+        "min": 8,
+        "max": 12
+      }
+    },
+    {
+      "name": "word to",
+      "input": "8 to 12",
+      "expected": {
+        "min": 8,
+        "max": 12
+      }
+    },
+    {
+      "name": "trailing reps suffix",
+      "input": "12-15 reps",
+      "expected": {
+        "min": 12,
+        "max": 15
+      }
+    },
+    {
+      "name": "singular rep suffix",
+      "input": "1-1 rep",
+      "expected": {
+        "min": 1,
+        "max": 1
+      }
+    },
+    {
+      "name": "uppercase and extra whitespace",
+      "input": "  12 TO 15 Reps  ",
+      "expected": {
+        "min": 12,
+        "max": 15
+      }
+    },
+    {
+      "name": "equal bounds",
+      "input": "10-10",
+      "expected": {
+        "min": 10,
+        "max": 10
+      }
+    },
+    {
+      "name": "inverted range is not a target",
+      "input": "12-8",
+      "expected": null
+    },
+    {
+      "name": "zero minimum is not a target",
+      "input": "0-5",
+      "expected": null
+    },
+    {
+      "name": "prose is not a target",
+      "input": "as many as feel good",
+      "expected": null
+    },
+    {
+      "name": "empty text is not a target",
+      "input": "",
+      "expected": null
+    },
+    {
+      "name": "whitespace only is not a target",
+      "input": "   ",
+      "expected": null
+    },
+    {
+      "name": "null is not a target",
+      "input": null,
+      "expected": null
+    },
+    {
+      "name": "number is not a target",
+      "input": 12,
+      "expected": null
+    },
+    {
+      "name": "open ended range is not a target",
+      "input": "8+",
+      "expected": null
+    },
+    {
+      "name": "four digit bound is not a target",
+      "input": "1000-2000",
+      "expected": null
+    },
+    {
+      "name": "bare number is a target",
+      "input": "10",
+      "expected": {
+        "min": 10,
+        "max": 10
+      }
+    },
+    {
+      "name": "bare number with reps suffix",
+      "input": "10 reps",
+      "expected": {
+        "min": 10,
+        "max": 10
+      }
+    },
+    {
+      "name": "zero is not a target",
+      "input": "0",
+      "expected": null
+    }
+  ],
+  "$repRangeParsingNote": "Single-number targets are listed separately only because they are a distinct shape, not because the two implementations differ: both the app and the supervisor treat a bare \"10\" as exactly ten reps.",
+  "singleNumberRepTargets": [
+    {
+      "name": "bare number",
+      "input": "10",
+      "expected": {
+        "min": 10,
+        "max": 10
+      }
+    },
+    {
+      "name": "number with reps suffix",
+      "input": "10 reps",
+      "expected": {
+        "min": 10,
+        "max": 10
+      }
+    },
+    {
+      "name": "zero is not a target",
+      "input": "0",
+      "expected": null
+    }
+  ],
+  "loadComparability": [
+    {
+      "left": "total",
+      "right": "total",
+      "comparable": true
+    },
+    {
+      "left": "unknown",
+      "right": "unknown",
+      "comparable": true
+    },
+    {
+      "$comment": "A legacy row with no recorded unit is read as total pounds, so the two are comparable. Nothing else is ever mixed.",
+      "left": "unknown",
+      "right": "total",
+      "comparable": true
+    },
+    {
+      "left": "total",
+      "right": "unknown",
+      "comparable": true
+    },
+    {
+      "left": "per_dumbbell",
+      "right": "per_dumbbell",
+      "comparable": true
+    },
+    {
+      "left": "per_dumbbell",
+      "right": "total",
+      "comparable": false
+    },
+    {
+      "left": "per_dumbbell",
+      "right": "unknown",
+      "comparable": false
+    },
+    {
+      "left": "machine_setting",
+      "right": "total",
+      "comparable": false
+    },
+    {
+      "left": "machine_setting",
+      "right": "machine_setting",
+      "comparable": true
+    },
+    {
+      "left": "assistance",
+      "right": "total",
+      "comparable": false
+    },
+    {
+      "left": "assistance",
+      "right": "assistance",
+      "comparable": true
+    },
+    {
+      "left": "bodyweight",
+      "right": "total",
+      "comparable": false
+    },
+    {
+      "left": "bodyweight",
+      "right": "bodyweight",
+      "comparable": true
+    }
+  ],
+  "loadSemantics": [
+    {
+      "convention": "unknown",
+      "supportsTonnage": true,
+      "supportsOneRepMax": true,
+      "higherIsHarder": true,
+      "recorded": false
+    },
+    {
+      "convention": "total",
+      "supportsTonnage": true,
+      "supportsOneRepMax": true,
+      "higherIsHarder": true,
+      "recorded": true
+    },
+    {
+      "convention": "per_dumbbell",
+      "supportsTonnage": false,
+      "supportsOneRepMax": true,
+      "higherIsHarder": true,
+      "recorded": true
+    },
+    {
+      "convention": "machine_setting",
+      "supportsTonnage": false,
+      "supportsOneRepMax": false,
+      "higherIsHarder": true,
+      "recorded": true
+    },
+    {
+      "convention": "bodyweight",
+      "supportsTonnage": false,
+      "supportsOneRepMax": false,
+      "higherIsHarder": true,
+      "recorded": true
+    },
+    {
+      "convention": "assistance",
+      "supportsTonnage": false,
+      "supportsOneRepMax": false,
+      "higherIsHarder": false,
+      "recorded": true
+    }
+  ],
+  "estimatedOneRepMaxForLoad": [
+    {
+      "name": "total load estimates normally",
+      "weightLbs": 100,
+      "reps": 5,
+      "convention": "total",
+      "expected": 116.66666666666667
+    },
+    {
+      "name": "per-dumbbell stays comparable with itself",
+      "weightLbs": 40,
+      "reps": 10,
+      "convention": "per_dumbbell",
+      "expected": 53.333333333333336
+    },
+    {
+      "name": "machine setting has no valid estimate",
+      "weightLbs": 7,
+      "reps": 10,
+      "convention": "machine_setting",
+      "expected": null
+    },
+    {
+      "name": "assistance has no valid estimate",
+      "weightLbs": 60,
+      "reps": 8,
+      "convention": "assistance",
+      "expected": null
+    },
+    {
+      "name": "bodyweight-only has no valid estimate",
+      "weightLbs": 25,
+      "reps": 8,
+      "convention": "bodyweight",
+      "expected": null
+    },
+    {
+      "name": "unrecognised convention falls back to unknown",
+      "weightLbs": 100,
+      "reps": 1,
+      "convention": "kilograms",
+      "expected": 100
+    }
+  ],
+  "setVolumeForLoad": [
+    {
+      "name": "total load is real tonnage",
+      "weightLbs": 100,
+      "reps": 10,
+      "convention": "total",
+      "expected": 1000
+    },
+    {
+      "name": "legacy row assumes pounds",
+      "weightLbs": 100,
+      "reps": 10,
+      "convention": "unknown",
+      "expected": 1000
+    },
+    {
+      "name": "per dumbbell has no defined tonnage",
+      "weightLbs": 40,
+      "reps": 10,
+      "convention": "per_dumbbell",
+      "expected": null
+    },
+    {
+      "name": "machine setting has no defined tonnage",
+      "weightLbs": 7,
+      "reps": 10,
+      "convention": "machine_setting",
+      "expected": null
+    },
+    {
+      "name": "assistance has no defined tonnage",
+      "weightLbs": 60,
+      "reps": 8,
+      "convention": "assistance",
+      "expected": null
+    },
+    {
+      "name": "bodyweight has no defined tonnage",
+      "weightLbs": 25,
+      "reps": 8,
+      "convention": "bodyweight",
+      "expected": null
+    }
+  ],
+  "structuredRepBounds": [
+    {
+      "name": "structured bounds win over unparseable display text",
+      "plan": {
+        "targetRepRange": "top set then back-offs",
+        "repBounds": {
+          "min": 6,
+          "max": 8
+        }
+      },
+      "expected": {
+        "min": 6,
+        "max": 8
+      },
+      "source": "structured"
+    },
+    {
+      "name": "explicit null means no machine-readable target",
+      "plan": {
+        "targetRepRange": "8-12",
+        "repBounds": null
+      },
+      "expected": null,
+      "source": "unparseable_text"
+    },
+    {
+      "name": "absent bounds fall back to parsing the text",
+      "plan": {
+        "targetRepRange": "8-12"
+      },
+      "expected": {
+        "min": 8,
+        "max": 12
+      },
+      "source": "parsed_text"
+    },
+    {
+      "name": "absent bounds and prose text",
+      "plan": {
+        "targetRepRange": "as many as feel good"
+      },
+      "expected": null,
+      "source": "unparseable_text"
+    },
+    {
+      "name": "no target at all",
+      "plan": {
+        "targetRepRange": ""
+      },
+      "expected": null,
+      "source": "missing"
+    },
+    {
+      "name": "malformed structured bounds fall back to the text",
+      "plan": {
+        "targetRepRange": "8-12",
+        "repBounds": {
+          "min": 0,
+          "max": 4
+        }
+      },
+      "expected": {
+        "min": 8,
+        "max": 12
+      },
+      "source": "parsed_text"
+    }
+  ],
+  "zeroLoad": [
+    {
+      "name": "bodyweight with no added load",
+      "weightLbs": 0,
+      "convention": "bodyweight",
+      "valid": true
+    },
+    {
+      "name": "unassisted rep on an assistance machine",
+      "weightLbs": 0,
+      "convention": "assistance",
+      "valid": true
+    },
+    {
+      "name": "total load cannot be zero",
+      "weightLbs": 0,
+      "convention": "total",
+      "valid": false
+    },
+    {
+      "name": "legacy row cannot be zero",
+      "weightLbs": 0,
+      "convention": "unknown",
+      "valid": false
+    },
+    {
+      "name": "per dumbbell cannot be zero",
+      "weightLbs": 0,
+      "convention": "per_dumbbell",
+      "valid": false
+    },
+    {
+      "name": "machine setting cannot be zero",
+      "weightLbs": 0,
+      "convention": "machine_setting",
+      "valid": false
+    },
+    {
+      "name": "negative is never valid",
+      "weightLbs": -5,
+      "convention": "bodyweight",
+      "valid": false
+    },
+    {
+      "name": "positive total load stays valid",
+      "weightLbs": 100,
+      "convention": "total",
+      "valid": true
+    },
+    {
+      "name": "positive added load stays valid",
+      "weightLbs": 25,
+      "convention": "bodyweight",
+      "valid": true
+    }
+  ]
+}

@@ -71,9 +71,15 @@ briefing design.
 ## Engineering highlights
 
 - **Offline and resilient:** route chunks and assets are precached, active
-  workouts survive reloads, failed completion snapshots retry after startup,
-  foregrounding, or reconnecting, and backup imports validate the complete graph
-  before replacing any local data.
+  workouts survive reloads, and backup imports validate the complete graph before
+  replacing any local data. A durable IndexedDB revision counter is advanced in
+  the same transaction as every trusted local change — including a correction to
+  a historical set — so the uploader knows the mirror is behind even when no
+  workout timestamp moved.
+- **Honest measurement:** exercises can record what their weight number means
+  (total, per dumbbell, machine setting, bodyweight, assistance). Legacy rows stay
+  unlabelled and are read exactly as before, tonnage is only summed where it is
+  defined, and one-rep-max estimates are omitted where they would be meaningless.
 - **Race-safe cloud writes:** snapshot compare-and-swap, reservation ownership,
   logout fencing, and exact receipt replay prevent duplicate or stale Coach
   actions.
@@ -131,6 +137,18 @@ the pinned deployment script:
 npx --yes wrangler@4.119.0 d1 migrations apply workout-tracker --remote
 npm run deploy
 ```
+
+`GET /api/cloud/version` reports the deployed backend so Settings can identify
+it. It reads two optional Pages environment variables — `DEPLOY_COMMIT` and
+`DEPLOY_ENVIRONMENT` — which are plain variables rather than secrets and can be
+set wherever the project configures Pages variables. Both are optional: values
+that are not a plain marker are dropped, and when neither is configured the
+endpoint returns `null` instead of guessing. Settings renders that as an explicit
+unavailable state.
+
+The built app's own commit is baked in at build time from `CF_PAGES_COMMIT_SHA`,
+`GITHUB_SHA`, or `git rev-parse`, and falls back to the same explicit
+unavailable state.
 
 ## Security, privacy, and scope
 

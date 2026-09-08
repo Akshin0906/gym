@@ -1,6 +1,9 @@
 import Dexie from 'dexie'
 import { db } from '../schema'
+import { deriveRepBounds, isValidRepBounds } from '../../lib/measurement'
+import { mutateLocalData } from './syncState'
 import type {
+  RepBounds,
   Program,
   ProgramRow,
   SessionTemplate,
@@ -75,12 +78,14 @@ export async function createProgram(name: string): Promise<string> {
   const trimmed = name.trim()
   if (!trimmed) throw new Error('Program name is required')
   const id = crypto.randomUUID()
-  await db.programs.add({
-    id,
-    name: trimmed,
-    isActive: 0,
-    createdAt: Date.now(),
-    archivedAt: null,
+  await mutateLocalData([db.programs], async () => {
+    await db.programs.add({
+      id,
+      name: trimmed,
+      isActive: 0,
+      createdAt: Date.now(),
+      archivedAt: null,
+    })
   })
   return id
 }
@@ -88,11 +93,13 @@ export async function createProgram(name: string): Promise<string> {
 export async function renameProgram(id: string, name: string): Promise<void> {
   const trimmed = name.trim()
   if (!trimmed) throw new Error('Program name is required')
-  await db.programs.update(id, { name: trimmed })
+  await mutateLocalData([db.programs], async () => {
+    await db.programs.update(id, { name: trimmed })
+  })
 }
 
 export async function setProgramActive(id: string): Promise<void> {
-  await db.transaction('rw', db.programs, async () => {
+  await mutateLocalData([db.programs], async () => {
     const target = await db.programs.get(id)
     if (!target) throw new Error('Program not found')
     if (target.archivedAt !== null) {
@@ -107,13 +114,14 @@ export async function setProgramActive(id: string): Promise<void> {
 }
 
 export async function archiveProgram(id: string): Promise<void> {
-  await db.programs.update(id, { isActive: 0, archivedAt: Date.now() })
+  await mutateLocalData([db.programs], async () => {
+    await db.programs.update(id, { isActive: 0, archivedAt: Date.now() })
+  })
 }
 
 export async function cloneProgram(sourceId: string): Promise<string> {
   const newId = crypto.randomUUID()
-  await db.transaction(
-    'rw',
+  await mutateLocalData(
     [db.programs, db.sessionTemplates, db.templateExercises],
     async () => {
       const source = await db.programs.get(sourceId)
@@ -174,7 +182,7 @@ export async function addSessionTemplate(
 ): Promise<string> {
   const trimmed = name.trim() || 'Session'
   const id = crypto.randomUUID()
-  await db.transaction('rw', db.sessionTemplates, async () => {
+  await mutateLocalData([db.sessionTemplates], async () => {
     const existing = await getSessionsForProgram(programId)
     const order = existing.length
     await db.sessionTemplates.add({ id, programId, name: trimmed, order })
@@ -188,12 +196,13 @@ export async function renameSessionTemplate(
 ): Promise<void> {
   const trimmed = name.trim()
   if (!trimmed) throw new Error('Session name is required')
-  await db.sessionTemplates.update(id, { name: trimmed })
+  await mutateLocalData([db.sessionTemplates], async () => {
+    await db.sessionTemplates.update(id, { name: trimmed })
+  })
 }
 
 export async function deleteSessionTemplate(id: string): Promise<void> {
-  await db.transaction(
-    'rw',
+  await mutateLocalData(
     [db.sessionTemplates, db.templateExercises, db.workoutSessions],
     async () => {
       const target = await db.sessionTemplates.get(id)
@@ -222,7 +231,7 @@ export async function moveSessionTemplate(
   id: string,
   direction: 'up' | 'down',
 ): Promise<void> {
-  await db.transaction('rw', db.sessionTemplates, async () => {
+  await mutateLocalData([db.sessionTemplates], async () => {
     const target = await db.sessionTemplates.get(id)
     if (!target) return
     await swapOrder(
@@ -251,10 +260,13 @@ export async function addTemplateExercise(args: {
   exerciseId: string
   targetSets: number
   targetRepRange: string
+  repBounds?: RepBounds | null
+  warmupSets?: number
 }): Promise<string> {
   assertValidTargetSets(args.targetSets)
+  const repBounds = resolveTemplateRepBounds(args.targetRepRange, args.repBounds)
   const id = crypto.randomUUID()
-  await db.transaction('rw', db.templateExercises, async () => {
+  await mutateLocalData([db.templateExercises], async () => {
     const existing = await getTemplateExercises(args.sessionTemplateId)
     await db.templateExercises.add({
       id,
@@ -263,21 +275,56 @@ export async function addTemplateExercise(args: {
       order: existing.length,
       targetSets: args.targetSets,
       targetRepRange: args.targetRepRange,
+      ...(repBounds !== undefined ? { repBounds } : {}),
+      ...(args.warmupSets !== undefined ? { warmupSets: args.warmupSets } : {}),
     })
   })
   return id
 }
 
+// Structured bounds follow the display text unless the caller states them.
+// Returning `undefined` (field omitted) for unparseable text keeps the row
+// legacy-shaped rather than pinning it to a guessed range.
+function resolveTemplateRepBounds(
+  targetRepRange: string,
+  explicit: RepBounds | null | undefined,
+): RepBounds | null | undefined {
+  if (explicit === undefined) return deriveRepBounds(targetRepRange)
+  if (explicit === null) return null
+  if (!isValidRepBounds(explicit)) {
+    throw new Error('Rep bounds must be whole numbers with min <= max')
+  }
+  return explicit
+}
+
 export async function updateTemplateExercise(
   id: string,
-  patch: { targetSets?: number; targetRepRange?: string },
+  patch: {
+    targetSets?: number
+    targetRepRange?: string
+    repBounds?: RepBounds | null
+    warmupSets?: number
+  },
 ): Promise<void> {
   if (patch.targetSets !== undefined) assertValidTargetSets(patch.targetSets)
-  await db.templateExercises.update(id, patch)
+  await mutateLocalData([db.templateExercises], async () => {
+    const current = await db.templateExercises.get(id)
+    if (!current) throw new Error('Template exercise not found')
+    const next = { ...current, ...patch }
+    if (patch.targetRepRange !== undefined || patch.repBounds !== undefined) {
+      const bounds = resolveTemplateRepBounds(
+        next.targetRepRange,
+        patch.repBounds !== undefined ? patch.repBounds : undefined,
+      )
+      if (bounds === undefined) delete next.repBounds
+      else next.repBounds = bounds
+    }
+    await db.templateExercises.put(next)
+  })
 }
 
 export async function deleteTemplateExercise(id: string): Promise<void> {
-  await db.transaction('rw', db.templateExercises, async () => {
+  await mutateLocalData([db.templateExercises], async () => {
     const target = await db.templateExercises.get(id)
     if (!target) return
     await db.templateExercises.delete(id)
@@ -292,7 +339,7 @@ export async function moveTemplateExercise(
   id: string,
   direction: 'up' | 'down',
 ): Promise<void> {
-  await db.transaction('rw', db.templateExercises, async () => {
+  await mutateLocalData([db.templateExercises], async () => {
     const target = await db.templateExercises.get(id)
     if (!target) return
     await swapOrder(

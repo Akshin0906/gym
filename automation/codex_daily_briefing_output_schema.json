@@ -7,7 +7,13 @@
     "briefing": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["headline", "mode", "sections"],
+      "required": [
+        "headline",
+        "mode",
+        "sections",
+        "supportingEvidenceIds",
+        "contradictingEvidenceIds"
+      ],
       "properties": {
         "headline": { "type": "string", "minLength": 1, "maxLength": 80 },
         "mode": {
@@ -53,6 +59,25 @@
                 "maxLength": 220
               }
             }
+          }
+        },
+        "supportingEvidenceIds": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 4,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 180
+          }
+        },
+        "contradictingEvidenceIds": {
+          "type": "array",
+          "maxItems": 2,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 180
           }
         }
       }

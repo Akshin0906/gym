@@ -18,6 +18,10 @@ type MemoryType = 'workout' | 'two_week' | 'four_month'
 interface Env {
   CLOUD_AUTOMATION_SECRET?: string
   WORKOUT_DB: D1Database
+  // Optional, set at deploy time (for example from CF_PAGES_COMMIT_SHA). When
+  // absent the version endpoint reports it as unavailable rather than guessing.
+  DEPLOY_COMMIT?: string
+  DEPLOY_ENVIRONMENT?: string
 }
 
 interface PagesContext {
@@ -524,6 +528,180 @@ function reservationConflict(code: string): Response {
   return json(409, { error: code })
 }
 
+const LOAD_CONVENTIONS = new Set([
+  'unknown',
+  'total',
+  'per_dumbbell',
+  'machine_setting',
+  'bodyweight',
+  'assistance',
+])
+
+// Zero is a real recorded value only where the number is an adjustment rather
+// than the load itself. Mirrors allowsZeroWeight in the app's sessions
+// repository; every other convention still requires a positive load.
+const ZERO_LOAD_CONVENTIONS = new Set(['bodyweight', 'assistance'])
+
+function assertLoadConvention(value: unknown, field: string): void {
+  if (value === undefined) return
+  if (typeof value !== 'string' || !LOAD_CONVENTIONS.has(value)) {
+    throw new Error(`${field} must be a known load convention`)
+  }
+}
+
+function assertRepBounds(value: unknown, field: string): void {
+  // Absent means "legacy row"; explicit null means "no machine-readable
+  // target". Both are valid, and neither is the same as a malformed object.
+  if (value === undefined || value === null) return
+  if (!isObject(value)) throw new Error(`${field} must be an object or null`)
+  const keys = Object.keys(value)
+  if (keys.length !== 2 || !keys.includes('min') || !keys.includes('max')) {
+    throw new Error(`${field} must have exactly min and max`)
+  }
+  const min = value.min
+  const max = value.max
+  if (
+    typeof min !== 'number' ||
+    typeof max !== 'number' ||
+    !Number.isSafeInteger(min) ||
+    !Number.isSafeInteger(max) ||
+    min < 1 ||
+    max < min ||
+    max > 1000
+  ) {
+    throw new Error(`${field} has invalid bounds`)
+  }
+}
+
+function assertWarmupSets(value: unknown, field: string): void {
+  if (value === undefined) return
+  if (
+    typeof value !== 'number' ||
+    !Number.isSafeInteger(value) ||
+    value < 0 ||
+    value > 100
+  ) {
+    throw new Error(`${field} must be a whole number from 0 to 100`)
+  }
+}
+
+// Focused validation of the measurement metadata the app now records.
+//
+// Deliberately narrow: only fields that are actually supplied are checked, so
+// every historical payload that predates them still validates unchanged. The
+// point is that supplied metadata is either correct or rejected — it is never
+// silently dropped, because the mirror stores the payload verbatim and the
+// supervisor reads these exact fields back out.
+function assertMeasurementMetadata(data: Record<string, unknown>): void {
+  const exercises = data.exercises as unknown[]
+  for (const [index, row] of exercises.entries()) {
+    if (!isObject(row)) continue
+    if (row.measurement === undefined) continue
+    if (!isObject(row.measurement)) {
+      throw new Error(`exercises[${index}].measurement must be an object`)
+    }
+    const keys = Object.keys(row.measurement)
+    if (keys.length !== 1 || keys[0] !== 'loadConvention') {
+      throw new Error(
+        `exercises[${index}].measurement must contain only loadConvention`,
+      )
+    }
+    assertLoadConvention(
+      row.measurement.loadConvention,
+      `exercises[${index}].measurement.loadConvention`,
+    )
+  }
+
+  const templateExercises = data.templateExercises as unknown[]
+  for (const [index, row] of templateExercises.entries()) {
+    if (!isObject(row)) continue
+    assertRepBounds(row.repBounds, `templateExercises[${index}].repBounds`)
+    assertWarmupSets(row.warmupSets, `templateExercises[${index}].warmupSets`)
+  }
+
+  const workoutSessions = data.workoutSessions as unknown[]
+  for (const [index, row] of workoutSessions.entries()) {
+    if (!isObject(row)) continue
+    const snapshot = row.exerciseSnapshot
+    if (snapshot !== undefined) {
+      if (!Array.isArray(snapshot)) {
+        throw new Error(`workoutSessions[${index}].exerciseSnapshot must be an array`)
+      }
+      for (const [position, item] of snapshot.entries()) {
+        if (!isObject(item)) continue
+        const field = `workoutSessions[${index}].exerciseSnapshot[${position}]`
+        assertRepBounds(item.repBounds, `${field}.repBounds`)
+        assertWarmupSets(item.warmupSets, `${field}.warmupSets`)
+        assertLoadConvention(item.loadConvention, `${field}.loadConvention`)
+      }
+    }
+    if (row.unfinishedWork !== undefined && row.unfinishedWork !== null) {
+      const note = row.unfinishedWork
+      if (!isObject(note)) {
+        throw new Error(`workoutSessions[${index}].unfinishedWork must be an object`)
+      }
+      if (note.version !== 1) {
+        throw new Error(
+          `workoutSessions[${index}].unfinishedWork has an unsupported version`,
+        )
+      }
+      if (
+        typeof note.reason !== 'string' ||
+        !UNFINISHED_WORK_REASONS.has(note.reason)
+      ) {
+        throw new Error(
+          `workoutSessions[${index}].unfinishedWork has an unknown reason`,
+        )
+      }
+      if (
+        typeof note.recordedAt !== 'number' ||
+        !Number.isSafeInteger(note.recordedAt) ||
+        note.recordedAt < 0
+      ) {
+        throw new Error(
+          `workoutSessions[${index}].unfinishedWork has an invalid recordedAt`,
+        )
+      }
+    }
+  }
+
+  const loggedSets = data.loggedSets as unknown[]
+  for (const [index, row] of loggedSets.entries()) {
+    if (!isObject(row)) continue
+    if (row.setKind !== undefined && row.setKind !== 'working' && row.setKind !== 'warmup') {
+      throw new Error(`loggedSets[${index}].setKind must be working or warmup`)
+    }
+    assertLoadConvention(row.loadConvention, `loggedSets[${index}].loadConvention`)
+    // Load values are checked against the row's own convention. A payload from
+    // before conventions existed resolves to `unknown` and keeps the original
+    // "greater than zero" rule, so legacy compatibility is unchanged.
+    if (row.weightLbs !== undefined) {
+      const weight = row.weightLbs
+      if (typeof weight !== 'number' || !Number.isFinite(weight)) {
+        throw new Error(`loggedSets[${index}].weightLbs must be a finite number`)
+      }
+      if (weight < 0) {
+        throw new Error(`loggedSets[${index}].weightLbs cannot be negative`)
+      }
+      const convention =
+        typeof row.loadConvention === 'string' ? row.loadConvention : 'unknown'
+      if (weight === 0 && !ZERO_LOAD_CONVENTIONS.has(convention)) {
+        throw new Error(
+          `loggedSets[${index}].weightLbs must be greater than 0 for ${convention}`,
+        )
+      }
+    }
+  }
+}
+
+const UNFINISHED_WORK_REASONS = new Set([
+  'time',
+  'equipment',
+  'deliberate_change',
+  'discomfort',
+  'not_recorded',
+])
+
 function assertExportPayload(raw: unknown): { schemaVersion: number } {
   if (!isObject(raw)) throw new Error('payload must be an object')
   if (typeof raw.schemaVersion !== 'number') {
@@ -543,6 +721,7 @@ function assertExportPayload(raw: unknown): { schemaVersion: number } {
       throw new Error(`${table} must be an array`)
     }
   }
+  assertMeasurementMetadata(raw.data)
   return { schemaVersion: raw.schemaVersion }
 }
 
@@ -1788,6 +1967,33 @@ async function handleAtomicPublish(
   throw new Error('atomic publish verification failed')
 }
 
+// Sanitized operational metadata only: a short commit marker and an
+// environment label, both optional deploy-time variables. No secrets, no file
+// system paths, no database contents, and nothing derived from the request.
+function sanitizedDeployMarker(value: string | undefined): string | null {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  // Commit shas and environment names only; anything else is dropped rather
+  // than echoed back to the client.
+  return /^[A-Za-z0-9._-]{1,64}$/.test(trimmed) ? trimmed : null
+}
+
+function handleGetVersion(env: Env): Response {
+  const commit = sanitizedDeployMarker(env.DEPLOY_COMMIT)
+  return json(200, {
+    // `null` is a first-class answer: the deployment simply did not record one.
+    commit: commit === null ? null : commit.slice(0, 40),
+    environment: sanitizedDeployMarker(env.DEPLOY_ENVIRONMENT),
+    apiContract: CLOUD_API_CONTRACT,
+    serverTime: Date.now(),
+  })
+}
+
+// Bumped when the client-visible cloud contract changes. Lets the app say
+// "backend is older than this build expects" instead of failing obscurely.
+const CLOUD_API_CONTRACT = 'cloud-v1'
+
 export const onRequest = async (ctx: PagesContext): Promise<Response> => {
   try {
     const path = routePath(ctx)
@@ -1812,6 +2018,9 @@ export const onRequest = async (ctx: PagesContext): Promise<Response> => {
       if (authError) return authError
     }
 
+    if (path === 'version' && method === 'GET') {
+      return handleGetVersion(ctx.env)
+    }
     if (path === 'snapshot' && method === 'GET') {
       return await handleGetSnapshot(ctx.env.WORKOUT_DB)
     }

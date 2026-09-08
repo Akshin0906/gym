@@ -1,8 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   buildExportPayload,
+  buildExportPayloadAtRevision,
   type ExportPayload,
 } from '../db/repositories/exportImport'
+import { listPendingCoachActionResults } from '../db/repositories/chatActions'
+import {
+  advanceAuthEpoch,
+  advanceAuthEpochIfCurrent,
+  clearAutoSyncBackoff,
+  getLocalSyncState,
+  isAutoSyncBackedOff,
+  readSyncFence,
+  recordSyncFailure,
+  recordSyncSuccess,
+} from '../db/repositories/syncState'
 import {
   getCloudSyncStatus,
   hasPendingCloudSnapshotSync,
@@ -14,6 +26,24 @@ import {
 
 vi.mock('../db/repositories/exportImport', () => ({
   buildExportPayload: vi.fn(),
+  buildExportPayloadAtRevision: vi.fn(),
+}))
+
+vi.mock('../db/repositories/chatActions', () => ({
+  listPendingCoachActionResults: vi.fn(),
+}))
+
+vi.mock('../db/repositories/syncState', () => ({
+  advanceAuthEpoch: vi.fn(),
+  advanceAuthEpochIfCurrent: vi.fn(),
+  clearAutoSyncBackoff: vi.fn(),
+  getLocalSyncState: vi.fn(),
+  isAutoSyncBackedOff: vi.fn(),
+  readSyncFence: vi.fn(),
+  recordSyncFailure: vi.fn(),
+  recordSyncSuccess: vi.fn(),
+  subscribeLocalMutations: vi.fn(() => () => {}),
+  subscribeLocalSyncState: vi.fn(() => () => {}),
 }))
 
 const AUTH_PAIRED_KEY = 'workout-tracker:cloudAuthPaired'
@@ -93,8 +123,25 @@ function deferred<T>(): {
   return { promise, resolve }
 }
 
+// The upload path captures the payload and the local revision together. Tests
+// drive `buildExportPayload` and this shim keeps the captured revision in step,
+// so revision bookkeeping is exercised rather than bypassed.
+function revisionFromPayload(payload: ExportPayload): number {
+  return payload.exportedAt
+}
+
 describe('cloud snapshot version CAS', () => {
   const mockedBuildExportPayload = vi.mocked(buildExportPayload)
+  const mockedBuildAtRevision = vi.mocked(buildExportPayloadAtRevision)
+  const mockedPendingCoachResults = vi.mocked(listPendingCoachActionResults)
+  const mockedGetLocalSyncState = vi.mocked(getLocalSyncState)
+  const mockedRecordSyncSuccess = vi.mocked(recordSyncSuccess)
+  const mockedRecordSyncFailure = vi.mocked(recordSyncFailure)
+  const mockedAdvanceAuthEpoch = vi.mocked(advanceAuthEpoch)
+  const mockedAdvanceAuthEpochIfCurrent = vi.mocked(advanceAuthEpochIfCurrent)
+  const mockedClearBackoff = vi.mocked(clearAutoSyncBackoff)
+  const mockedIsBackedOff = vi.mocked(isAutoSyncBackedOff)
+  const mockedReadSyncFence = vi.mocked(readSyncFence)
   let storage: TestStorage
 
   beforeEach(() => {
@@ -107,6 +154,62 @@ describe('cloud snapshot version CAS', () => {
       removeEventListener: vi.fn(),
     })
     mockedBuildExportPayload.mockReset()
+    mockedBuildAtRevision.mockReset()
+    mockedBuildAtRevision.mockImplementation(async () => {
+      const payload = await mockedBuildExportPayload()
+      return {
+        payload,
+        capturedRevision: revisionFromPayload(payload),
+        fence: { datasetEpoch: 0, authEpoch: 0 },
+      }
+    })
+    mockedPendingCoachResults.mockReset()
+    mockedPendingCoachResults.mockResolvedValue([])
+    mockedGetLocalSyncState.mockReset()
+    mockedGetLocalSyncState.mockResolvedValue({
+      id: 'local',
+      // 0/0 models a device upgraded from a build with no revision counter,
+      // which is exactly what the legacy recovery fallback exists for.
+      localRevision: 0,
+      syncedRevision: 0,
+      lastMutationAt: null,
+      lastSyncedAt: null,
+      lastSyncedCloudUpdatedAt: null,
+      lastSyncError: null,
+      failedAttempts: 0,
+      datasetEpoch: 0,
+      authEpoch: 0,
+      nextAutoAttemptAt: null,
+    })
+    mockedRecordSyncSuccess.mockReset()
+    mockedRecordSyncSuccess.mockResolvedValue({
+      applied: true,
+      state: {
+        id: 'local',
+        localRevision: 0,
+        syncedRevision: 0,
+        lastMutationAt: null,
+        lastSyncedAt: null,
+        lastSyncedCloudUpdatedAt: null,
+        lastSyncError: null,
+        failedAttempts: 0,
+        datasetEpoch: 0,
+        authEpoch: 0,
+        nextAutoAttemptAt: null,
+      },
+    })
+    mockedRecordSyncFailure.mockReset()
+    mockedRecordSyncFailure.mockResolvedValue(undefined)
+    mockedAdvanceAuthEpoch.mockReset()
+    mockedAdvanceAuthEpoch.mockResolvedValue(1)
+    mockedAdvanceAuthEpochIfCurrent.mockReset()
+    mockedAdvanceAuthEpochIfCurrent.mockResolvedValue(true)
+    mockedClearBackoff.mockReset()
+    mockedClearBackoff.mockResolvedValue(undefined)
+    mockedIsBackedOff.mockReset()
+    mockedIsBackedOff.mockResolvedValue(false)
+    mockedReadSyncFence.mockReset()
+    mockedReadSyncFence.mockResolvedValue({ datasetEpoch: 0, authEpoch: 0 })
   })
 
   afterEach(() => {

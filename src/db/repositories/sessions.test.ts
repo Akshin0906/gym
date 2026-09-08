@@ -567,8 +567,16 @@ describe('swapExerciseInSession', () => {
     await swapExerciseInSession('swap-empty', 'a', 'c')
 
     const updated = await db.workoutSessions.get('swap-empty')
+    // The replacement row freezes its measurement explicitly, including an
+    // explicit `unknown`, so a later exercise edit cannot reinterpret it.
     expect(updated?.exerciseSnapshot).toEqual([
-      { exerciseId: 'c', order: 0, targetSets: 4, targetRepRange: '6-8' },
+      {
+        exerciseId: 'c',
+        order: 0,
+        targetSets: 4,
+        targetRepRange: '6-8',
+        loadConvention: 'unknown',
+      },
       { exerciseId: 'b', order: 1, targetSets: 3, targetRepRange: '10-12' },
     ])
     expect(updated?.doneExerciseIds).toEqual([])
@@ -597,7 +605,13 @@ describe('swapExerciseInSession', () => {
     const updated = await db.workoutSessions.get('swap-worked')
     expect(updated?.exerciseSnapshot).toEqual([
       { exerciseId: 'a', order: 0, targetSets: 1, targetRepRange: '6-8' },
-      { exerciseId: 'c', order: 1, targetSets: 3, targetRepRange: '6-8' },
+      {
+        exerciseId: 'c',
+        order: 1,
+        targetSets: 3,
+        targetRepRange: '6-8',
+        loadConvention: 'unknown',
+      },
       { exerciseId: 'b', order: 2, targetSets: 3, targetRepRange: '10-12' },
     ])
     expect(updated?.doneExerciseIds).toEqual(['a'])
@@ -627,7 +641,13 @@ describe('swapExerciseInSession', () => {
 
     expect((await db.workoutSessions.get('swap-complete'))?.exerciseSnapshot).toEqual([
       { exerciseId: 'a', order: 0, targetSets: 2, targetRepRange: '8-10' },
-      { exerciseId: 'c', order: 1, targetSets: 0, targetRepRange: '8-10' },
+      {
+        exerciseId: 'c',
+        order: 1,
+        targetSets: 0,
+        targetRepRange: '8-10',
+        loadConvention: 'unknown',
+      },
     ])
   })
 

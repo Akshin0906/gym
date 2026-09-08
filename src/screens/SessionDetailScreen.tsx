@@ -1,19 +1,25 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router'
 import { Header } from '../components/Header'
+import { LoadFailure } from '../components/Feedback'
+import { SessionAttainmentCard } from '../components/SessionAttainmentCard'
 import { SetLogger } from '../components/SetLogger'
 import { getExercisesByIds } from '../db/repositories/exercises'
 import {
   deleteSession,
   getSession,
   getSetsForSession,
+  setUnfinishedWorkReason,
 } from '../db/repositories/sessions'
 import type {
   Exercise,
   LoggedSet,
+  UnfinishedWorkReason,
   WorkoutSession,
 } from '../db/types'
 import { relativeOrAbsolute } from '../lib/dates'
+import { resolveSnapshotLoadConvention } from '../lib/measurement'
+import { buildSessionAttainment } from '../lib/plannedVsPerformed'
 import { useActiveWorkout } from '../store/activeWorkout'
 import { useTimer } from '../store/timer'
 
@@ -26,30 +32,43 @@ export function SessionDetailScreen() {
   const [sets, setSets] = useState<LoggedSet[]>([])
   const [exMap, setExMap] = useState<Map<string, Exercise>>(new Map())
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     if (!sessionId) return
-    const s = await getSession(sessionId)
-    if (!s) {
-      navigate('/history')
-      return
+    setLoadError(null)
+    try {
+      const s = await getSession(sessionId)
+      if (!s) {
+        navigate('/history')
+        return
+      }
+      setSession(s)
+      const ls = await getSetsForSession(sessionId)
+      setSets(ls)
+      const exIds = Array.from(
+        new Set([
+          ...s.exerciseSnapshot.map((x) => x.exerciseId),
+          ...ls.map((x) => x.exerciseId),
+        ]),
+      )
+      setExMap(await getExercisesByIds(exIds))
+    } catch (err) {
+      // A rejected IndexedDB read used to leave a permanent "Loading…".
+      setLoadError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setLoading(false)
     }
-    setSession(s)
-    const ls = await getSetsForSession(sessionId)
-    setSets(ls)
-    const exIds = Array.from(
-      new Set([
-        ...s.exerciseSnapshot.map((x) => x.exerciseId),
-        ...ls.map((x) => x.exerciseId),
-      ]),
-    )
-    setExMap(await getExercisesByIds(exIds))
-    setLoading(false)
   }, [sessionId, navigate])
 
   useEffect(() => {
     void load()
   }, [load])
+
+  const attainment = useMemo(
+    () => (session ? buildSessionAttainment(session, sets, exMap) : null),
+    [session, sets, exMap],
+  )
 
   async function handleDelete() {
     if (!session) return
@@ -60,6 +79,27 @@ export function SessionDetailScreen() {
       setActiveSession(null)
     }
     navigate('/history')
+  }
+
+  async function recordReason(reason: UnfinishedWorkReason | null) {
+    if (!session) return
+    await setUnfinishedWorkReason(session.id, reason)
+    await load()
+  }
+
+  if (loadError) {
+    return (
+      <>
+        <Header title="Session" back="/history" />
+        <LoadFailure
+          message={`Could not load this session: ${loadError}`}
+          onRetry={() => {
+            setLoading(true)
+            void load()
+          }}
+        />
+      </>
+    )
   }
 
   if (loading || !session) {
@@ -107,6 +147,15 @@ export function SessionDetailScreen() {
         back="/history"
       />
       <div className="px-4 py-4 space-y-6">
+        {attainment && attainment.exercises.length > 0 && (
+          <SessionAttainmentCard
+            attainment={attainment}
+            unfinishedWork={session.unfinishedWork}
+            canRecordReason={session.completedAt !== null}
+            onSelectReason={recordReason}
+          />
+        )}
+
         {allExerciseIds.length === 0 ? (
           <p className="text-neutral-500 text-center py-4">
             No sets logged in this session.
@@ -127,6 +176,11 @@ export function SessionDetailScreen() {
                   existingSets={existing}
                   previousSets={[]}
                   defaultRestSeconds={ex.defaultRestSeconds}
+                  loadConvention={resolveSnapshotLoadConvention(
+                    session.exerciseSnapshot.find(
+                      (row) => row.exerciseId === ex.id,
+                    ),
+                  )}
                   onChange={() => void load()}
                 />
               </section>

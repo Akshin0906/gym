@@ -1,8 +1,13 @@
 import 'fake-indexeddb/auto'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { db } from '../schema'
-import type { Exercise, WorkoutSession } from '../types'
-import { buildLiveCoachContext } from '../../lib/chatContext'
+import type { Exercise, LoadConvention, WorkoutSession } from '../types'
+import {
+  buildLiveCoachContext,
+  hashActiveWorkoutActionState,
+  hashExerciseLibraryActionState,
+} from '../../lib/chatContext'
+import { logSet, recordPreWorkoutCheckIn } from './sessions'
 import {
   applyCoachActionPlan as applyCoachActionPlanToDb,
   getAppliedCoachActionResult,
@@ -454,6 +459,11 @@ describe('active workout Coach actions', () => {
         order: 0,
         targetSets: 2,
         targetRepRange: '12-15',
+        // Structured bounds derived from the new target, and the replacement
+        // exercise's own frozen measurement — neither inherited from the
+        // exercise that was swapped out.
+        repBounds: { min: 12, max: 15 },
+        loadConvention: 'unknown',
       },
       expect.objectContaining({ exerciseId: 'b', order: 1 }),
     ])
@@ -1803,5 +1813,307 @@ describe('AI-memory Coach actions', () => {
       }),
     ).rejects.toBeInstanceOf(StaleCoachActionError)
     expect(await db.aiNotes.count()).toBe(0)
+  })
+})
+
+describe('Coach actions and the measurement schema', () => {
+  function measuredExercise(
+    id: string,
+    convention: LoadConvention,
+    name = id,
+  ): Exercise {
+    return { ...exercise(id, name), measurement: { loadConvention: convention } }
+  }
+
+  beforeEach(async () => {
+    await Promise.all(db.tables.map((table) => table.clear()))
+  })
+
+  it('replaces stale structured bounds when the Coach changes a rep target', async () => {
+    // The bug: the row was spread and only targetRepRange replaced, so the old
+    // structured bounds survived — and structured bounds win over display text,
+    // silently overriding the target the Coach just asked for.
+    await db.exercises.bulkAdd([exercise('a'), exercise('b')])
+    await db.workoutSessions.add({
+      ...activeSession(),
+      exerciseSnapshot: [
+        {
+          exerciseId: 'a',
+          order: 0,
+          targetSets: 3,
+          targetRepRange: '8-10',
+          repBounds: { min: 8, max: 10 },
+        },
+        { exerciseId: 'b', order: 1, targetSets: 3, targetRepRange: '10-12' },
+      ],
+    })
+
+    await applyCoachActionPlan({
+      proposalId: 'p-targets',
+      rawPlan: plan({
+        type: 'update_active_exercise_targets',
+        sessionId: 'session',
+        exerciseId: 'a',
+        targetSets: 4,
+        repRange: '12-15',
+      }),
+      currentStateHash: HASH,
+      currentActionStateHashes: actionStateHashes(),
+    })
+
+    const row = (await db.workoutSessions.get('session'))?.exerciseSnapshot[0]
+    expect(row?.targetRepRange).toBe('12-15')
+    expect(row?.repBounds).toEqual({ min: 12, max: 15 })
+  })
+
+  it('drops structured bounds when the new target is not machine-readable', async () => {
+    await db.exercises.bulkAdd([exercise('a'), exercise('b')])
+    await db.workoutSessions.add({
+      ...activeSession(),
+      exerciseSnapshot: [
+        {
+          exerciseId: 'a',
+          order: 0,
+          targetSets: 3,
+          targetRepRange: '8-10',
+          repBounds: { min: 8, max: 10 },
+        },
+        { exerciseId: 'b', order: 1, targetSets: 3, targetRepRange: '10-12' },
+      ],
+    })
+
+    await applyCoachActionPlan({
+      proposalId: 'p-prose',
+      rawPlan: plan({
+        type: 'update_active_exercise_targets',
+        sessionId: 'session',
+        exerciseId: 'a',
+        targetSets: 3,
+        repRange: 'as many as feel strong',
+      }),
+      currentStateHash: HASH,
+      currentActionStateHashes: actionStateHashes(),
+    })
+
+    const row = (await db.workoutSessions.get('session'))?.exerciseSnapshot[0]
+    expect(row?.targetRepRange).toBe('as many as feel strong')
+    // Left over, the old 8-10 would have overridden the new prose target.
+    expect(row?.repBounds).toBeUndefined()
+  })
+
+  it('freezes the destination convention when swapping an unperformed exercise', async () => {
+    // The bug: the source row was spread and only exerciseId replaced, so the
+    // new exercise inherited the ORIGINAL exercise's measurement.
+    await db.exercises.bulkAdd([
+      measuredExercise('a', 'total'),
+      exercise('b'),
+      measuredExercise('c', 'assistance'),
+    ])
+    await db.workoutSessions.add({
+      ...activeSession(),
+      exerciseSnapshot: [
+        {
+          exerciseId: 'a',
+          order: 0,
+          targetSets: 3,
+          targetRepRange: '8-10',
+          repBounds: { min: 8, max: 10 },
+          loadConvention: 'total',
+        },
+        { exerciseId: 'b', order: 1, targetSets: 3, targetRepRange: '10-12' },
+      ],
+    })
+
+    await applyCoachActionPlan({
+      proposalId: 'p-swap',
+      rawPlan: plan({
+        type: 'swap_active_exercise',
+        sessionId: 'session',
+        fromExerciseId: 'a',
+        toExerciseId: 'c',
+        targetSets: 3,
+        repRange: '6-8',
+      }),
+      currentStateHash: HASH,
+      currentActionStateHashes: actionStateHashes(),
+    })
+
+    const row = (await db.workoutSessions.get('session'))?.exerciseSnapshot[0]
+    expect(row?.exerciseId).toBe('c')
+    expect(row?.loadConvention).toBe('assistance')
+    expect(row?.repBounds).toEqual({ min: 6, max: 8 })
+  })
+
+  it('keeps the performed row untouched and freezes only the replacement', async () => {
+    await db.exercises.bulkAdd([
+      measuredExercise('a', 'total'),
+      exercise('b'),
+      measuredExercise('c', 'per_dumbbell'),
+    ])
+    await db.workoutSessions.add({
+      ...activeSession(),
+      exerciseSnapshot: [
+        {
+          exerciseId: 'a',
+          order: 0,
+          targetSets: 3,
+          targetRepRange: '8-10',
+          loadConvention: 'total',
+        },
+        { exerciseId: 'b', order: 1, targetSets: 3, targetRepRange: '10-12' },
+      ],
+    })
+    await db.loggedSets.add({
+      id: 'performed',
+      workoutSessionId: 'session',
+      exerciseId: 'a',
+      setNumber: 1,
+      weightLbs: 100,
+      reps: 8,
+      rpe: null,
+      loggedAt: 5,
+      loadConvention: 'total',
+    })
+
+    await applyCoachActionPlan({
+      proposalId: 'p-swap-worked',
+      rawPlan: plan({
+        type: 'swap_active_exercise',
+        sessionId: 'session',
+        fromExerciseId: 'a',
+        toExerciseId: 'c',
+        targetSets: 2,
+        repRange: '10-12',
+      }),
+      currentStateHash: HASH,
+      currentActionStateHashes: actionStateHashes(),
+    })
+
+    const snapshot = (await db.workoutSessions.get('session'))?.exerciseSnapshot
+    // Historical row keeps its original measurement and target.
+    expect(snapshot?.[0]).toMatchObject({
+      exerciseId: 'a',
+      loadConvention: 'total',
+      targetRepRange: '8-10',
+    })
+    expect(snapshot?.[1]).toMatchObject({
+      exerciseId: 'c',
+      loadConvention: 'per_dumbbell',
+      repBounds: { min: 10, max: 12 },
+    })
+  })
+
+  it('freezes a convention when the Coach adds an exercise mid-workout', async () => {
+    await db.exercises.bulkAdd([
+      exercise('a'),
+      exercise('b'),
+      measuredExercise('c', 'bodyweight'),
+    ])
+    await db.workoutSessions.add(activeSession())
+
+    await applyCoachActionPlan({
+      proposalId: 'p-add',
+      rawPlan: plan({
+        type: 'add_active_exercise',
+        sessionId: 'session',
+        exerciseId: 'c',
+        position: 0,
+        targetSets: 3,
+        repRange: '8-12',
+      }),
+      currentStateHash: HASH,
+      currentActionStateHashes: actionStateHashes(),
+    })
+
+    const row = (await db.workoutSessions.get('session'))?.exerciseSnapshot[0]
+    expect(row?.exerciseId).toBe('c')
+    expect(row?.loadConvention).toBe('bodyweight')
+
+    // The whole point: a bodyweight plan must accept a zero added load.
+    await expect(
+      logSet({
+        sessionId: 'session',
+        exerciseId: 'c',
+        weightLbs: 0,
+        reps: 10,
+        rpe: null,
+      }),
+    ).resolves.toMatchObject({ setNumber: 1 })
+    expect((await db.loggedSets.toArray())[0]).toMatchObject({
+      weightLbs: 0,
+      loadConvention: 'bodyweight',
+    })
+  })
+
+  it('freezes conventions for a one-time workout the Coach creates', async () => {
+    await db.exercises.bulkAdd([
+      measuredExercise('a', 'assistance'),
+      measuredExercise('b', 'machine_setting'),
+    ])
+
+    const result = await applyCoachActionPlan({
+      proposalId: 'p-one-time',
+      rawPlan: plan(
+        {
+          type: 'create_one_time_workout',
+          name: 'Quick pull',
+          exercises: [
+            { exerciseId: 'a', targetSets: 3, repRange: '6-8' },
+            { exerciseId: 'b', targetSets: 3, repRange: 'to failure' },
+          ],
+        },
+        'one_time_workout',
+      ),
+      currentStateHash: HASH,
+      currentActionStateHashes: actionStateHashes(),
+    })
+
+    const session = await db.workoutSessions.get(result.activeSessionId!)
+    expect(session?.exerciseSnapshot[0]).toMatchObject({
+      exerciseId: 'a',
+      loadConvention: 'assistance',
+      repBounds: { min: 6, max: 8 },
+    })
+    expect(session?.exerciseSnapshot[1]).toMatchObject({
+      exerciseId: 'b',
+      loadConvention: 'machine_setting',
+    })
+    expect(session?.exerciseSnapshot[1].repBounds).toBeUndefined()
+
+    // Assistance accepts an unassisted (zero) rep.
+    await recordPreWorkoutCheckIn(session!.id, 7)
+    await expect(
+      logSet({
+        sessionId: session!.id,
+        exerciseId: 'a',
+        weightLbs: 0,
+        reps: 6,
+        rpe: null,
+      }),
+    ).resolves.toMatchObject({ setNumber: 1 })
+  })
+
+  it('makes a plan stale when the exercise measurement changed underneath it', async () => {
+    // A plan proposed while an exercise was total-load means something
+    // different once it is assistance, so the action-state hash must move.
+    const before = await hashExerciseLibraryActionState([
+      measuredExercise('a', 'total'),
+    ])
+    const after = await hashExerciseLibraryActionState([
+      measuredExercise('a', 'assistance'),
+    ])
+    expect(before).not.toBe(after)
+
+    const activeBefore = await hashActiveWorkoutActionState({
+      exercises: [measuredExercise('a', 'total')],
+      inProgress: [],
+      loggedSets: [],
+    })
+    const activeAfter = await hashActiveWorkoutActionState({
+      exercises: [measuredExercise('a', 'assistance')],
+      inProgress: [],
+      loggedSets: [],
+    })
+    expect(activeBefore).not.toBe(activeAfter)
   })
 })

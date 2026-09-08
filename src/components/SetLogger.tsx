@@ -7,7 +7,14 @@ import {
   updateSet,
 } from '../db/repositories/sessions'
 import { vibrate } from '../lib/audio'
-import type { LoggedSet } from '../db/types'
+import {
+  LOAD_CONVENTION_SHORT_LABELS,
+  allowsZeroLoad,
+  loadConventionsComparable,
+  resolveSetLoadConvention,
+  setKindOf,
+} from '../lib/measurement'
+import type { LoadConvention, LoggedSet } from '../db/types'
 import { Toast, type ToastNotice } from './Feedback'
 
 interface Props {
@@ -16,6 +23,10 @@ interface Props {
   existingSets: LoggedSet[]
   previousSets: LoggedSet[]
   defaultRestSeconds: number
+  // What the weight number means for this exercise in this session, frozen at
+  // session start. Drives the field label so an assistance or bodyweight set is
+  // never labelled as if it were total load.
+  loadConvention?: LoadConvention
   onChange: () => void
   onStartRest?: (seconds: number, loggedSetCount: number) => void
   onDraftChange?: (draftId: string, dirty: boolean) => void
@@ -37,6 +48,7 @@ export function SetLogger({
   existingSets,
   previousSets,
   defaultRestSeconds,
+  loadConvention = 'unknown',
   onChange,
   onStartRest,
   onDraftChange,
@@ -45,6 +57,15 @@ export function SetLogger({
   const [undo, setUndo] = useState<{ notice: ToastNotice; set: LoggedSet } | null>(
     null,
   )
+
+  // Only pre-fill from a prior session whose sets measured the same thing.
+  // Carrying "60" across from an assistance machine into a total-load exercise
+  // would seed a plausible-looking but wrong number.
+  const previousComparable =
+    previousSets.length === 0 ||
+    previousSets.every((set) =>
+      loadConventionsComparable(resolveSetLoadConvention(set), loadConvention),
+    )
 
   const handleDelete = useCallback(
     async (set: LoggedSet) => {
@@ -68,6 +89,7 @@ export function SetLogger({
         <div className="px-3 py-2 rounded-lg bg-[var(--color-surface)] border border-[var(--color-border)]">
           <div className="text-[10px] font-bold uppercase tracking-widest text-[var(--color-fg-faint)]">
             Last session
+            {!previousComparable && ' · different measurement'}
           </div>
           <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-sm nums text-[var(--color-fg-dim)]">
             {previousSets.map((s) => (
@@ -75,7 +97,11 @@ export function SetLogger({
                 <span className="text-[var(--color-fg)] font-semibold">
                   {s.weightLbs}
                 </span>
-                <span className="text-[var(--color-fg-faint)]">×</span>
+                <span className="text-[var(--color-fg-faint)]">
+                  {' '}
+                  {LOAD_CONVENTION_SHORT_LABELS[resolveSetLoadConvention(s)]}
+                </span>
+                <span className="text-[var(--color-fg-faint)]"> × </span>
                 <span className="text-[var(--color-fg)] font-semibold">
                   {s.reps}
                 </span>
@@ -85,6 +111,12 @@ export function SetLogger({
               </span>
             ))}
           </div>
+          {!previousComparable && (
+            <p className="mt-1 text-[11px] text-[var(--color-fg-faint)]">
+              Recorded under a different load measurement, so these numbers are
+              shown for reference only and are not pre-filled.
+            </p>
+          )}
         </div>
       )}
 
@@ -110,8 +142,12 @@ export function SetLogger({
             ? Math.max(...existingSets.map((s) => s.setNumber)) + 1
             : 1
         }
-        previousSet={existingSets.at(-1) ?? previousSets.at(-1) ?? null}
+        previousSet={
+          existingSets.at(-1) ??
+          (previousComparable ? (previousSets.at(-1) ?? null) : null)
+        }
         defaultRestSeconds={defaultRestSeconds}
+        loadConvention={loadConvention}
         onLogged={() => {
           onChange()
         }}
@@ -152,12 +188,22 @@ function SetRow({
   const [w, setW] = useState(String(set.weightLbs))
   const [r, setR] = useState(String(set.reps))
   const [rpe, setRpe] = useState(set.rpe === null ? '' : String(set.rpe))
+  const [warmup, setWarmup] = useState(setKindOf(set) === 'warmup')
   const [error, setError] = useState<string | null>(null)
+  // This row's OWN frozen measurement, not the session's current plan: an
+  // existing set is edited under the units it was recorded with, so the label,
+  // the placeholder, and whether 0 is accepted all follow the row itself.
+  const editConvention = resolveSetLoadConvention(set)
   const editDirty =
     editing &&
     (w !== String(set.weightLbs) ||
       r !== String(set.reps) ||
-      rpe !== (set.rpe === null ? '' : String(set.rpe)))
+      rpe !== (set.rpe === null ? '' : String(set.rpe)) ||
+      warmup !== (setKindOf(set) === 'warmup'))
+
+  useEffect(() => {
+    if (!editing) setWarmup(setKindOf(set) === 'warmup')
+  }, [editing, set])
 
   useEffect(() => {
     const draftId = `edit:${set.id}`
@@ -211,6 +257,9 @@ function SetRow({
         weightLbs: Number(w),
         reps: Number(r),
         rpe: rpe === '' ? null : Number(rpe),
+        // Always written on save, so an unclassified legacy row becomes an
+        // explicit working set once the athlete has looked at it.
+        setKind: warmup ? 'warmup' : 'working',
       })
       setEditing(false)
       setError(null)
@@ -228,8 +277,9 @@ function SetRow({
           <NumField
             value={w}
             setValue={setW}
-            placeholder="lb"
-            ariaLabel="Weight in pounds"
+            placeholder={LOAD_CONVENTION_SHORT_LABELS[editConvention]}
+            ariaLabel={weightFieldLabel(editConvention)}
+            allowZero={allowsZeroLoad(editConvention)}
           />
           <span className="text-[var(--color-fg-faint)]">×</span>
           <NumField
@@ -246,6 +296,15 @@ function SetRow({
             optional
           />
         </div>
+        <label className="flex items-center gap-2 px-1 text-xs text-[var(--color-fg-dim)] cursor-pointer">
+          <input
+            type="checkbox"
+            checked={warmup}
+            onChange={(e) => setWarmup(e.target.checked)}
+            className="w-4 h-4 accent-[var(--color-accent)] cursor-pointer"
+          />
+          Warm-up set (excluded from target attainment)
+        </label>
         {error && <p className="text-xs text-red-400 px-1">{error}</p>}
         <div className="flex gap-2">
           <button
@@ -322,6 +381,17 @@ function SetRow({
               @{set.rpe}
             </span>
           )}
+          {setKindOf(set) === 'warmup' && (
+            <span
+              className="ml-2 align-middle rounded-full border px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider"
+              style={{
+                color: 'var(--color-fg-faint)',
+                borderColor: 'var(--color-border)',
+              }}
+            >
+              Warm-up
+            </span>
+          )}
         </div>
         <button
           type="button"
@@ -356,6 +426,7 @@ function NewSetRow({
   nextSetNumber,
   previousSet,
   defaultRestSeconds,
+  loadConvention,
   onLogged,
   onStartRest,
   onDraftChange,
@@ -365,6 +436,7 @@ function NewSetRow({
   nextSetNumber: number
   previousSet: LoggedSet | null
   defaultRestSeconds: number
+  loadConvention: LoadConvention
   onLogged: () => void
   onStartRest?: (seconds: number, loggedSetCount: number) => void
   onDraftChange?: (draftId: string, dirty: boolean) => void
@@ -372,6 +444,7 @@ function NewSetRow({
   const [w, setW] = useState(previousSet ? String(previousSet.weightLbs) : '')
   const [r, setR] = useState(previousSet ? String(previousSet.reps) : '')
   const [rpe, setRpe] = useState('')
+  const [warmup, setWarmup] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const committedSetCountRef = useRef(nextSetNumber - 1)
@@ -399,12 +472,16 @@ function NewSetRow({
         weightLbs: Number(w),
         reps: Number(r),
         rpe: rpe === '' ? null : Number(rpe),
+        // Only recorded when the athlete says so. Leaving it off keeps the row
+        // unclassified rather than asserting it was a working set.
+        ...(warmup ? { setKind: 'warmup' as const } : {}),
       })
       // Light tactile confirmation that the set committed — the most frequent
       // in-gym action, otherwise silent.
       vibrate(10)
       committedDraftRef.current = { w, r, rpe: '' }
       setRpe('')
+      setWarmup(false)
       // Update synchronously before the IndexedDB refresh/rerender. A fast tap
       // on Start Rest must see the just-committed final set.
       committedSetCountRef.current = result.setNumber
@@ -431,8 +508,9 @@ function NewSetRow({
         <NumField
           value={w}
           setValue={setW}
-          placeholder="lb"
-          ariaLabel="Weight in pounds"
+          placeholder={LOAD_CONVENTION_SHORT_LABELS[loadConvention]}
+          ariaLabel={weightFieldLabel(loadConvention)}
+          allowZero={allowsZeroLoad(loadConvention)}
         />
         <span className="text-[var(--color-fg-faint)]">×</span>
         <NumField
@@ -449,6 +527,15 @@ function NewSetRow({
           optional
         />
       </div>
+      <label className="flex items-center gap-2 px-1 text-xs text-[var(--color-fg-dim)] cursor-pointer">
+        <input
+          type="checkbox"
+          checked={warmup}
+          onChange={(e) => setWarmup(e.target.checked)}
+          className="w-4 h-4 accent-[var(--color-accent)] cursor-pointer"
+        />
+        Log as warm-up set (excluded from target attainment)
+      </label>
       {error && <p className="text-xs text-red-400 px-1">{error}</p>}
       <div className="flex gap-2">
         <button
@@ -487,23 +574,45 @@ export function isNewSetDraftDirty(
   )
 }
 
+// Names the number honestly. "Weight in pounds" is wrong for an assistance
+// machine or a bodyweight movement, and the label is what a screen reader says.
+export function weightFieldLabel(convention: LoadConvention): string {
+  switch (convention) {
+    case 'per_dumbbell':
+      return 'Weight per dumbbell in pounds'
+    case 'machine_setting':
+      return 'Machine setting'
+    case 'bodyweight':
+      return 'Added weight in pounds'
+    case 'assistance':
+      return 'Assistance weight in pounds'
+    default:
+      return 'Weight in pounds'
+  }
+}
+
 function NumField({
   value,
   setValue,
   placeholder,
   ariaLabel,
   optional,
+  allowZero,
 }: {
   value: string
   setValue: (s: string) => void
   placeholder: string
   ariaLabel: string
   optional?: boolean
+  // Bodyweight with no added load, and an unassisted rep on an assistance
+  // machine, are both legitimately 0.
+  allowZero?: boolean
 }) {
   return (
     <input
       type="number"
       inputMode="decimal"
+      min={allowZero ? 0 : undefined}
       value={value}
       onChange={(e) => setValue(e.target.value)}
       placeholder={placeholder}

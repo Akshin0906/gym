@@ -1,6 +1,6 @@
 import 'fake-indexeddb/auto'
 import { beforeEach, describe, expect, it } from 'vitest'
-import { db } from './schema'
+import { db, LOCAL_ONLY_TABLE_NAMES } from './schema'
 import {
   assertExportTableCoverage,
   buildExportPayload,
@@ -134,12 +134,22 @@ async function clearAll() {
 beforeEach(clearAll)
 
 describe('export/import round-trip', () => {
-  it('includes every Dexie table in the export payload', async () => {
+  it('includes every trusted Dexie table in the export payload', async () => {
     const payload = await buildExportPayload()
     const exportedTables = Object.keys(payload.data)
     for (const table of db.tables) {
+      if (LOCAL_ONLY_TABLE_NAMES.has(table.name)) continue
       expect(exportedTables).toContain(table.name)
     }
+  })
+
+  it('keeps device-local sync bookkeeping out of the export payload', async () => {
+    const payload = await buildExportPayload()
+    for (const name of LOCAL_ONLY_TABLE_NAMES) {
+      expect(Object.keys(payload.data)).not.toContain(name)
+    }
+    // The exclusion must be deliberate, not an accident of an empty table.
+    expect(LOCAL_ONLY_TABLE_NAMES.has('syncState')).toBe(true)
   })
 
   it('throws when a Dexie table is not wired into the export payload', () => {
@@ -557,7 +567,11 @@ describe('export/import round-trip', () => {
     await expect(importPayload(JSON.stringify(payload))).rejects.toThrow(
       'Import table "chatActionReceipts" is malformed',
     )
-    expect(await db.exercises.toArray()).toEqual([exercise('keep')])
+    expect(await db.exercises.toArray()).toEqual([
+      // `normalizedName` is derived by the Dexie hook on write; it is not part
+      // of the payload, and its presence is what proves the row is untouched.
+      { ...exercise('keep'), normalizedName: 'keep' },
+    ])
   })
 
   it('rejects a Coach receipt whose row metadata does not match its result', async () => {
@@ -571,7 +585,11 @@ describe('export/import round-trip', () => {
     await expect(importPayload(JSON.stringify(payload))).rejects.toThrow(
       'Import table "chatActionReceipts" is malformed',
     )
-    expect(await db.exercises.toArray()).toEqual([exercise('keep')])
+    expect(await db.exercises.toArray()).toEqual([
+      // `normalizedName` is derived by the Dexie hook on write; it is not part
+      // of the payload, and its presence is what proves the row is untouched.
+      { ...exercise('keep'), normalizedName: 'keep' },
+    ])
   })
 })
 

@@ -1916,6 +1916,261 @@ describe('cloud logout reservation fence', () => {
   })
 })
 
+describe('snapshot measurement metadata validation', () => {
+  function payload(overrides: Record<string, unknown> = {}) {
+    return {
+      schemaVersion: 4,
+      exportedAt: 1,
+      appVersion: 'test',
+      data: {
+        exercises: [],
+        programs: [],
+        sessionTemplates: [],
+        templateExercises: [],
+        workoutSessions: [],
+        loggedSets: [],
+        ...overrides,
+      },
+    }
+  }
+
+  async function put(body: Record<string, unknown>) {
+    const database = new SnapshotFenceDb(await sha256Hex('snapshot-token'))
+    const response = await snapshotFenceRequest(database, {}, body)
+    return { response, database }
+  }
+
+  it('accepts and stores valid measurement metadata verbatim', async () => {
+    const body = payload({
+      exercises: [
+        { id: 'e1', name: 'Dip', measurement: { loadConvention: 'assistance' } },
+      ],
+      templateExercises: [
+        {
+          id: 't1',
+          targetRepRange: '8-12',
+          repBounds: { min: 8, max: 12 },
+          warmupSets: 2,
+        },
+      ],
+      workoutSessions: [
+        {
+          id: 'w1',
+          exerciseSnapshot: [
+            {
+              exerciseId: 'e1',
+              repBounds: null,
+              warmupSets: 0,
+              loadConvention: 'bodyweight',
+            },
+          ],
+          unfinishedWork: { version: 1, reason: 'time', recordedAt: 5 },
+        },
+      ],
+      loggedSets: [
+        {
+          id: 's1',
+          weightLbs: 0,
+          setKind: 'warmup',
+          loadConvention: 'bodyweight',
+        },
+        { id: 's2', weightLbs: 0, loadConvention: 'assistance' },
+        { id: 's3', weightLbs: 100, loadConvention: 'total' },
+        { id: 's4', weightLbs: 100 },
+      ],
+    })
+
+    const { response, database } = await put(body)
+
+    expect(response.status).toBe(200)
+    expect(database.snapshotWrites).toBe(1)
+    // Stored verbatim — no field is stripped on the way through, because the
+    // supervisor reads these exact fields back out of the mirror.
+    expect(JSON.parse(database.snapshot?.payload_json ?? 'null')).toEqual(body)
+  })
+
+  it('still accepts a legacy payload with no measurement metadata', async () => {
+    const { response } = await put(
+      payload({
+        exercises: [{ id: 'e1', name: 'Row' }],
+        loggedSets: [{ id: 's1', weightLbs: 100, reps: 8 }],
+      }),
+    )
+    expect(response.status).toBe(200)
+  })
+
+  const rejected: Array<[string, Record<string, unknown>]> = [
+    [
+      'an unknown load convention on a set',
+      { loggedSets: [{ id: 's1', weightLbs: 10, loadConvention: 'kilograms' }] },
+    ],
+    [
+      'an unknown set kind',
+      { loggedSets: [{ id: 's1', weightLbs: 10, setKind: 'backoff' }] },
+    ],
+    [
+      'a zero load for a total-load set',
+      { loggedSets: [{ id: 's1', weightLbs: 0, loadConvention: 'total' }] },
+    ],
+    [
+      'a zero load for a legacy set with no convention',
+      { loggedSets: [{ id: 's1', weightLbs: 0 }] },
+    ],
+    [
+      'a negative load even for bodyweight',
+      { loggedSets: [{ id: 's1', weightLbs: -1, loadConvention: 'bodyweight' }] },
+    ],
+    [
+      'inverted rep bounds on a template',
+      {
+        templateExercises: [
+          { id: 't1', targetRepRange: '8-12', repBounds: { min: 12, max: 8 } },
+        ],
+      },
+    ],
+    [
+      'rep bounds carrying extra fields',
+      {
+        templateExercises: [
+          {
+            id: 't1',
+            targetRepRange: '8-12',
+            repBounds: { min: 8, max: 12, step: 1 },
+          },
+        ],
+      },
+    ],
+    [
+      'negative warm-up sets',
+      { templateExercises: [{ id: 't1', targetRepRange: '8-12', warmupSets: -1 }] },
+    ],
+    [
+      'an unknown convention on a session snapshot row',
+      {
+        workoutSessions: [
+          {
+            id: 'w1',
+            exerciseSnapshot: [{ exerciseId: 'e1', loadConvention: 'stones' }],
+          },
+        ],
+      },
+    ],
+    [
+      'an exercise measurement with an unexpected field',
+      {
+        exercises: [
+          {
+            id: 'e1',
+            name: 'Row',
+            measurement: { loadConvention: 'total', unit: 'kg' },
+          },
+        ],
+      },
+    ],
+    [
+      'an unknown unfinished-work reason',
+      {
+        workoutSessions: [
+          {
+            id: 'w1',
+            unfinishedWork: { version: 1, reason: 'bored', recordedAt: 5 },
+          },
+        ],
+      },
+    ],
+  ]
+
+  for (const [name, overrides] of rejected) {
+    it(`rejects ${name}`, async () => {
+      const { response, database } = await put(payload(overrides))
+      expect(response.status).toBe(400)
+      expect(await response.json()).toMatchObject({ error: 'invalid_snapshot' })
+      // Nothing malformed reaches the mirror.
+      expect(database.snapshotWrites).toBe(0)
+    })
+  }
+})
+
+describe('deploy version endpoint', () => {
+  // The automation secret is a valid read credential for /api/cloud/* routes,
+  // so it exercises the route without needing a paired device session.
+  function versionRequest(): Request {
+    return new Request('https://gym.test/api/cloud/version', {
+      headers: { 'X-Cloud-Automation-Secret': 'test-secret' },
+    })
+  }
+
+  // The route never touches D1, but the shared auth guard requires a binding to
+  // be present, so supply one that would fail loudly if it were used.
+  const unusedDb = {
+    prepare() {
+      throw new Error('the version route must not query D1')
+    },
+  } as unknown as D1Database
+
+  async function readVersion(env: Record<string, unknown>) {
+    const response = await cloudOnRequest({
+      request: versionRequest(),
+      env: {
+        WORKOUT_DB: unusedDb,
+        CLOUD_AUTOMATION_SECRET: 'test-secret',
+        ...env,
+      },
+      params: { path: 'version' },
+    })
+    return { response, body: (await response.json()) as Record<string, unknown> }
+  }
+
+  it('reports the configured deploy markers', async () => {
+    const { response, body } = await readVersion({
+      DEPLOY_COMMIT: 'a1b2c3d4e5f6',
+      DEPLOY_ENVIRONMENT: 'production',
+    })
+
+    expect(response.status).toBe(200)
+    expect(body.commit).toBe('a1b2c3d4e5f6')
+    expect(body.environment).toBe('production')
+    expect(body.apiContract).toBe('cloud-v1')
+    expect(typeof body.serverTime).toBe('number')
+  })
+
+  it('reports null rather than inventing a version when none is configured', async () => {
+    const { response, body } = await readVersion({})
+
+    expect(response.status).toBe(200)
+    expect(body.commit).toBeNull()
+    expect(body.environment).toBeNull()
+    expect(body.apiContract).toBe('cloud-v1')
+  })
+
+  it('never echoes a value that is not a plain deploy marker', async () => {
+    const { body } = await readVersion({
+      DEPLOY_COMMIT: '/opt/secrets/deploy key',
+      DEPLOY_ENVIRONMENT: 'prod\nSECRET=1',
+    })
+
+    expect(body.commit).toBeNull()
+    expect(body.environment).toBeNull()
+  })
+
+  it('requires authentication like every other read route', async () => {
+    const response = await cloudOnRequest({
+      request: new Request('https://gym.test/api/cloud/version'),
+      env: {
+        WORKOUT_DB: {
+          prepare: () => ({
+            bind: () => ({ first: async () => null }),
+          }),
+        } as unknown as D1Database,
+        CLOUD_AUTOMATION_SECRET: 'test-secret',
+      },
+      params: { path: 'version' },
+    })
+
+    expect(response.status).toBe(401)
+  })
+})
+
 describe('snapshot byte limiting', () => {
   function streamedRequest(body: string): Request {
     const bytes = new TextEncoder().encode(body)

@@ -150,6 +150,7 @@ describe('CoachActionCard lifecycle previews', () => {
               order: 0,
               targetSets: 3,
               repRange: '8-12',
+              planSource: 'frozen_session' as const,
               done: false,
               sets: [],
             },

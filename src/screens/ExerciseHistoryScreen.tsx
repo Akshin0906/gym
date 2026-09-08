@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
 import { ArrowDown, ArrowUp, ChevronRight } from 'lucide-react'
 import { Link, useParams } from 'react-router'
+import { ComparableProgressionCard } from '../components/ComparableProgressionCard'
+import { LoadFailure } from '../components/Feedback'
 import { Header } from '../components/Header'
 import { getExercise } from '../db/repositories/exercises'
 import {
@@ -9,6 +11,8 @@ import {
 } from '../db/repositories/sessions'
 import type { Exercise, LoggedSet, WorkoutSession } from '../db/types'
 import { relativeOrAbsolute } from '../lib/dates'
+import { LOAD_CONVENTION_SHORT_LABELS } from '../lib/measurement'
+import { buildComparableProgression } from '../lib/plannedVsPerformed'
 
 interface HistoryGroup {
   session: WorkoutSession | null
@@ -22,6 +26,8 @@ export function ExerciseHistoryScreen() {
   const [groups, setGroups] = useState<HistoryGroup[] | null>(null)
   const [notFound, setNotFound] = useState(false)
   const [newestFirst, setNewestFirst] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [reloadToken, setReloadToken] = useState(0)
 
   useEffect(() => {
     if (!id) return
@@ -30,7 +36,9 @@ export function ExerciseHistoryScreen() {
     setGroups(null)
     setNotFound(false)
     setNewestFirst(true)
+    setLoadError(null)
     void (async () => {
+      try {
       const [foundExercise, sets] = await Promise.all([
         getExercise(id),
         getAllSetsForExercise(id),
@@ -77,11 +85,16 @@ export function ExerciseHistoryScreen() {
       )
       setExercise(foundExercise)
       setGroups(nextGroups)
+      } catch (err) {
+        if (cancelled) return
+        // A rejected read used to leave "Loading…" on screen permanently.
+        setLoadError(err instanceof Error ? err.message : String(err))
+      }
     })()
     return () => {
       cancelled = true
     }
-  }, [id])
+  }, [id, reloadToken])
 
   const orderedGroups = useMemo(() => {
     if (!groups) return []
@@ -91,6 +104,33 @@ export function ExerciseHistoryScreen() {
         newestFirst ? b.occurredAt - a.occurredAt : a.occurredAt - b.occurredAt,
       )
   }, [groups, newestFirst])
+
+  const progression = useMemo(() => {
+    if (!exercise || !groups) return null
+    const sessions = groups
+      .map((group) => group.session)
+      .filter((session): session is WorkoutSession => session !== null)
+    if (sessions.length === 0) return null
+    return buildComparableProgression({
+      exerciseId: exercise.id,
+      exercise,
+      sessions,
+      sets: groups.flatMap((group) => group.sets),
+      limit: 8,
+    })
+  }, [exercise, groups])
+
+  if (loadError) {
+    return (
+      <>
+        <Header title="Exercise history" back="/library" />
+        <LoadFailure
+          message={`Could not load this exercise history: ${loadError}`}
+          onRetry={() => setReloadToken((n) => n + 1)}
+        />
+      </>
+    )
+  }
 
   if (notFound) {
     return (
@@ -135,6 +175,10 @@ export function ExerciseHistoryScreen() {
             {newestFirst ? 'Newest' : 'Oldest'}
           </button>
         </div>
+
+        {progression && progression.points.length > 0 && (
+          <ComparableProgressionCard progression={progression} />
+        )}
 
         {orderedGroups.length === 0 ? (
           <p className="card p-6 text-sm text-center text-[var(--color-fg-dim)]">
@@ -187,7 +231,16 @@ export function ExerciseHistoryScreen() {
                   {group.sets.map((set) => (
                     <tr key={set.id} className="border-t border-[var(--color-border)] nums">
                       <td className="px-4 py-2.5">{set.setNumber}</td>
-                      <td className="px-2 py-2.5 text-right">{set.weightLbs} lb</td>
+                      <td className="px-2 py-2.5 text-right">
+                        {set.weightLbs}{' '}
+                        {
+                          LOAD_CONVENTION_SHORT_LABELS[
+                            set.loadConvention ??
+                              exercise.measurement?.loadConvention ??
+                              'unknown'
+                          ]
+                        }
+                      </td>
                       <td className="px-2 py-2.5 text-right">{set.reps}</td>
                       <td className="px-4 py-2.5 text-right">{set.rpe ?? '—'}</td>
                     </tr>

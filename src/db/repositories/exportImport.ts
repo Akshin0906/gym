@@ -1,8 +1,18 @@
-import { db } from '../schema'
+import { assignUniqueNormalizedNames, db, LOCAL_ONLY_TABLE_NAMES } from '../schema'
 import { parseCoachActionResultJson } from '../../lib/coachActionResult'
+import { normalizedExerciseName } from '../../lib/exerciseName'
+import { isLoadConvention, isSetKind, isValidRepBounds } from '../../lib/measurement'
 import { postWorkoutFeedbackValidationIssue } from '../../lib/postWorkoutFeedback'
 import { preWorkoutCheckInValidationIssue } from '../../lib/preWorkoutCheckIn'
+import { unfinishedWorkValidationIssue } from '../../lib/unfinishedWork'
+import { weightValidationIssue } from './sessions'
+import {
+  announceDatasetReplaced,
+  markDatasetReplacedInTransaction,
+  readLocalSyncStateInTransaction,
+} from './syncState'
 import type {
+  SyncFence,
   AiMemorySettings,
   AiMemorySummary,
   AiNote,
@@ -69,11 +79,24 @@ const EXPORT_TABLE_NAMES = Object.keys(
   EXPORT_TABLE_INTRODUCED_IN,
 ) as ExportTableName[]
 
+// `normalizedName` is a local IndexedDB index, not user data. Keeping it out of
+// exports and cloud snapshots means backup files and the mirror payload keep
+// exactly the shape every existing consumer already validates.
+function stripDerivedExerciseFields(row: Exercise): Exercise {
+  if (row.normalizedName === undefined) return row
+  const { normalizedName: _normalizedName, ...rest } = row
+  return rest
+}
+
 export function assertExportTableCoverage(
   dexieTableNames: readonly string[],
   data: Readonly<Record<string, unknown>>,
 ): void {
-  const missing = dexieTableNames.filter((name) => !(name in data))
+  // Device-local bookkeeping tables are intentionally absent: they describe
+  // this device's relationship to the mirror, not the user's training data.
+  const missing = dexieTableNames.filter(
+    (name) => !LOCAL_ONLY_TABLE_NAMES.has(name) && !(name in data),
+  )
   if (missing.length > 0) {
     throw new Error(
       `Export payload is missing Dexie tables: ${missing.join(', ')}`,
@@ -82,9 +105,37 @@ export function assertExportTableCoverage(
 }
 
 export async function buildExportPayload(): Promise<ExportPayload> {
+  return (await buildExportPayloadAtRevision()).payload
+}
+
+// Capture the payload and the local revision it reflects in a single read
+// transaction. The uploader records this revision — not "now" — on success, so
+// an edit committed while the request was in flight stays pending instead of
+// being silently marked as mirrored.
+export async function buildExportPayloadAtRevision(): Promise<{
+  payload: ExportPayload
+  capturedRevision: number
+  fence: SyncFence
+}> {
+  return db.transaction('r', db.tables, async () => {
+    const state = await readLocalSyncStateInTransaction()
+    return {
+      payload: await collectExportPayload(),
+      capturedRevision: state.localRevision,
+      // Captured in the same read transaction as the payload, so the identity
+      // recorded on success is exactly the one the payload was taken under.
+      fence: {
+        datasetEpoch: state.datasetEpoch,
+        authEpoch: state.authEpoch,
+      },
+    }
+  })
+}
+
+async function collectExportPayload(): Promise<ExportPayload> {
   return db.transaction('r', db.tables, async () => {
     const data = {
-      exercises: await db.exercises.toArray(),
+      exercises: (await db.exercises.toArray()).map(stripDerivedExerciseFields),
       programs: await db.programs.toArray(),
       sessionTemplates: await db.sessionTemplates.toArray(),
       templateExercises: await db.templateExercises.toArray(),
@@ -213,6 +264,24 @@ function isExercise(value: unknown): value is Exercise {
   ) {
     return false
   }
+  if (
+    value.measurement !== undefined &&
+    !(
+      isObject(value.measurement) &&
+      Object.keys(value.measurement).length === 1 &&
+      isLoadConvention(value.measurement.loadConvention)
+    )
+  ) {
+    return false
+  }
+  // `normalizedName` is derived local index state. Accept it when a payload
+  // happens to carry it (older builds exported raw rows) but never require it.
+  if (
+    value.normalizedName !== undefined &&
+    typeof value.normalizedName !== 'string'
+  ) {
+    return false
+  }
   return (
     typeof value.notes === 'string' &&
     isPositiveInteger(value.defaultRestSeconds) &&
@@ -221,6 +290,17 @@ function isExercise(value: unknown): value is Exercise {
     typeof value.hiddenFromLibrary === 'boolean' &&
     isFiniteNumber(value.createdAt) &&
     value.createdAt >= 0
+  )
+}
+
+function isOptionalRepBounds(value: unknown): boolean {
+  return value === undefined || value === null || isValidRepBounds(value)
+}
+
+function isOptionalWarmupSets(value: unknown): boolean {
+  return (
+    value === undefined ||
+    (isNonNegativeInteger(value) && value <= 100)
   )
 }
 
@@ -256,7 +336,9 @@ function isTemplateExercise(value: unknown): value is TemplateExercise {
     isNonNegativeInteger(value.order) &&
     isPositiveInteger(value.targetSets) &&
     value.targetSets <= 100 &&
-    isNonEmptyString(value.targetRepRange)
+    isNonEmptyString(value.targetRepRange) &&
+    isOptionalRepBounds(value.repBounds) &&
+    isOptionalWarmupSets(value.warmupSets)
   )
 }
 
@@ -278,6 +360,18 @@ function sessionSnapshotValidationIssue(value: unknown): string | null {
     }
     if (typeof item.targetRepRange !== 'string') {
       return `${label} has an invalid targetRepRange`
+    }
+    if (!isOptionalRepBounds(item.repBounds)) {
+      return `${label} has invalid repBounds`
+    }
+    if (!isOptionalWarmupSets(item.warmupSets)) {
+      return `${label} has invalid warmupSets`
+    }
+    if (
+      item.loadConvention !== undefined &&
+      !isLoadConvention(item.loadConvention)
+    ) {
+      return `${label} has an invalid loadConvention`
     }
     exerciseIds.push(item.exerciseId)
     orders.push(item.order)
@@ -358,6 +452,10 @@ function workoutSessionValidationIssue(value: unknown): string | null {
     )
     if (feedbackIssue) return `postWorkoutFeedback ${feedbackIssue}`
   }
+  if (value.unfinishedWork !== undefined && value.unfinishedWork !== null) {
+    const issue = unfinishedWorkValidationIssue(value.unfinishedWork)
+    if (issue) return `unfinishedWork ${issue}`
+  }
   if (value.doneExerciseIds !== undefined) {
     if (!isStringArray(value.doneExerciseIds) || !hasUniqueStrings(value.doneExerciseIds)) {
       return 'doneExerciseIds is invalid or contains duplicates'
@@ -384,14 +482,29 @@ function normalizeWorkoutSession(value: WorkoutSession): WorkoutSession {
 }
 
 function isLoggedSet(value: unknown): value is LoggedSet {
+  if (!isObject(value)) return false
+  if (value.setKind !== undefined && !isSetKind(value.setKind)) return false
+  if (
+    value.loadConvention !== undefined &&
+    !isLoadConvention(value.loadConvention)
+  ) {
+    return false
+  }
+  // Judged against the row's own convention. A bodyweight set with no added
+  // weight and an unassisted rep on an assistance machine are legitimately 0;
+  // every other convention — including the `unknown` that every legacy row
+  // resolves to — still requires a positive load, so nothing that was rejected
+  // before is accepted now. Negative and non-finite are always rejected.
+  if (!isFiniteNumber(value.weightLbs)) return false
+  const convention = isLoadConvention(value.loadConvention)
+    ? value.loadConvention
+    : 'unknown'
+  if (weightValidationIssue(value.weightLbs, convention) !== null) return false
   return (
-    isObject(value) &&
     isNonEmptyString(value.id) &&
     isNonEmptyString(value.workoutSessionId) &&
     isNonEmptyString(value.exerciseId) &&
     isPositiveInteger(value.setNumber) &&
-    isFiniteNumber(value.weightLbs) &&
-    value.weightLbs > 0 &&
     isPositiveInteger(value.reps) &&
     (value.rpe === null ||
       (isFiniteNumber(value.rpe) && value.rpe >= 1 && value.rpe <= 10)) &&
@@ -735,8 +848,24 @@ export function assertImportByteLength(byteLength: number): void {
   }
 }
 
+// Rebuild the derived uniqueness key for an imported payload. Historical
+// backups predate the index and may contain case-variant duplicates; those are
+// disambiguated by renaming the later row, never by dropping it, so every id,
+// logged set, template reference, and snapshot survives the restore.
+function withUniqueNormalizedNames(rows: Exercise[]): Exercise[] {
+  const withKeys = rows.map((row) => ({
+    ...row,
+    normalizedName: normalizedExerciseName(row.name),
+  }))
+  const changes = new Map(
+    assignUniqueNormalizedNames(withKeys).map((row) => [row.id, row]),
+  )
+  return withKeys.map((row) => changes.get(row.id) ?? row)
+}
+
 export async function importPayload(rawJson: string): Promise<{
   imported: Record<string, number>
+  renamedExerciseCount: number
 }> {
   // Reject obviously oversized strings before asking TextEncoder for another
   // allocation. UTF-8 is never smaller than the JavaScript string length.
@@ -746,9 +875,17 @@ export async function importPayload(rawJson: string): Promise<{
   assertImportByteLength(new TextEncoder().encode(rawJson).byteLength)
   const parsed: unknown = JSON.parse(rawJson)
   const payload = validatePayload(parsed, MAX_IMPORT_ROWS_PER_TABLE)
+  const importedExercises = withUniqueNormalizedNames(payload.data.exercises)
   await db.transaction('rw', db.tables, async () => {
+    // Read the outgoing sync bookkeeping before the clear, then rewrite it
+    // inside the same transaction. The restored rows and the durable "this
+    // device is ahead of the mirror" marker therefore commit together: a crash
+    // can leave the old dataset or the new one, never the new dataset silently
+    // marked as already mirrored.
+    const previousSync = await readLocalSyncStateInTransaction()
     await Promise.all(db.tables.map((t) => t.clear()))
-    await db.exercises.bulkAdd(payload.data.exercises)
+    await markDatasetReplacedInTransaction(previousSync)
+    await db.exercises.bulkAdd(importedExercises)
     await db.programs.bulkAdd(payload.data.programs)
     await db.sessionTemplates.bulkAdd(payload.data.sessionTemplates)
     await db.templateExercises.bulkAdd(payload.data.templateExercises)
@@ -761,7 +898,12 @@ export async function importPayload(rawJson: string): Promise<{
     await db.aiMemorySummaries.bulkAdd(payload.data.aiMemorySummaries)
     await db.chatActionReceipts.bulkAdd(payload.data.chatActionReceipts)
   })
+  announceDatasetReplaced()
+  const renamedExerciseCount = importedExercises.filter(
+    (row, index) => row.name !== payload.data.exercises[index].name,
+  ).length
   return {
+    renamedExerciseCount,
     imported: {
       exercises: payload.data.exercises.length,
       programs: payload.data.programs.length,

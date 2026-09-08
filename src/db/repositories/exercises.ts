@@ -1,7 +1,10 @@
 import { db } from '../schema'
-import type { Exercise, MuscleGroup } from '../types'
+import type { Exercise, ExerciseMeasurement, MuscleGroup } from '../types'
+import { normalizedExerciseName } from '../../lib/exerciseName'
+import { isLoadConvention } from '../../lib/measurement'
 import { normalizeSecondaryMuscles } from '../../lib/muscles'
 import { isValidRestSeconds } from '../../lib/restTimer'
+import { mutateLocalData } from './syncState'
 
 export interface ExerciseInput {
   name: string
@@ -10,36 +13,89 @@ export interface ExerciseInput {
   notes: string
   defaultRestSeconds: number
   hiddenFromLibrary: boolean
+  measurement?: ExerciseMeasurement
 }
 
-async function findByNameCI(name: string, excludeId?: string) {
-  const lower = name.trim().toLowerCase()
-  const matches = await db.exercises
-    .filter((e) => e.name.toLowerCase() === lower)
-    .toArray()
-  return excludeId ? matches.find((e) => e.id !== excludeId) : matches[0]
+export class DuplicateExerciseNameError extends Error {
+  constructor(existingName: string) {
+    super(`An exercise named "${existingName}" already exists`)
+    this.name = 'DuplicateExerciseNameError'
+  }
 }
 
-export async function createCustomExercise(input: ExerciseInput): Promise<string> {
+// Read-only helper for callers that want to warn before submitting. It is NOT
+// the uniqueness guarantee — that lives inside the write transaction below,
+// because any check performed outside the transaction can be overtaken.
+export async function findExerciseByName(
+  name: string,
+  excludeId?: string,
+): Promise<Exercise | undefined> {
+  const normalized = normalizedExerciseName(name)
+  if (!normalized) return undefined
+  const match = await db.exercises
+    .where('normalizedName')
+    .equals(normalized)
+    .first()
+  return match && match.id !== excludeId ? match : undefined
+}
+
+function validatedInput(input: ExerciseInput): {
+  name: string
+  normalizedName: string
+} {
   const name = input.name.trim()
   if (!name) throw new Error('Name is required')
   if (!isValidRestSeconds(input.defaultRestSeconds)) {
     throw new Error('Rest must be a whole number from 1 to 3600 seconds')
   }
-  const dup = await findByNameCI(name)
-  if (dup) throw new Error(`An exercise named "${dup.name}" already exists`)
+  if (
+    input.measurement !== undefined &&
+    !isLoadConvention(input.measurement.loadConvention)
+  ) {
+    throw new Error('Unknown load convention')
+  }
+  return { name, normalizedName: normalizedExerciseName(name) }
+}
 
+function measurementPatch(
+  input: ExerciseInput,
+): Pick<Exercise, 'measurement'> | Record<string, never> {
+  // Omitting the field entirely (rather than writing `undefined`) keeps legacy
+  // rows legacy instead of stamping them with a guessed convention.
+  if (input.measurement === undefined) return {}
+  if (input.measurement.loadConvention === 'unknown') return {}
+  return { measurement: { loadConvention: input.measurement.loadConvention } }
+}
+
+export async function createCustomExercise(
+  input: ExerciseInput,
+): Promise<string> {
+  const { name, normalizedName } = validatedInput(input)
   const id = crypto.randomUUID()
-  await db.exercises.add({
-    ...input,
-    name,
-    secondaryMuscles: normalizeSecondaryMuscles(
-      input.primaryMuscle,
-      input.secondaryMuscles,
-    ),
-    id,
-    isCustom: true,
-    createdAt: Date.now(),
+
+  await mutateLocalData([db.exercises], async () => {
+    // Check and write inside one transaction over the exercises store, so two
+    // concurrent creates of the same name are serialized rather than both
+    // reading "no duplicate" and both inserting. The unique index on
+    // normalizedName is the backstop if a future caller forgets.
+    const existing = await db.exercises
+      .where('normalizedName')
+      .equals(normalizedName)
+      .first()
+    if (existing) throw new DuplicateExerciseNameError(existing.name)
+    await db.exercises.add({
+      ...input,
+      ...measurementPatch(input),
+      name,
+      normalizedName,
+      secondaryMuscles: normalizeSecondaryMuscles(
+        input.primaryMuscle,
+        input.secondaryMuscles,
+      ),
+      id,
+      isCustom: true,
+      createdAt: Date.now(),
+    })
   })
   return id
 }
@@ -48,27 +104,46 @@ export async function updateExercise(
   id: string,
   input: ExerciseInput,
 ): Promise<void> {
-  const name = input.name.trim()
-  if (!name) throw new Error('Name is required')
-  if (!isValidRestSeconds(input.defaultRestSeconds)) {
-    throw new Error('Rest must be a whole number from 1 to 3600 seconds')
-  }
-  const dup = await findByNameCI(name, id)
-  if (dup) throw new Error(`An exercise named "${dup.name}" already exists`)
+  const { name, normalizedName } = validatedInput(input)
 
-  const updated = await db.exercises.update(id, {
-    ...input,
-    name,
-    secondaryMuscles: normalizeSecondaryMuscles(
-      input.primaryMuscle,
-      input.secondaryMuscles,
-    ),
+  await mutateLocalData([db.exercises], async () => {
+    const existing = await db.exercises
+      .where('normalizedName')
+      .equals(normalizedName)
+      .first()
+    if (existing && existing.id !== id) {
+      throw new DuplicateExerciseNameError(existing.name)
+    }
+    const current = await db.exercises.get(id)
+    if (!current) throw new Error('Exercise not found')
+    const next: Exercise = {
+      ...current,
+      ...input,
+      name,
+      normalizedName,
+      secondaryMuscles: normalizeSecondaryMuscles(
+        input.primaryMuscle,
+        input.secondaryMuscles,
+      ),
+    }
+    // A rename must not resurrect a stale measurement block, and clearing the
+    // convention back to "unknown" must actually remove it.
+    if (input.measurement === undefined) {
+      // Field not supplied by this caller: preserve whatever was stored.
+      next.measurement = current.measurement
+    } else if (input.measurement.loadConvention === 'unknown') {
+      delete next.measurement
+    } else {
+      next.measurement = { loadConvention: input.measurement.loadConvention }
+    }
+    await db.exercises.put(next)
   })
-  if (updated === 0) throw new Error('Exercise not found')
 }
 
 export async function setHidden(id: string, hidden: boolean): Promise<void> {
-  await db.exercises.update(id, { hiddenFromLibrary: hidden })
+  await mutateLocalData([db.exercises], async () => {
+    await db.exercises.update(id, { hiddenFromLibrary: hidden })
+  })
 }
 
 export async function getExercise(id: string): Promise<Exercise | undefined> {

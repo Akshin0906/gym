@@ -5,8 +5,8 @@ import type { DailyBriefing, DailyBriefingSections } from '../db/types'
 import {
   BriefingSections,
   briefingDateLabel,
-  recoveryStatusLabel,
 } from './RecommendationBanner'
+import { recoveryStatusLabel } from '../lib/briefingFreshness'
 
 const sections: DailyBriefingSections = {
   todaysCall: 'Run Upper as written and let the first set confirm the load.',
@@ -52,8 +52,10 @@ describe('RecommendationBanner presentation', () => {
     expect(html).not.toContain('Data context')
   })
 
-  it('distinguishes stale recovery from unavailable recovery', () => {
-    expect(recoveryStatusLabel('fresh')).toBeNull()
+  it('names Oura explicitly so recovery is never read as training freshness', () => {
+    // The label always says "Oura" — fresh recovery data must not be mistaken
+    // for a fresh training snapshot, which has its own separate line.
+    expect(recoveryStatusLabel('fresh')).toBe('Oura fresh')
     expect(recoveryStatusLabel('stale')).toBe('Oura stale')
     expect(recoveryStatusLabel('unavailable')).toBe('No Oura')
     expect(recoveryStatusLabel(undefined)).toBeNull()

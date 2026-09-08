@@ -1,5 +1,5 @@
 import { useEffect } from 'react'
-import { AlertCircle, CheckCircle2, X } from 'lucide-react'
+import { AlertCircle, CheckCircle2, RefreshCw, X } from 'lucide-react'
 
 export interface ToastNotice {
   id: number
@@ -20,6 +20,31 @@ export function ErrorAlert({ message }: { message: string }) {
     >
       <AlertCircle size={16} className="shrink-0 mt-0.5" />
       <span>{message}</span>
+    </div>
+  )
+}
+
+// Terminal state for a screen whose initial read failed. A rejected IndexedDB
+// read previously left a spinner forever with nothing the user could do.
+export function LoadFailure({
+  message,
+  onRetry,
+  retryLabel = 'Try again',
+}: {
+  message: string
+  onRetry: () => void
+  retryLabel?: string
+}) {
+  return (
+    <div className="px-4 py-8 max-w-md mx-auto space-y-3 text-center">
+      <ErrorAlert message={message} />
+      <button
+        type="button"
+        onClick={onRetry}
+        className="btn-primary w-full justify-center"
+      >
+        <RefreshCw size={16} aria-hidden /> {retryLabel}
+      </button>
     </div>
   )
 }

@@ -1,4 +1,5 @@
 import { db } from './schema'
+import { normalizedExerciseName } from '../lib/exerciseName'
 import type { Exercise } from './types'
 
 export const SEED_EXERCISES: Omit<Exercise, 'id' | 'createdAt'>[] = [
@@ -104,6 +105,7 @@ export async function seedIfEmpty(): Promise<void> {
         ...e,
         id: crypto.randomUUID(),
         createdAt: now,
+        normalizedName: normalizedExerciseName(e.name),
       })),
     )
   })

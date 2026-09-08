@@ -26,14 +26,16 @@ import {
   importPayload,
 } from '../db/repositories/exportImport'
 import { markExportedNow } from '../lib/backup'
+import { ReleaseSection } from '../components/ReleaseSection'
 import {
+  fetchCloudUpdates,
   getCloudAuthStatus,
   getCloudSyncStatus,
   isCloudConfigured,
   pairCloudDevice,
   subscribeCloudSyncStatus,
   unpairCloudDevice,
-  uploadCloudSnapshot,
+  syncPendingLocalChanges,
   type CloudAuthStatus,
   type CloudSyncStatus,
 } from '../lib/cloud'
@@ -64,7 +66,6 @@ import {
 import { useActiveWorkout } from '../store/activeWorkout'
 import { useTimer } from '../store/timer'
 
-const APP_RELEASE = '2026-08-06.2'
 
 export function SettingsScreen() {
   const navigate = useNavigate()
@@ -204,8 +205,9 @@ export function SettingsScreen() {
 
         <OuraSection />
 
+        <ReleaseSection />
+
         <section className="pt-4 border-t border-[var(--color-border)] text-xs text-[var(--color-fg-faint)]">
-          <p>Workout Tracker · v0.1.0 · release {APP_RELEASE}</p>
           <p className="mt-1">
             IndexedDB primary · cloud snapshot when synced.
           </p>
@@ -222,6 +224,14 @@ function formatDateTime(epochMs: number | null): string {
     dateStyle: 'medium',
     timeStyle: 'short',
   }).format(epochMs)
+}
+
+export function cloudBriefingErrorMessage(
+  configured: boolean,
+  status: CloudSyncStatus,
+): string | null {
+  if (!configured || !status.lastBriefingError) return null
+  return `Cloud briefing failed: ${status.lastBriefingError}`
 }
 
 function CloudSyncSection({
@@ -286,7 +296,9 @@ function CloudSyncSection({
       const next = await pairCloudDevice(secret, deviceName.trim())
       setAuth(next)
       setPairingSecret('')
-      onSynced('Cloud device paired.')
+      await fetchCloudUpdates()
+      setStatus(getCloudSyncStatus())
+      onSynced('Cloud device paired and refreshed.')
     } catch (err) {
       setAuthError(err instanceof Error ? err.message : String(err))
     } finally {
@@ -313,15 +325,28 @@ function CloudSyncSection({
     if (syncing || !configured) return
     setSyncing(true)
     try {
-      await uploadCloudSnapshot('manual')
+      // `force` because an explicit "sync now" should reach the mirror even
+      // when the revision says nothing is pending. It still goes through the
+      // gate, so it cannot bypass single-flight or a Coach reservation.
+      const results = await Promise.allSettled([
+        syncPendingLocalChanges('manual', { force: true }),
+        fetchCloudUpdates(),
+      ])
       setStatus(getCloudSyncStatus())
-      onSynced('Cloud snapshot uploaded.')
+      const failed = results.find(
+        (result): result is PromiseRejectedResult =>
+          result.status === 'rejected',
+      )
+      if (failed) throw failed.reason
+      onSynced('Cloud data refreshed.')
     } catch {
       setStatus(getCloudSyncStatus())
     } finally {
       setSyncing(false)
     }
   }
+
+  const briefingError = cloudBriefingErrorMessage(configured, status)
 
   return (
     <section className="space-y-3">
@@ -431,6 +456,7 @@ function CloudSyncSection({
       {configured && status.lastSnapshotError && (
         <ErrorAlert message={`Cloud sync failed: ${status.lastSnapshotError}`} />
       )}
+      {briefingError && <ErrorAlert message={briefingError} />}
       {configured && status.lastMemoryError && (
         <ErrorAlert message={`Cloud memory failed: ${status.lastMemoryError}`} />
       )}

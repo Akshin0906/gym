@@ -59,7 +59,79 @@ class ManageDailyBriefingTests(unittest.TestCase):
         self.fake_launchctl = self._write_fake_launchctl()
         self.fake_mv = self._write_fake_mv()
 
+    # Mirrors BRIEFING_MODULES in manage_daily_briefing.sh. The fixture ships a
+    # real package so the release staging path is exercised end to end: if the
+    # installer forgets to stage a module, the staged entrypoint fails to import
+    # and the update must refuse before touching the live installation.
+    BRIEFING_MODULES = (
+        "__init__.py",
+        "errors.py",
+        "constants.py",
+        "primitives.py",
+        "models.py",
+        "textutil.py",
+        "measurement.py",
+        "recovery.py",
+        "cloudclient.py",
+        "evidence.py",
+        "memory.py",
+        "validation.py",
+        "publishing.py",
+    )
+
+    def _write_briefing_package(self) -> None:
+        package = self.automation / "briefing"
+        package.mkdir(parents=True, exist_ok=True)
+        for name in self.BRIEFING_MODULES:
+            if name == "measurement.py":
+                continue
+            (package / name).write_text(
+                f'"""Fixture stub for {name}."""\n', encoding="utf-8"
+            )
+        (package / "measurement.py").write_text(
+            textwrap.dedent(
+                """\
+                \"\"\"Fixture measurement module.
+
+                Only the behaviour the release check asserts is implemented.
+                \"\"\"
+
+                from __future__ import annotations
+
+
+                def estimated_one_rep_max(weight_lbs, reps):
+                    if weight_lbs is None or reps is None:
+                        return None
+                    if weight_lbs <= 0 or reps < 1:
+                        return None
+                    if reps == 1:
+                        return float(weight_lbs)
+                    return float(weight_lbs) * (1.0 + float(reps) / 30.0)
+
+
+                def top_estimated_one_rep_max(rows):
+                    estimates = [
+                        value
+                        for row in rows
+                        for value in (
+                            estimated_one_rep_max(row.get("weightLbs"), row.get("reps")),
+                        )
+                        if value is not None
+                    ]
+                    return round(max(estimates), 2) if estimates else None
+                """
+            ),
+            encoding="utf-8",
+        )
+        fixtures = self.automation / "shared_fixtures"
+        fixtures.mkdir(parents=True, exist_ok=True)
+        (fixtures / "calculations.json").write_text(
+            json.dumps({"version": 1, "estimatedOneRepMax": []}) + "\n",
+            encoding="utf-8",
+        )
+
     def _write_release_fixture(self) -> None:
+        self._write_briefing_package()
         (self.automation / "run_codex_daily_briefing.sh").write_text(
             "#!/usr/bin/env bash\n"
             "set -euo pipefail\n"
@@ -79,6 +151,33 @@ class ManageDailyBriefingTests(unittest.TestCase):
                 import sys
                 import time
                 from pathlib import Path
+
+                _MODULE_DIR = str(Path(__file__).resolve().parent)
+                if _MODULE_DIR not in sys.path:
+                    sys.path.append(_MODULE_DIR)
+
+                from briefing.measurement import (  # noqa: E402
+                    estimated_one_rep_max,
+                    top_estimated_one_rep_max,
+                )
+
+                RUNNER_VERSION = "fixture"
+
+
+                def publish_spool(*args, **kwargs):
+                    raise NotImplementedError
+
+
+                def validate_model_output(*args, **kwargs):
+                    raise NotImplementedError
+
+
+                def validate_spool(*args, **kwargs):
+                    raise NotImplementedError
+
+
+                def build_model_input_bundle(*args, **kwargs):
+                    raise NotImplementedError
 
 
                 def main() -> int:
@@ -406,6 +505,62 @@ class ManageDailyBriefingTests(unittest.TestCase):
         if not self.launchctl_log.exists():
             return []
         return [json.loads(line) for line in self.launchctl_log.read_text().splitlines()]
+
+    def test_module_list_matches_the_real_supervisor_package(self) -> None:
+        # The installer stages an explicit file list. If the real package gains
+        # or loses a module without that list changing, a release would either
+        # ship a partial package or refuse to install; catch it here instead.
+        package = SOURCE_AUTOMATION / "briefing"
+        actual = sorted(path.name for path in package.glob("*.py"))
+        self.assertEqual(sorted(self.BRIEFING_MODULES), actual)
+
+        manager = (SOURCE_AUTOMATION / "manage_daily_briefing.sh").read_text(
+            encoding="utf-8"
+        )
+        for name in actual:
+            self.assertIn(f"\n  {name}\n", manager, f"{name} is not staged")
+
+    def test_release_stages_every_supervisor_module(self) -> None:
+        self._install("v1")
+        release = (self.runtime / "current").resolve()
+        for name in self.BRIEFING_MODULES:
+            self.assertTrue(
+                (release / "briefing" / name).is_file(),
+                f"briefing/{name} was not staged",
+            )
+        self.assertTrue(
+            (release / "shared_fixtures" / "calculations.json").is_file()
+        )
+        # Byte-compiled caches would make the immutable release directory
+        # mutable after the switch.
+        self.assertFalse((release / "__pycache__").exists())
+        self.assertFalse((release / "briefing" / "__pycache__").exists())
+
+    def test_update_refuses_when_a_supervisor_module_is_missing(self) -> None:
+        self._install("v1")
+        live_before = os.readlink(self.runtime / "current")
+        (self.automation / "briefing" / "publishing.py").unlink()
+        self._set_release_version("v2")
+
+        result = self._run_manager("update")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("briefing/publishing.py", result.stdout + result.stderr)
+        # The live installation must be untouched by a refused release.
+        self.assertEqual(os.readlink(self.runtime / "current"), live_before)
+
+    def test_update_refuses_a_release_whose_entrypoint_cannot_import(self) -> None:
+        self._install("v1")
+        live_before = os.readlink(self.runtime / "current")
+        (self.automation / "briefing" / "measurement.py").write_text(
+            "raise ImportError('fixture module is broken')\n", encoding="utf-8"
+        )
+        self._set_release_version("v2")
+
+        result = self._run_manager("update")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(os.readlink(self.runtime / "current"), live_before)
 
     def test_successful_update_preserves_mutable_oura_and_retains_rollback_bundle(self) -> None:
         self._install("v1")

@@ -1,6 +1,22 @@
-import { buildExportPayload } from '../db/repositories/exportImport'
+import {
+  buildExportPayload,
+  buildExportPayloadAtRevision,
+} from '../db/repositories/exportImport'
 import { upsertDailyBriefing } from '../db/repositories/dailyBriefings'
 import { mergeCodexCloudMemory } from '../db/repositories/aiMemory'
+import { listPendingCoachActionResults } from '../db/repositories/chatActions'
+import {
+  advanceAuthEpoch,
+  advanceAuthEpochIfCurrent,
+  clearAutoSyncBackoff,
+  getLocalSyncState,
+  isAutoSyncBackedOff,
+  readSyncFence,
+  recordSyncFailure,
+  recordSyncSuccess,
+  subscribeLocalMutations,
+} from '../db/repositories/syncState'
+import type { SyncFence } from '../db/types'
 import type {
   AiMemorySummary,
   AiMemorySummaryType,
@@ -255,9 +271,37 @@ export function isCloudConfigured(): boolean {
   return readCloudAuthPaired()
 }
 
+const NOT_PAIRED_MESSAGE =
+  'Cloud device is not paired. Pair this device in Settings.'
+
+export class CloudAuthLostError extends Error {
+  constructor() {
+    super(NOT_PAIRED_MESSAGE)
+    this.name = 'CloudAuthLostError'
+  }
+}
+
+// Handle a 401 that arrived under a specific session identity.
+//
+// A 401 only means "this session is gone" for the session that issued the
+// request. A reply from a request made before a logout and re-pair must not
+// tear down the new session, so the fence decides whether to act.
+async function handleAuthLoss(fence: SyncFence): Promise<CloudAuthLostError> {
+  try {
+    const fenced = await advanceAuthEpochIfCurrent(fence)
+    if (fenced) setCloudAuthPaired(false)
+  } catch {
+    // Best effort; the pending comparison fails safe towards "still pending".
+  }
+  return new CloudAuthLostError()
+}
+
+// Unfenced variant for call sites that have no captured identity because they
+// are establishing one (the pairing status probe itself).
 function authLostError(): Error {
   setCloudAuthPaired(false)
-  return new Error('Cloud device is not paired. Pair this device in Settings.')
+  void advanceAuthEpoch().catch(() => {})
+  return new CloudAuthLostError()
 }
 
 function parseAuthStatus(raw: unknown): CloudAuthStatus {
@@ -287,7 +331,25 @@ function parseAuthStatus(raw: unknown): CloudAuthStatus {
   }
 }
 
+// Apply a pairing verdict only if the session it was asked about is still the
+// current one. A read issued before a re-pair can return `paired: false` long
+// after the new session exists; applying it would unpair a live device.
+async function applyPairedIfCurrent(
+  fence: SyncFence,
+  paired: boolean,
+): Promise<boolean> {
+  if (paired) {
+    setCloudAuthPaired(true)
+    return true
+  }
+  const current = await getLocalSyncState()
+  if (current.authEpoch !== fence.authEpoch) return false
+  setCloudAuthPaired(false)
+  return true
+}
+
 export async function getCloudAuthStatus(): Promise<CloudAuthStatus> {
+  const fence = await readSyncFence()
   const res = await fetch('/api/auth/cloud', { credentials: 'include' })
   if (!res.ok) {
     const detail = await responseDetail(res)
@@ -296,7 +358,7 @@ export async function getCloudAuthStatus(): Promise<CloudAuthStatus> {
     )
   }
   const status = parseAuthStatus(await res.json())
-  setCloudAuthPaired(status.paired)
+  await applyPairedIfCurrent(fence, status.paired)
   return status
 }
 
@@ -318,6 +380,10 @@ export async function pairCloudDevice(
   }
   const status = parseAuthStatus(await res.json())
   setCloudAuthPaired(status.paired)
+  // A new session invalidates every operation started under the old one, and
+  // this mirror has never seen this device's data. Both facts are the same
+  // epoch bump, which also resets the watermark.
+  await advanceAuthEpoch()
   return status
 }
 
@@ -333,6 +399,7 @@ export async function unpairCloudDevice(): Promise<void> {
     )
   }
   setCloudAuthPaired(false)
+  await advanceAuthEpoch()
 }
 
 async function responseDetail(res: Response): Promise<string> {
@@ -478,12 +545,14 @@ function parseMemoryPayload(raw: unknown): {
   }
 }
 
-async function currentSnapshotUpdatedAt(): Promise<number | null> {
+async function currentSnapshotUpdatedAt(
+  fence: SyncFence,
+): Promise<number | null> {
   const res = await fetch('/api/cloud/snapshot', {
     credentials: 'include',
     cache: 'no-store',
   })
-  if (res.status === 401) throw authLostError()
+  if (res.status === 401) throw await handleAuthLoss(fence)
   if (res.status === 404) return null
   if (!res.ok) {
     const detail = await responseDetail(res)
@@ -528,12 +597,14 @@ function completedWorkoutSummary(raw: unknown): CompletedWorkoutSummary {
   return { count, latestCompletedAt }
 }
 
-async function currentCloudWorkoutSummary(): Promise<CompletedWorkoutSummary | null> {
+async function currentCloudWorkoutSummary(
+  fence: SyncFence,
+): Promise<CompletedWorkoutSummary | null> {
   const res = await fetch('/api/cloud/snapshot', {
     credentials: 'include',
     cache: 'no-store',
   })
-  if (res.status === 401) throw authLostError()
+  if (res.status === 401) throw await handleAuthLoss(fence)
   if (res.status === 404) return null
   if (!res.ok) {
     const detail = await responseDetail(res)
@@ -571,8 +642,12 @@ export async function uploadCloudSnapshot(
       if (!auth.paired) throw authLostError()
     }
     for (let attempt = 0; attempt < MAX_SNAPSHOT_UPLOAD_ATTEMPTS; attempt += 1) {
-      const baseUpdatedAt = await currentSnapshotUpdatedAt()
-      const payload = await buildExportPayload()
+      // Re-read the identity on every attempt: a retry after a version
+      // conflict is a fresh operation and must be judged on current state.
+      const versionFence = await readSyncFence()
+      const baseUpdatedAt = await currentSnapshotUpdatedAt(versionFence)
+      const { payload, capturedRevision, fence } =
+        await buildExportPayloadAtRevision()
       const res = await fetch('/api/cloud/snapshot', {
         method: 'PUT',
         credentials: 'include',
@@ -590,11 +665,17 @@ export async function uploadCloudSnapshot(
         },
         body: JSON.stringify(payload),
       })
-      if (res.status === 401) throw authLostError()
+      if (res.status === 401) throw await handleAuthLoss(fence)
       if (!res.ok) {
+        const errorCode = res.status === 409 ? await responseErrorCode(res) : null
+        // The backend refuses a generic snapshot while a Coach action owns a
+        // reservation. That is the fence working, not a failure: surface it as
+        // a distinct signal so callers can wait instead of showing an error.
+        if (errorCode === 'coach_action_reservation_required') {
+          throw new CoachReservationActiveError()
+        }
         const retryableVersionConflict =
-          res.status === 409 &&
-          (await responseErrorCode(res)) === 'snapshot_version_changed'
+          errorCode === 'snapshot_version_changed'
         if (
           retryableVersionConflict &&
           attempt + 1 < MAX_SNAPSHOT_UPLOAD_ATTEMPTS
@@ -618,31 +699,151 @@ export async function uploadCloudSnapshot(
         lastSnapshotTrigger: trigger,
         lastSnapshotError: null,
       })
-      clearPendingCloudSnapshot(pending)
+      // Durable watermark: only the revision actually contained in the payload
+      // the mirror accepted is marked synced, and only if the dataset and the
+      // session it was captured under are still the current ones. Anything
+      // written while this request was in flight has a higher revision and
+      // stays pending; anything from a superseded dataset or session is
+      // discarded outright.
+      const recorded = await recordSyncSuccess({
+        capturedRevision,
+        cloudUpdatedAt: updatedAt,
+        fence,
+      })
+      if (recorded.applied) clearPendingCloudSnapshot(pending)
       return { updatedAt }
     }
     throw new Error('Cloud snapshot failed after version retries')
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     saveStatus({ lastSnapshotError: message })
+    // Diagnostics must never replace the real failure: if IndexedDB itself is
+    // what broke, recording that fact will fail too, and the caller needs the
+    // original error.
+    try {
+      await recordSyncFailure(message)
+    } catch {
+      // The revision watermark is unchanged, so the work stays pending.
+    }
     throw err
+  }
+}
+
+export class CoachReservationActiveError extends Error {
+  constructor() {
+    super('A Coach change is still publishing. Sync will resume after it.')
+    this.name = 'CoachReservationActiveError'
+  }
+}
+
+export type LocalSyncOutcome =
+  | 'uploaded'
+  | 'up_to_date'
+  | 'not_paired'
+  | 'deferred_coach_reservation'
+  | 'backing_off'
+
+export interface LocalSyncOptions {
+  // The automatic scheduler sets this so a persistently failing upload settles
+  // into capped exponential backoff instead of retrying at a fixed rate.
+  // Manual and reconnect triggers leave it false: an explicit user action or a
+  // regained network is new information and should be tried immediately.
+  respectBackoff?: boolean
+  // Upload even when the revision says nothing is pending. Only the Settings
+  // "sync now" button uses this; it never bypasses the reservation gate or the
+  // single-flight guard.
+  force?: boolean
+}
+
+let inFlightLocalSync: Promise<LocalSyncOutcome> | null = null
+
+// The single coordinated entry point for pushing local edits to the mirror.
+//
+// Every generic caller goes through here — workout completion, foreground
+// recovery, reconnect, the debounced scheduler, and the Settings button — so
+// the rules live in one place rather than at each call site: one upload at a
+// time, never during a Coach reservation, backoff when asked to respect it,
+// and no upload at all when nothing local has changed.
+//
+// The Coach's own publish path deliberately does NOT come through here: it has
+// a reservation, receipt proofs, and a different retry protocol, and calls
+// uploadCloudSnapshot('chat_action_applied') directly.
+export async function syncPendingLocalChanges(
+  trigger: DurableCloudSnapshotTrigger = 'manual',
+  options: LocalSyncOptions = {},
+): Promise<LocalSyncOutcome> {
+  if (inFlightLocalSync) return inFlightLocalSync
+  const run = (async (): Promise<LocalSyncOutcome> => {
+    if (!isCloudConfigured()) return 'not_paired'
+
+    // A confirmed Coach action publishes through its own reservation-aware
+    // protocol with receipt proofs. A generic snapshot PUT during that window
+    // is rejected by the backend as `coach_action_reservation_required`, and
+    // even if it were not, it would publish outside the reservation. Wait.
+    const pendingCoachResults = await listPendingCoachActionResults()
+    if (pendingCoachResults.length > 0) return 'deferred_coach_reservation'
+
+    if (options.respectBackoff) {
+      if (await isAutoSyncBackedOff()) return 'backing_off'
+    } else {
+      await clearAutoSyncBackoff()
+    }
+
+    const state = await getLocalSyncState()
+    const legacyPending = hasPendingCloudSnapshotSync()
+    if (
+      !options.force &&
+      state.localRevision <= state.syncedRevision &&
+      !legacyPending
+    ) {
+      return 'up_to_date'
+    }
+    try {
+      await uploadCloudSnapshot(trigger)
+    } catch (err) {
+      // A reservation can exist server-side without a local pending receipt —
+      // for example when the app closed between reserving and writing one. The
+      // backend fence still holds; treat it as a wait, not a failure.
+      if (err instanceof CoachReservationActiveError) {
+        return 'deferred_coach_reservation'
+      }
+      throw err
+    }
+    return 'uploaded'
+  })()
+  inFlightLocalSync = run
+  try {
+    return await run
+  } finally {
+    inFlightLocalSync = null
   }
 }
 
 export async function recoverCloudSnapshot(): Promise<boolean> {
   if (!isCloudConfigured()) return false
 
+  // A queued marker from a previous run still goes through the gate: it is a
+  // generic upload and must respect the single-flight guard and the Coach
+  // reservation fence exactly like any other.
   const pending = readPendingCloudSnapshot()
   if (pending) {
-    await uploadCloudSnapshot(pending.trigger)
-    return true
+    return (await syncPendingLocalChanges(pending.trigger)) === 'uploaded'
   }
 
-  // This repairs workouts completed by an older app build, before durable
-  // pending markers existed. Only move the mirror forward when this device has
-  // a newer completed workout; do not overwrite a newer cloud source.
+  // The durable revision covers every relevant local mutation, not just a
+  // completed workout: a corrected historical set, a deleted session, a program
+  // edit, a note, or a restored backup all leave localRevision ahead.
+  const outcome = await syncPendingLocalChanges('manual')
+  if (outcome === 'uploaded') return true
+  if (outcome !== 'up_to_date') return false
+
+  // Fallback for a device upgraded from a build that had no revision counter:
+  // its first post-upgrade revision is 0, so nothing above would fire. Only
+  // move the mirror forward when this device has a newer completed workout; do
+  // not overwrite a newer cloud source with an empty or older local database.
+  const legacyFence = await readSyncFence()
   const [cloud, localPayload] = await Promise.all([
-    currentCloudWorkoutSummary(),
+    currentCloudWorkoutSummary(legacyFence),
     buildExportPayload(),
   ])
   const local = completedWorkoutSummary(localPayload.data.workoutSessions)
@@ -656,18 +857,25 @@ export async function recoverCloudSnapshot(): Promise<boolean> {
     local.count > (cloud?.count ?? 0)
   if (!localIsNewer && !localHasAdditionalLatestWorkout) return false
 
-  await uploadCloudSnapshot('workout_completed')
-  return true
+  // Still through the gate, so the legacy repair cannot bypass single-flight
+  // or publish inside a Coach reservation window.
+  return (
+    (await syncPendingLocalChanges('workout_completed', { force: true })) ===
+    'uploaded'
+  )
 }
 
 export async function fetchLatestCloudBriefing(): Promise<DailyBriefing | null> {
   if (!isCloudConfigured()) return null
   try {
+    const fence = await readSyncFence()
     const res = await fetch('/api/cloud/briefing/latest', {
       credentials: 'include',
     })
     if (res.status === 401) {
-      setCloudAuthPaired(false)
+      // Only tear down the session that issued this request; a reply that
+      // crossed a re-pair must not unpair the new one.
+      await handleAuthLoss(fence)
       return null
     }
     if (res.status === 404) {
@@ -704,11 +912,12 @@ export async function fetchCloudMemory(): Promise<{
 } | null> {
   if (!isCloudConfigured()) return null
   try {
+    const fence = await readSyncFence()
     const res = await fetch('/api/cloud/memory', {
       credentials: 'include',
     })
     if (res.status === 401) {
-      setCloudAuthPaired(false)
+      await handleAuthLoss(fence)
       return null
     }
     if (!res.ok) {
@@ -736,7 +945,149 @@ export async function fetchCloudMemory(): Promise<{
   }
 }
 
+export async function fetchCloudUpdates(): Promise<void> {
+  const results = await Promise.allSettled([
+    fetchLatestCloudBriefing(),
+    fetchCloudMemory(),
+  ])
+  const failed = results.find(
+    (result): result is PromiseRejectedResult => result.status === 'rejected',
+  )
+  if (failed) throw failed.reason
+}
+
 let installedBriefingRefresh = false
+
+// How long to wait after a local edit before pushing it. Long enough that a
+// burst of set logging is one upload, short enough that a history correction
+// reaches the daily coach without waiting for the next app launch.
+export const LOCAL_SYNC_DEBOUNCE_MS = 8_000
+
+// After a successful upload, work that arrived while that upload was in flight
+// is still pending by design. It gets a short drain pass rather than waiting
+// for the next user action — the case that used to strand an edit for good.
+export const LOCAL_SYNC_DRAIN_MS = 500
+
+// A Coach reservation is transient and is not a failure, so it is re-checked on
+// a modest fixed interval rather than a tight loop or the failure backoff.
+export const COACH_RESERVATION_RETRY_MS = 15_000
+
+let installedScheduler: (() => void) | null = null
+
+// The automatic sync scheduler.
+//
+// Three jobs, all of which were missing before:
+//   1. debounce a burst of local edits into one upload;
+//   2. actually wake at the backoff deadline, so a transient server failure
+//      recovers on its own instead of waiting for the user to do something;
+//   3. drain after a success, because an edit that landed while an upload was
+//      in flight is deliberately left pending by the revision watermark and
+//      would otherwise never get an automatic attempt.
+//
+// Every pass makes progress — it either uploads (advancing the watermark) or
+// records a failure (advancing the backoff) — so rescheduling cannot spin.
+export function startLocalSyncScheduler(): () => void {
+  let timer: ReturnType<typeof setTimeout> | null = null
+  let stopped = false
+  let running = false
+
+  const cancel = () => {
+    if (timer !== null) {
+      clearTimeout(timer)
+      timer = null
+    }
+  }
+
+  const scheduleIn = (delayMs: number) => {
+    if (stopped) return
+    cancel()
+    timer = setTimeout(() => {
+      timer = null
+      void attempt()
+    }, Math.max(0, delayMs))
+  }
+
+  const offline = () =>
+    typeof navigator !== 'undefined' && navigator.onLine === false
+
+  // Decide when — if ever — to wake next, from durable state rather than from
+  // whatever the last call happened to return.
+  const planNext = async (outcome: LocalSyncOutcome | 'failed') => {
+    if (stopped) return
+    if (outcome === 'not_paired') {
+      cancel()
+      return
+    }
+    if (outcome === 'deferred_coach_reservation') {
+      scheduleIn(COACH_RESERVATION_RETRY_MS)
+      return
+    }
+    const state = await getLocalSyncState()
+    if (stopped) return
+    if (state.localRevision <= state.syncedRevision) {
+      cancel()
+      return
+    }
+    // Offline: the 'online' listener takes over, so stop burning timers.
+    if (offline()) {
+      cancel()
+      return
+    }
+    if (state.nextAutoAttemptAt !== null) {
+      scheduleIn(state.nextAutoAttemptAt - Date.now())
+      return
+    }
+    scheduleIn(LOCAL_SYNC_DRAIN_MS)
+  }
+
+  const attempt = async () => {
+    if (stopped || running || offline()) return
+    running = true
+    let outcome: LocalSyncOutcome | 'failed' = 'failed'
+    try {
+      outcome = await syncPendingLocalChanges('manual', {
+        respectBackoff: true,
+      })
+    } catch {
+      // The failure is already recorded durably, together with its backoff.
+    } finally {
+      running = false
+    }
+    await planNext(outcome)
+  }
+
+  const stopMutations = subscribeLocalMutations(() => {
+    scheduleIn(LOCAL_SYNC_DEBOUNCE_MS)
+  })
+
+  const onOnline = () => {
+    // Regaining the network is new information, so it clears the backoff and
+    // tries immediately rather than waiting out a deadline set while offline.
+    void syncPendingLocalChanges('manual').then(
+      (outcome) => planNext(outcome),
+      () => planNext('failed'),
+    )
+  }
+  const onOffline = () => cancel()
+
+  if (typeof window !== 'undefined') {
+    window.addEventListener('online', onOnline)
+    window.addEventListener('offline', onOffline)
+  }
+
+  // Pick up anything already pending from a previous run.
+  void planNext('up_to_date')
+
+  return () => {
+    stopped = true
+    cancel()
+    stopMutations()
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('online', onOnline)
+      window.removeEventListener('offline', onOffline)
+    }
+  }
+}
 
 export function installCloudBriefingRefresh(): void {
   if (installedBriefingRefresh) return
@@ -755,10 +1106,7 @@ export function installCloudBriefingRefresh(): void {
         // Recovery status is persisted by the upload path. Briefing and memory
         // downloads remain independently useful during a transient failure.
       }
-      await Promise.allSettled([
-        fetchLatestCloudBriefing(),
-        fetchCloudMemory(),
-      ])
+      await fetchCloudUpdates()
     } catch {
       // Foreground fetch is advisory; the cached briefing remains visible.
     } finally {
@@ -772,4 +1120,6 @@ export function installCloudBriefingRefresh(): void {
   })
   window.addEventListener('focus', () => void refresh())
   window.addEventListener('online', () => void refresh())
+
+  installedScheduler ??= startLocalSyncScheduler()
 }

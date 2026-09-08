@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { ArrowRight, MessageCircle, Play, Plus, Sparkles, Zap } from 'lucide-react'
 import { BackupBanner } from '../components/BackupBanner'
-import { ErrorAlert } from '../components/Feedback'
+import { ErrorAlert, LoadFailure } from '../components/Feedback'
 import { CoachLink, Header, SettingsLink } from '../components/Header'
 import { QuickAiNoteCard } from '../components/QuickAiNoteCard'
 import { RecommendationBanner } from '../components/RecommendationBanner'
@@ -37,31 +37,38 @@ export function TodayScreen() {
   } | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [loadError, setLoadError] = useState<string | null>(null)
 
   const load = useCallback(async () => {
-    const resumable = (await getResumableSession()) ?? null
-    const program = (await getActiveProgram()) ?? null
-    let sessions: SessionTemplate[] = []
-    let suggestedIdx: number | null = null
-    if (program) {
-      sessions = (await getSessionsForProgram(program.id)).sort(
-        (a, b) => a.order - b.order,
-      )
-      if (sessions.length > 0) {
-        const lastCompleted = await getLastCompletedSessionForProgram(
-          program.id,
+    setLoadError(null)
+    try {
+      const resumable = (await getResumableSession()) ?? null
+      const program = (await getActiveProgram()) ?? null
+      let sessions: SessionTemplate[] = []
+      let suggestedIdx: number | null = null
+      if (program) {
+        sessions = (await getSessionsForProgram(program.id)).sort(
+          (a, b) => a.order - b.order,
         )
-        if (lastCompleted?.sessionTemplateId) {
-          const idx = sessions.findIndex(
-            (s) => s.id === lastCompleted.sessionTemplateId,
+        if (sessions.length > 0) {
+          const lastCompleted = await getLastCompletedSessionForProgram(
+            program.id,
           )
-          suggestedIdx = idx === -1 ? 0 : (idx + 1) % sessions.length
-        } else {
-          suggestedIdx = 0
+          if (lastCompleted?.sessionTemplateId) {
+            const idx = sessions.findIndex(
+              (s) => s.id === lastCompleted.sessionTemplateId,
+            )
+            suggestedIdx = idx === -1 ? 0 : (idx + 1) % sessions.length
+          } else {
+            suggestedIdx = 0
+          }
         }
       }
+      setState({ resumable, program, sessions, suggestedIdx })
+    } catch (err) {
+      // Without this, a rejected read left the skeleton on screen forever.
+      setLoadError(err instanceof Error ? err.message : String(err))
     }
-    setState({ resumable, program, sessions, suggestedIdx })
   }, [])
 
   useEffect(() => {
@@ -126,7 +133,14 @@ export function TodayScreen() {
             </div>
           }
         />
-        <TodaySkeleton />
+        {loadError ? (
+          <LoadFailure
+            message={`Could not load today's workout: ${loadError}`}
+            onRetry={() => void load()}
+          />
+        ) : (
+          <TodaySkeleton />
+        )}
       </>
     )
   }
@@ -144,33 +158,10 @@ export function TodayScreen() {
       />
       <div className="px-4 py-5 space-y-5 max-w-md mx-auto">
         <BackupBanner />
-        <RecommendationBanner />
-        <button
-          type="button"
-          onClick={() => navigate('/coach')}
-          className="card w-full p-4 flex items-center gap-3 text-left transition-colors hover:bg-[var(--color-surface-2)]"
-        >
-          <span
-            className="h-11 w-11 rounded-xl grid place-items-center shrink-0"
-            style={{
-              color: 'var(--color-accent)',
-              background: 'oklch(0.72 0.18 50 / 0.12)',
-              border: '1px solid oklch(0.72 0.18 50 / 0.25)',
-            }}
-          >
-            <MessageCircle size={22} />
-          </span>
-          <span className="min-w-0 flex-1">
-            <span className="flex items-center gap-1.5 font-semibold">
-              Ask Coach <Sparkles size={14} className="text-[var(--color-accent)]" />
-            </span>
-            <span className="block mt-0.5 text-sm text-[var(--color-fg-dim)]">
-              Adjust today, swap an exercise, or build a workout
-            </span>
-          </span>
-          <ArrowRight size={18} className="text-[var(--color-fg-faint)]" />
-        </button>
-        <QuickAiNoteCard />
+
+        {/* The workout is the reason this screen exists, so it sits above the
+            briefing, Coach, and note cards. On a phone those three used to push
+            Resume below the fold. */}
         {state.resumable ? (
           <section
             className="relative overflow-hidden rounded-2xl p-5"
@@ -179,6 +170,7 @@ export function TodayScreen() {
                 'linear-gradient(135deg, oklch(0.74 0.18 50) 0%, oklch(0.62 0.21 35) 100%)',
               color: 'oklch(0.18 0.04 50)',
             }}
+            aria-labelledby="today-primary-heading"
           >
             <span
               aria-hidden
@@ -189,7 +181,10 @@ export function TodayScreen() {
               <Zap size={14} strokeWidth={2.5} fill="currentColor" />
               In progress
             </div>
-            <h2 className="mt-2 text-2xl font-bold leading-tight">
+            <h2
+              id="today-primary-heading"
+              className="mt-2 text-2xl font-bold leading-tight"
+            >
               {state.resumable.name}
             </h2>
             {state.resumable.programName && (
@@ -207,14 +202,17 @@ export function TodayScreen() {
             </button>
           </section>
         ) : state.program && state.suggestedIdx !== null ? (
-          <section className="card p-5">
+          <section className="card p-5" aria-labelledby="today-primary-heading">
             <div className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-[var(--color-accent)]">
               Next up
             </div>
             <p className="text-xs text-[var(--color-fg-faint)] mt-0.5">
               {state.program.name}
             </p>
-            <h2 className="mt-3 text-3xl font-bold leading-tight">
+            <h2
+              id="today-primary-heading"
+              className="mt-3 text-3xl font-bold leading-tight"
+            >
               {state.sessions[state.suggestedIdx].name}
             </h2>
             <button
@@ -228,11 +226,12 @@ export function TodayScreen() {
             </button>
           </section>
         ) : (
-          <section className="card p-5 text-sm text-[var(--color-fg-dim)]">
-            No active program. Create one in{' '}
-            <strong className="text-[var(--color-fg)]">Programs</strong> or
-            start an empty workout below.
-          </section>
+          <GetStartedCard
+            hasEmptyProgram={state.program !== null}
+            busy={busy}
+            onCreateProgram={() => navigate('/programs')}
+            onStartEmpty={() => void startFreestyleNow()}
+          />
         )}
 
         {state.program && state.sessions.length > 1 && (
@@ -267,16 +266,98 @@ export function TodayScreen() {
           </section>
         )}
 
+        {/* A fresh install has no program and no history, so the empty-workout
+            escape hatch already lives inside GetStartedCard above. Repeating it
+            here would give the same action twice in one screen. */}
+        {(state.resumable !== null || state.program !== null) && (
+          <button
+            type="button"
+            onClick={() => void startFreestyleNow()}
+            disabled={busy}
+            className="btn-ghost w-full justify-center text-sm"
+          >
+            <Plus size={16} /> Start empty workout
+          </button>
+        )}
+        {error && <ErrorAlert message={error} />}
+
+        <RecommendationBanner />
         <button
           type="button"
-          onClick={() => void startFreestyleNow()}
-          disabled={busy}
-          className="btn-ghost w-full justify-center mt-2 text-sm"
+          onClick={() => navigate('/coach')}
+          className="card w-full p-4 flex items-center gap-3 text-left transition-colors hover:bg-[var(--color-surface-2)]"
         >
-          <Plus size={16} /> Start empty workout
+          <span
+            className="h-11 w-11 rounded-xl grid place-items-center shrink-0"
+            style={{
+              color: 'var(--color-accent)',
+              background: 'oklch(0.72 0.18 50 / 0.12)',
+              border: '1px solid oklch(0.72 0.18 50 / 0.25)',
+            }}
+          >
+            <MessageCircle size={22} />
+          </span>
+          <span className="min-w-0 flex-1">
+            <span className="flex items-center gap-1.5 font-semibold">
+              Ask Coach <Sparkles size={14} className="text-[var(--color-accent)]" />
+            </span>
+            <span className="block mt-0.5 text-sm text-[var(--color-fg-dim)]">
+              Adjust today, swap an exercise, or build a workout
+            </span>
+          </span>
+          <ArrowRight size={18} className="text-[var(--color-fg-faint)]" />
         </button>
-        {error && <ErrorAlert message={error} />}
+        <QuickAiNoteCard />
       </div>
     </>
+  )
+}
+
+// First-run entry point. Without an active program the old screen only offered
+// a sentence pointing at another tab; this gives the two real next steps.
+function GetStartedCard({
+  hasEmptyProgram,
+  busy,
+  onCreateProgram,
+  onStartEmpty,
+}: {
+  hasEmptyProgram: boolean
+  busy: boolean
+  onCreateProgram: () => void
+  onStartEmpty: () => void
+}) {
+  return (
+    <section className="card p-5" aria-labelledby="today-primary-heading">
+      <div className="flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-[var(--color-accent)]">
+        Get started
+      </div>
+      <h2
+        id="today-primary-heading"
+        className="mt-3 text-2xl font-bold leading-tight"
+      >
+        {hasEmptyProgram ? 'Add a session to your program' : 'Create a program'}
+      </h2>
+      <p className="mt-1.5 text-sm text-[var(--color-fg-dim)]">
+        {hasEmptyProgram
+          ? 'Your active program has no sessions yet. Add one to get a suggested workout here.'
+          : 'Build a reusable training template, or start logging right away and organise it later.'}
+      </p>
+      <button
+        type="button"
+        onClick={onCreateProgram}
+        className="btn-primary w-full mt-5 text-base"
+      >
+        <Plus size={18} />
+        {hasEmptyProgram ? 'Edit program' : 'Create a program'}
+      </button>
+      <button
+        type="button"
+        onClick={onStartEmpty}
+        disabled={busy}
+        className="btn-ghost w-full justify-center mt-2 text-sm"
+      >
+        <Play size={16} fill="currentColor" /> Start empty workout
+      </button>
+    </section>
   )
 }

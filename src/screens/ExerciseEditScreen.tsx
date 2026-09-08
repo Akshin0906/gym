@@ -8,7 +8,8 @@ import {
   updateExercise,
   type ExerciseInput,
 } from '../db/repositories/exercises'
-import type { Exercise, MuscleGroup } from '../db/types'
+import { LOAD_CONVENTIONS, type Exercise, type LoadConvention, type MuscleGroup } from '../db/types'
+import { LOAD_CONVENTION_LABELS } from '../lib/measurement'
 import {
   MUSCLE_LABEL,
   MUSCLE_ORDER,
@@ -59,6 +60,9 @@ export function ExerciseEditScreen() {
           notes: e.notes,
           defaultRestSeconds: e.defaultRestSeconds,
           hiddenFromLibrary: e.hiddenFromLibrary,
+          measurement: {
+            loadConvention: e.measurement?.loadConvention ?? 'unknown',
+          },
         })
       }
       setLoading(false)
@@ -232,6 +236,32 @@ export function ExerciseEditScreen() {
               }
               className="field nums"
             />
+          </Field>
+
+          <Field label="What the weight number means (optional)">
+            <select
+              value={input.measurement?.loadConvention ?? 'unknown'}
+              onChange={(e) =>
+                setInput({
+                  ...input,
+                  measurement: {
+                    loadConvention: e.target.value as LoadConvention,
+                  },
+                })
+              }
+              className="field"
+            >
+              {LOAD_CONVENTIONS.map((convention) => (
+                <option key={convention} value={convention}>
+                  {LOAD_CONVENTION_LABELS[convention]}
+                </option>
+              ))}
+            </select>
+            <span className="block text-xs text-[var(--color-fg-faint)] mt-1.5">
+              Leave this alone unless the number is not simply total pounds.
+              Sets already logged keep the meaning they were recorded with, so
+              changing this never rewrites old charts.
+            </span>
           </Field>
 
           {!isNew && existing && (

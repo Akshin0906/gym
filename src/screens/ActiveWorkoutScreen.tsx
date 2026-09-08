@@ -30,8 +30,13 @@ import type {
   SessionExerciseSnapshot,
   WorkoutSession,
 } from '../db/types'
-import { uploadCloudSnapshot } from '../lib/cloud'
+import { syncPendingLocalChanges } from '../lib/cloud'
 import { shouldCompleteExerciseAfterRest } from '../lib/workoutFlow'
+import {
+  countWorkingSets,
+  resolveSnapshotLoadConvention,
+} from '../lib/measurement'
+import { summarizeTonnage } from '../lib/analytics'
 import { useUnsavedChangesWarning } from '../lib/useUnsavedChangesWarning'
 import { useActiveWorkout } from '../store/activeWorkout'
 import { useTimer } from '../store/timer'
@@ -168,7 +173,10 @@ export function ActiveWorkoutScreen() {
     // leave it in limbo. Feedback fields are patched after, or stay null
     // if the user skips.
     await endSession(session.id)
-    void uploadCloudSnapshot('workout_completed').catch(() => {
+    // Through the coordinated gate: single-flight, and never inside a Coach
+    // reservation window. The completed session and its durable revision are
+    // already committed, so startup, foreground, and online recovery retry.
+    void syncPendingLocalChanges('workout_completed').catch(() => {
       // The completed session and pending-sync marker are durable locally;
       // startup, foreground, and online recovery will try again.
     })
@@ -181,7 +189,7 @@ export function ActiveWorkoutScreen() {
       // Queue a new durable generation immediately. If the completion upload is
       // still in flight, snapshot CAS makes either order converge on this newer
       // local state while the generation marker survives a tab close.
-      void uploadCloudSnapshot('workout_completed').catch(() => {
+      void syncPendingLocalChanges('workout_completed').catch(() => {
         // Settings keeps the last sync error and recovery keeps the retry.
       })
     }
@@ -293,11 +301,11 @@ export function ActiveWorkoutScreen() {
     setsByExercise.set(s.exerciseId, list)
   }
 
-  const totalSetsLogged = setsBySession.length
-  const totalVolume = setsBySession.reduce(
-    (sum, s) => sum + s.weightLbs * s.reps,
-    0,
-  )
+  const totalSetsLogged = countWorkingSets(setsBySession)
+  const totalWarmupSets = setsBySession.length - totalSetsLogged
+  // Only sets whose recorded load is a real external weight contribute; a
+  // machine setting or an assistance load is not lb-reps.
+  const totalVolume = summarizeTonnage(setsBySession).tonnage
 
   // Full expanded exercise card. Shared by the active group (top) and a done
   // exercise that's been reopened in place (bottom). Its Done button collapses
@@ -309,8 +317,13 @@ export function ActiveWorkoutScreen() {
       (a, b) => a.setNumber - b.setNumber,
     )
     const prev = previousByExercise.get(ex.id) ?? []
+    // Planned targets are working-set targets. Counting every logged row made a
+    // single warm-up read as "1/3 planned sets done", which is a claim the data
+    // does not support.
+    const workingCount = countWorkingSets(existing)
+    const warmupCount = existing.length - workingCount
     const targetReached =
-      snap.targetSets > 0 && existing.length >= snap.targetSets
+      snap.targetSets > 0 && workingCount >= snap.targetSets
     return (
       <section key={ex.id} className="space-y-3">
         <button
@@ -321,7 +334,7 @@ export function ActiveWorkoutScreen() {
         >
           {snap.targetSets > 0 && (
             <ProgressRing
-              value={existing.length}
+              value={workingCount}
               max={snap.targetSets}
               size={30}
               stroke={3}
@@ -340,13 +353,15 @@ export function ActiveWorkoutScreen() {
                       : ''
                   }
                 >
-                  {existing.length}/{snap.targetSets}
+                  {workingCount}/{snap.targetSets}
                 </span>{' '}
-                sets · {snap.targetRepRange || '—'}
+                sets{warmupCount > 0 && ` + ${warmupCount} warm-up`} ·{' '}
+                {snap.targetRepRange || '—'}
               </p>
             ) : (
               <p className="text-xs text-[var(--color-fg-faint)] nums mt-0.5">
-                {existing.length} {existing.length === 1 ? 'set' : 'sets'}
+                {workingCount} {workingCount === 1 ? 'set' : 'sets'}
+                {warmupCount > 0 && ` + ${warmupCount} warm-up`}
               </p>
             )}
           </div>
@@ -376,17 +391,17 @@ export function ActiveWorkoutScreen() {
           existingSets={existing}
           previousSets={prev}
           defaultRestSeconds={ex.defaultRestSeconds}
+          loadConvention={resolveSnapshotLoadConvention(snap)}
           onChange={() => void refreshSets(session.id)}
           onDraftChange={reportSetDraft}
-          onStartRest={(secs, committedSetCount) => {
+          onStartRest={(secs) => {
             startRest(secs, ex.id)
             // The spec's final-set flow is Log set → Start Rest → next
-            // exercise. Collapse only after the user has had that chance.
+            // exercise. Collapse only after the user has had that chance, and
+            // only once the *working* sets meet the target — a warm-up must
+            // never auto-complete a planned exercise.
             if (
-              shouldCompleteExerciseAfterRest(
-                snap.targetSets,
-                committedSetCount,
-              )
+              shouldCompleteExerciseAfterRest(snap.targetSets, workingCount)
             ) {
               markDone(ex.id)
             }
@@ -437,7 +452,7 @@ export function ActiveWorkoutScreen() {
             value={totalSetsLogged}
             className="text-[var(--color-fg)] font-semibold"
           />{' '}
-          sets
+          {totalWarmupSets > 0 ? 'work sets' : 'sets'}
         </span>
         <span>
           <CountUp

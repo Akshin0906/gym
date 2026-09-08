@@ -13,14 +13,23 @@ while plugged in; the display can still sleep.
 The job deliberately separates trusted operations from model reasoning:
 
 1. A Python supervisor acquires an OS-released file lock.
-2. It retries compatible pending uploads, validates the current cloud snapshot, and reuses an existing same-day briefing only when it was built from that exact snapshot.
+2. It retries compatible pending uploads, validates the current cloud snapshot,
+   and reuses an existing same-day briefing only when the snapshot, runner,
+   validator, prompt, packet schema, configured model, reasoning effort, and a
+   secret-free fingerprint of the newly sanitized recovery inputs all match the
+   current contract. A stale/unavailable-to-fresh or materially changed fresh
+   recovery record therefore regenerates even when workout data are unchanged.
 3. It refreshes Oura through the local OAuth companion and sanitizes recovery data.
 4. It fetches the existing Codex-owned training memory.
-5. It invokes `codex exec` with ChatGPT subscription authentication.
-6. Codex runs from an automation-only `CODEX_HOME` with web search and every currently exposed tool-bearing feature disabled, and receives no app secrets or Oura tokens.
-7. Codex returns one JSON object constrained by `codex_daily_briefing_output_schema.json`.
-8. The supervisor deterministically owns memory state/provenance, trusted metadata, the Oura summary, and snapshot-age warnings; it audits the Codex JSONL stream for tool use, then spools the result.
-9. One server-side transaction compare-and-sets both the snapshot timestamp and memory revision before writing memory plus the briefing; the supervisor verifies the committed reads.
+5. It constructs a bounded, deduplicated `briefingEvidencePacket` for today's
+   decision and a separate candidate-scoped `memorySourcePacket` for memory
+   creation. The full workout database remains canonical storage outside the
+   model context.
+6. It invokes `codex exec` with ChatGPT subscription authentication.
+7. Codex runs from an automation-only `CODEX_HOME` with web search and every currently exposed tool-bearing feature disabled, and receives no app secrets or Oura tokens.
+8. Codex returns one JSON object constrained by `codex_daily_briefing_output_schema.json`.
+9. The supervisor deterministically owns evidence selection, memory state/provenance, trusted metadata, the Oura summary, and snapshot-age warnings; it audits the Codex JSONL stream for tool use, then spools the result.
+10. One server-side transaction compare-and-sets both the snapshot timestamp and memory revision before writing memory plus the briefing; the supervisor verifies the committed reads.
 
 If upload fails after generation, later same-day or next-day launches retry the
 version-bound spool rather than consuming another Codex turn. A changed cloud
@@ -28,6 +37,93 @@ snapshot or memory revision quarantines the artifact instead of publishing it.
 A transient or server-contract failure on an older spool leaves that artifact
 pending but never blocks today's check or generation. Runs are ephemeral and do
 not create hidden Codex conversation history.
+
+### Bounded context and memory separation
+
+The daily agent is a decision synthesizer, not a full-database reader. The
+supervisor projects canonical data into two purpose-separated inputs:
+
+- `briefingEvidencePacket` retains a current resumable workout when one is
+  eligible for today, otherwise the next rotated programmed session. It also
+  retains bounded recent safety evidence with explicit timestamps, up to three
+  recent complete workout episodes, up to three same-exercise comparators per
+  scheduled movement, explicit missingness and subjective-signal contradictions, one
+  deduplicated recovery view, and non-overlapping older summaries or notes.
+- `memorySourcePacket` contains only the source records, notes, summaries, and
+  references required by `supervisorCandidatePlan`. Its periodic-candidate
+  digests aggregate all canonical session sources while retaining at most four
+  bounded session samples; periodic sources are not expanded into full session
+  episodes. Memory compaction remains a separate candidate-scoped input/output
+  lane within the same invocation, and its duplicate records cannot reinforce
+  the daily decision.
+
+Each citable domain atom has an internal `evidenceId`; its `sourceStoryId`
+groups representations derived from the same session, note, summary, or
+recovery record. This prevents one record from masquerading as repeated
+evidence. Distinct atoms in one story can still describe different domains,
+but repetition requires distinct source stories. Recent intervals use compact
+session episodes. The older-summary selector preserves recent 14-day detail
+and, when available, a non-overlapping older four-month horizon; neither is an
+independent mode trigger. Prior briefings, recommendations, Coach receipts,
+unrelated programs and exercises, and workout-memory copies of canonical
+sessions are excluded from decision context.
+
+The packet's `subjectiveSignalContradictions` are deterministic directional
+cues between PRS and perceived performance. They help preserve disagreement,
+but are not a validated classifier, an independent evidence atom, or a claim
+about logged performance.
+
+Before applying the overall budget, the supervisor creates deterministic
+field-level excerpts and source compactions. Notes are limited to 400
+characters, current context to 1,400 characters, each recent episode to eight
+movements with four retained sets per movement, and the current plan to 16
+movements. Truncation and compaction objects retain original, retained, and
+omitted counts or hashes so the model cannot mistake an excerpt for a full
+record.
+
+The memory plan exposes bounded projections of candidate provenance. Codex must
+echo the projected `sourceSessionIds` and `sourceSummaryIds` exactly; after
+validating them, the supervisor restores the complete canonical source lists
+before persistence. Note IDs are limited to the supplied allowed subset, and
+note bodies are never expanded beyond their bounded excerpts. For 14-day
+candidates, `periodicCandidateDigests` compute period-wide counts from every
+canonical session and retain no more than four illustrative samples. Four-month
+candidates use exactly eight consecutive, non-overlapping 14-day summaries,
+forming one gap-free 112-day `four_month` rollup. This prevents calendar-month
+boundaries from permanently dropping a crossing 14-day child. Malformed,
+missing, or overlapping sources block the candidate, and the long-horizon
+cursor waits until the sequential 14-day lane has caught up.
+Summary-to-summary provenance
+is recursively resolved to its underlying workout sessions before decision
+deduplication.
+
+AI-note decision recency follows the latest saved body (`updatedAt`, never
+earlier than `createdAt`) and exposes both timestamps plus their meaning. This
+keeps an edited current safety note current without pretending its described
+event necessarily happened at the edit time.
+
+The model-input data budget is 48,000 serialized UTF-8 bytes and the full prompt
+budget is 81,920 bytes. Selected safety evidence, the current resumable or next
+programmed session, up to three available compact recent episodes, and the
+recovery lane remain mandatory. If that bounded core cannot fit, generation
+fails closed. Optional
+older summaries are removed first while preserving the newest summary of each
+horizon when possible. The supervisor then defers whole periodic memory
+candidates and their dependents, then whole selected workout-memory candidates,
+only when the input-byte budget requires it; it next removes the oldest
+comparable exposures and finally general notes. The separately bounded workout
+backlog is staged across runs rather than inferred by the model. The supervisor
+never cuts serialized JSON in the middle of a value or emits a partial memory
+candidate.
+
+Trusted telemetry records `briefingPacketBytes`, `memorySourcePacketBytes`,
+`supervisorPlanBytes`, `totalInputBytes`, selected and deferred memory-candidate
+counts and reasons, and retained/pruned history counts without logging workout
+content. This bounded, retrieved structure reduces the risk of relevant
+evidence being buried in a long prompt, as studied in
+[Lost in the Middle](https://aclanthology.org/2024.tacl-1.9/), while preserving
+session-level chronology recommended by
+[LongMemEval](https://arxiv.org/abs/2410.10813).
 
 ## Evidence and writing policy
 
@@ -59,11 +155,76 @@ is intentionally conservative:
   recovery, and no proprietary score alone selects `light`, `deload`, or
   `rest`.
 
-Exact readiness cutoffs and fixed percentage deloads are deliberately omitted;
-the evidence for deload prescription is still limited and largely
-[consensus-based](https://pubmed.ncbi.nlm.nih.gov/37730925/). Explicit recent
-injury, illness, or red-flag symptoms always take priority over performance
-data, without diagnosis.
+The model evaluates evidence by domain rather than producing a weighted
+readiness score. This follows the IOC consensus that monitoring should combine
+external work, internal response, performance, subjective wellbeing, and
+health symptoms rather than rely on one marker
+([consensus statement](https://pmc.ncbi.nlm.nih.gov/articles/PMC5013087/)):
+
+1. Current safety reports are a gate and can override ordinary optimization.
+2. Same-exercise performance and completed exposure are the primary progression evidence.
+3. Per-set and whole-session RPE jointly describe one internal-effort domain.
+4. Pre-workout recovery, perceived performance, and user context describe one subjective state/outcome domain.
+5. Oura sleep and readiness form one supporting wearable domain.
+6. Repeated comparable exposures and non-overlapping summaries describe long-term adaptation.
+
+Correlated fields are not independent votes: load, reps, sets, and volume from
+one session are one external-work story; set RPE and session RPE are one effort
+story; logged and perceived performance are two views of one outcome; Oura
+sleep and readiness are one wearable story. A raw workout and a summary derived
+from it are correlated history, not independent votes. Missing or skipped data
+are unknown, not neutral. Material disagreement is preserved rather than
+averaged away, and mixed, sparse, stale, or non-comparable evidence defaults to
+`normal` unless a current safety report requires otherwise.
+
+All comparisons are within-person and exercise performance is used only across
+comparable exposures of a movement scheduled today. The app treats PRS as
+within-person context; a small resistance-training
+[PRS study](https://pubmed.ncbi.nlm.nih.gov/35255478/) supports pairing it with
+subsequent performance rather than applying a universal cutoff. A completed
+session's PRS remains historical, even if recorded today. Only
+`currentProgrammedSession.currentSubjectiveState` on a resumable workout is
+current; on its own, PRS 0-3 can make only `light` directly eligible, while a
+higher current PRS never unlocks `push`. The stored
+0-10 session RPE is an intensity rating, not session-load without reliable
+active duration, consistent with the original
+[session-RPE method](https://pubmed.ncbi.nlm.nih.gov/11708692/). The automation
+does not calculate weighted readiness, acute:chronic workload ratios, workload
+safe zones, or injury-risk percentages; ratio-based injury thresholds have
+important conceptual and statistical limitations described in a
+[critical analysis](https://pubmed.ncbi.nlm.nih.gov/32502973/).
+
+Exact readiness cutoffs and fixed percentage deload prescriptions are
+deliberately omitted; the evidence for deload prescription is still limited and
+largely [consensus-based](https://pubmed.ncbi.nlm.nih.gov/37730925/). The 3%
+historical performance-marker decline below is an eligibility screen, not a
+prescribed reduction. Explicit recent injury, illness, or red-flag symptoms
+always take priority over performance data, without diagnosis.
+
+Mode selection remains deliberately conservative and is checked against typed
+evidence IDs. Historical adverse feedback is actionable only inside an
+inclusive seven-day window, while progression and decline comparisons use an
+inclusive 90-day window. `push` requires at least two exact-target,
+progression-eligible same-movement exposures from distinct sessions, stable or
+improving logged markers, perceived performance of at least 3, no pain, and
+session RPE below 9. It is blocked by recent pain from any retained session,
+current PRS 0-3, or a current red flag; poor perceived performance or session
+RPE 9-10 is an automatic blocker only on a scheduled-movement comparator, while
+unrelated values remain context. `light` requires current PRS 0-3, recent poor
+perceived performance, pain that modified/stopped training, a current red flag,
+or 9-10 session RPE corroborated by poor performance or modifying pain.
+Historical PRS and pain reported as present without effect remain context rather
+than independently authorizing `light`. `deload` requires three strictly
+declining comparable external markers, at least 3% from oldest to newest, plus
+an eligible current state, corroborated internal-response, or material safety
+atom. Historical PRS and perceived performance cannot serve as the second
+domain because they are calibration/outcome views of the same session.
+`rest` requires
+seven-day stopped-pain evidence or an eligible current/same-day unresolved red
+flag. Sparse or mixed evidence remains `normal`, which may carry no supporting
+ID. The 7-day, 90-day, and 3% thresholds are conservative product eligibility
+guardrails, not validated clinical or physiological cutoffs; passing one
+permits but never compels a mode. Oura alone never changes the mode.
 
 ## Schedule
 
@@ -71,7 +232,8 @@ The launch agent tries at 10:30 AM Pacific, then at 11:00 AM, noon, 3:00 PM,
 4:00 PM, 6:00 PM, and 9:00 PM. It also checks once after login. The later
 launches provide bounded upload retries; all attempts are idempotent and stop
 before Codex when a verified briefing already matches the current phone
-snapshot. If a completed workout reaches the cloud later that day, the next
+snapshot and the current runner, validator, prompt, packet, model, and reasoning
+contract. If the snapshot or contract changes later that day, the next
 scheduled check replaces the older briefing automatically.
 
 When Oura is stale or unavailable before noon, the early runs wait for the next
@@ -116,6 +278,54 @@ Useful commands:
 
 `sync_launchd_runtime.sh` remains as a compatibility alias for `update`.
 
+## Supervisor module layout
+
+`daily_briefing_runner.py` is the entry point and owns everything that touches
+the outside world: configuration and credential loading, process supervision and
+signal handling, the Oura subprocess, Codex invocation and its JSONL audit,
+locking, logging, and the `run`/`doctor` command surface. The parts that are
+pure data handling live in the `briefing/` package next to it:
+
+| Module | Responsibility |
+| --- | --- |
+| `errors.py` | Error taxonomy and process exit codes |
+| `constants.py` | Version markers, packet/prompt budgets, safety regexes |
+| `primitives.py` | Strict coercions for untrusted JSON, Pacific-day arithmetic |
+| `models.py` | Dataclasses passed between stages |
+| `textutil.py` | Bounded text handling, evidence ids, byte accounting |
+| `measurement.py` | One-rep-max, rep ranges, load conventions |
+| `recovery.py` | Oura sanitisation, freshness policy, fingerprints |
+| `cloudclient.py` | Authenticated cloud client that rejects redirects |
+| `evidence.py` | Bounded evidence packet construction |
+| `memory.py` | Trusted memory state and candidate derivation |
+| `validation.py` | Snapshot, model-output, and spool contract validation |
+| `publishing.py` | Atomic spool publishing with commit verification |
+
+The entry point re-exports every public name from the package, so the module
+surface it presents is unchanged: the launchd wrapper, the staged release, and
+the test-suite all still import one module, and patching a name on it still
+reaches the `run()` call sites.
+
+`stage_release` in `manage_daily_briefing.sh` installs the package from an
+explicit module list rather than a glob, byte-compiles every file, and then runs
+the staged copy in a clean environment to prove it imports without the working
+tree on `sys.path`. A module that is added to the source tree but not to that
+list — or one that fails to import — fails the release before the live
+installation is touched, and the transaction rolls back.
+
+### Shared calculation fixtures
+
+`shared_fixtures/calculations.json` pins the calculations that exist in both the
+app and the supervisor: the one-rep-max formula, rep-range parsing, load
+comparability, and which loads have a defined tonnage.
+`automation/tests/test_shared_fixtures.py` and `src/lib/sharedFixtures.test.ts`
+assert the same expectations against their own implementation, so a divergence
+fails exactly one of the two suites.
+
+The file also records one deliberate difference: the app treats a bare `10` as a
+rep target, while the supervisor only recognises an explicit range. Both
+behaviours are asserted rather than left to drift.
+
 ## Runtime layout
 
 Private runtime data lives under `~/.workout-tracker-codex-daily`:
@@ -153,6 +363,8 @@ Launchd uses these safe defaults:
 - Model: `gpt-5.6-sol`
 - Reasoning effort: Extra High (`xhigh`)
 - Codex timeout: 20 minutes
+- Model-input data budget: 48,000 serialized UTF-8 bytes
+- Full prompt budget: 81,920 serialized UTF-8 bytes
 - Oura sync and briefing window: 45 days
 - Snapshot maximum age: 7 Pacific calendar days
 
@@ -173,6 +385,7 @@ the legacy Codex app, then `PATH`. This prevents another app-rename failure.
 python3 -m unittest discover -s automation/tests -v
 bash -n automation/*.sh
 plutil -lint automation/*.plist
+python3 -m compileall -q automation
 ```
 
 ## Local Coach chat bridge
