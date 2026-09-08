@@ -11,7 +11,10 @@ import signal
 from zoneinfo import ZoneInfo
 
 
-RUNNER_VERSION = "3.9"
+# 3.10 repairs the prompt-budget arithmetic: the evidence allowance is derived
+# from the measured prompt scaffold rather than assumed. A 3.9 spool is
+# therefore not reusable, and `validate_spool` rejects it on this marker.
+RUNNER_VERSION = "3.10"
 
 PROMPT_VERSION = "2026-09-08-shared-evidence-guide-v1"
 
@@ -80,6 +83,12 @@ MODEL_SYNC_WARNING_MARKERS = (
     "workout data may be stale",
 )
 
+# Ceiling on the serialized evidence packet. The allowance actually used is
+# DERIVED per run from what the rendered prompt costs (see
+# `model_input_packet_budget` in daily_briefing_runner.py) and is never larger
+# than this. Treating this number as the real allowance is what broke the
+# 3.9 release: the static prompt grew past 44 KB, and 44 KB of scaffold plus a
+# packet filled to 48 KB is 92 KB against an 81,920-byte prompt budget.
 MODEL_INPUT_PACKET_MAX_BYTES = 48_000
 
 MODEL_PROMPT_MAX_BYTES = 81_920

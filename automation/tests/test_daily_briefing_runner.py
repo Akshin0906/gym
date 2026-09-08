@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import importlib.util
 import json
 import logging
 import os
+import shutil
 import signal
 import sys
 import tempfile
@@ -6587,6 +6589,426 @@ class SchemaTests(unittest.TestCase):
                 "sourceSummaryIds",
             },
         )
+
+
+class PromptBudgetTests(BriefingHarness):
+    """The evidence allowance must come from what the prompt actually costs.
+
+    Release 3.9 shipped a 48,000-byte packet ceiling applied as if the
+    instructions and the shared evidence guide were free. They are more than
+    half the prompt, and the first real full-context run failed while
+    assembling the prompt with "Model prompt requires 92415 bytes, exceeding
+    the 81920-byte full prompt budget" — so that attempt produced no new
+    briefing.
+    """
+
+    UNICODE = "Ünïcödé — a note with an em dash, 25 kg, and “curly quotes”. "
+
+    def config(self):
+        return runner.Config.from_env()
+
+    def prompt_arguments(self) -> dict:
+        return {
+            "today": "2026-08-01",
+            "now": dt.datetime(2026, 8, 1, 12, 0, tzinfo=PACIFIC),
+            "run_id": "r" * 36,
+            "prompt_hash": "a" * 64,
+        }
+
+    def saturated_facts(self, movements: int = 8, sessions: int = 30):
+        """A history large enough to saturate any plausible packet budget."""
+        long_text = self.UNICODE + (
+            "a long description of how the session actually went " * 20
+        )
+        body = snapshot_body(self.updated_at)
+        data = body["snapshot"]["payload"]["data"]
+        data["exercises"] = [
+            {
+                "id": f"ex-{index}",
+                "name": f"Exercise {self.UNICODE}{index} " + "x" * 50,
+                "measurement": {"loadConvention": "total"},
+            }
+            for index in range(movements)
+        ]
+        data["programs"] = [
+            {"id": "prog", "name": "Program " + "p" * 40, "isActive": 1}
+        ]
+        data["sessionTemplates"] = [
+            {"id": "tpl", "programId": "prog", "name": "Today " + "t" * 40, "order": 0}
+        ]
+        data["templateExercises"] = [
+            {
+                "id": f"te-{index}",
+                "sessionTemplateId": "tpl",
+                "exerciseId": f"ex-{index}",
+                "order": index,
+                "targetSets": 4,
+                "targetRepRange": "8-12",
+                "repBounds": {"min": 8, "max": 12},
+            }
+            for index in range(movements)
+        ]
+        snapshot = [
+            {
+                "exerciseId": f"ex-{index}",
+                "order": index,
+                "targetSets": 4,
+                "targetRepRange": "8-12",
+                "repBounds": {"min": 8, "max": 12},
+                "loadConvention": "total",
+            }
+            for index in range(movements)
+        ]
+        workouts = []
+        logged = []
+        for session in range(sessions):
+            completed = self.updated_at - (session + 1) * 86_400_000
+            session_id = f"sat-{session}"
+            workouts.append(
+                {
+                    "id": session_id,
+                    "name": f"Session {self.UNICODE}{session} " + "s" * 40,
+                    "programId": "prog",
+                    "programName": "Program " + "p" * 40,
+                    "sessionTemplateId": "tpl",
+                    "startedAt": completed - 3_600_000,
+                    "completedAt": completed,
+                    "exerciseSnapshot": snapshot,
+                    "preWorkoutCheckIn": {
+                        "version": 1,
+                        "perceivedRecovery": 6,
+                        "recordedAt": completed - 3_000,
+                    },
+                    "postWorkoutFeedback": {
+                        "version": 2,
+                        "performance": 3,
+                        "sessionRpe": 7,
+                        "painImpact": "none",
+                    },
+                }
+            )
+            for index in range(movements):
+                for number in range(5):
+                    logged.append(
+                        {
+                            "id": f"set-{session}-{index}-{number}",
+                            "workoutSessionId": session_id,
+                            "exerciseId": f"ex-{index}",
+                            "setNumber": number + 1,
+                            "weightLbs": 100 + number,
+                            "reps": 10,
+                            "rpe": 8,
+                            "loggedAt": completed - 2_000 + number,
+                            "loadConvention": "total",
+                            "setKind": "working",
+                        }
+                    )
+        data["workoutSessions"] = workouts
+        data["loggedSets"] = logged
+        start = pacific_ms(2025, 6, 1)
+        data["aiMemorySettings"] = [
+            {
+                "id": "default",
+                "currentContext": long_text,
+                "paused": False,
+                "windowStartedAt": start,
+                "fourMonthStartedAt": start,
+                "createdAt": start,
+                "updatedAt": self.updated_at,
+            }
+        ]
+        data["aiNotes"] = [
+            {
+                "id": f"note-{index}",
+                "body": f"Note {index} " + long_text,
+                "createdAt": self.updated_at - index * 3_600_000,
+                "updatedAt": self.updated_at - index * 3_600_000,
+            }
+            for index in range(25)
+        ]
+        summaries = []
+        cursor = start
+        for index in range(20):
+            end = runner.add_calendar_days_ms(cursor, runner.TWO_WEEK_PERIOD_DAYS)
+            summaries.append(
+                {
+                    "id": f"tw-{index}",
+                    "periodType": "two_week",
+                    "periodStartAt": cursor,
+                    "periodEndAt": end,
+                    "bullets": [f"Period {index} " + long_text],
+                    "sourceSessionIds": [],
+                    "sourceNoteIds": [],
+                    "sourceSummaryIds": [],
+                    "model": "codex",
+                    "createdAt": end,
+                    "updatedAt": end,
+                }
+            )
+            cursor = end
+        data["aiMemorySummaries"] = summaries
+        memory = {
+            "revision": 0,
+            "state": {
+                "currentContext": long_text,
+                "paused": False,
+                "windowStartedAt": start,
+                "fourMonthStartedAt": start,
+            },
+            "items": [],
+        }
+        return runner.validate_snapshot(body, dt.date(2026, 8, 1)), memory
+
+    def temporary_config(self, *, instructions: str, guide: str):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        prompt_file = directory / "prompt.md"
+        guide_file = directory / "evidence_guide.md"
+        prompt_file.write_text(instructions, encoding="utf-8")
+        guide_file.write_text(guide, encoding="utf-8")
+        return dataclasses.replace(
+            self.config(), prompt_file=prompt_file, evidence_guide_file=guide_file
+        )
+
+    def test_the_allowance_is_derived_from_the_measured_scaffold(self) -> None:
+        config = self.config()
+        arguments = self.prompt_arguments()
+        scaffold = runner.model_prompt_scaffold_bytes(config, **arguments)
+        allowance = runner.model_input_packet_budget(config, **arguments)
+        self.assertLessEqual(allowance, runner.MODEL_INPUT_PACKET_MAX_BYTES)
+        # Every byte of the prompt budget is accounted for, none of it twice.
+        self.assertEqual(scaffold + allowance, runner.MODEL_PROMPT_MAX_BYTES)
+        # And the shipped prompt is genuinely too large for the old fixed
+        # ceiling, which is exactly what broke the release.
+        self.assertGreater(
+            scaffold + runner.MODEL_INPUT_PACKET_MAX_BYTES,
+            runner.MODEL_PROMPT_MAX_BYTES,
+        )
+
+    def test_the_packet_ceiling_still_caps_a_small_prompt(self) -> None:
+        # A short prompt does not entitle the packet to grow without limit.
+        config = self.temporary_config(
+            instructions="# Short prompt\n",
+            guide=f"Guide version `{runner.EVIDENCE_GUIDE_VERSION}`.\n",
+        )
+        self.assertEqual(
+            runner.model_input_packet_budget(config, **self.prompt_arguments()),
+            runner.MODEL_INPUT_PACKET_MAX_BYTES,
+        )
+
+    def test_a_saturated_history_renders_inside_the_prompt_budget(self) -> None:
+        facts, memory = self.saturated_facts()
+        config = self.config()
+        arguments = self.prompt_arguments()
+        bundle = runner.build_budgeted_input_bundle(
+            config,
+            facts=facts,
+            memory_body=memory,
+            recovery=self.recovery,
+            **arguments,
+        )
+        prompt = runner.build_model_prompt(
+            config,
+            facts=facts,
+            snapshot_body=None,
+            memory_body=memory,
+            recovery=self.recovery,
+            input_bundle=bundle,
+            **arguments,
+        )
+        prompt_bytes = len(prompt.encode("utf-8"))
+        self.assertLessEqual(prompt_bytes, runner.MODEL_PROMPT_MAX_BYTES)
+        # The packet really did saturate: this is not passing because the
+        # fixture happens to be small.
+        self.assertGreater(bundle.telemetry["totalInputBytes"], 20_000)
+        # Mandatory evidence survives the squeeze.
+        packet = bundle.inputs["briefingEvidencePacket"]
+        self.assertEqual(packet["currentProgrammedSession"]["status"], "available")
+        self.assertTrue(packet["recentSessionEpisodes"])
+        self.assertTrue(packet["allowedEvidenceIds"])
+        self.assertIn(runner.EVIDENCE_GUIDE_VERSION, prompt)
+
+    def test_the_rendered_prompt_is_exactly_scaffold_plus_packet(self) -> None:
+        # Including non-ASCII text, where an ensure_ascii mismatch between the
+        # measurement and the rendering would silently inflate the real prompt.
+        facts, memory = self.saturated_facts(movements=3, sessions=4)
+        config = self.config()
+        arguments = self.prompt_arguments()
+        bundle = runner.build_budgeted_input_bundle(
+            config,
+            facts=facts,
+            memory_body=memory,
+            recovery=self.recovery,
+            **arguments,
+        )
+        packet_json = runner.compact_json_text(bundle.inputs)
+        self.assertIn("Ünïcödé", packet_json)
+        # The budgeted metric and the rendered bytes are the same number.
+        self.assertEqual(
+            runner.compact_json_bytes(bundle.inputs),
+            len(packet_json.encode("utf-8")),
+        )
+        prompt = runner.build_model_prompt(
+            config,
+            facts=facts,
+            snapshot_body=None,
+            memory_body=memory,
+            recovery=self.recovery,
+            input_bundle=bundle,
+            **arguments,
+        )
+        scaffold = runner.model_prompt_scaffold_bytes(config, **arguments)
+        self.assertEqual(
+            len(prompt.encode("utf-8")),
+            scaffold + len(packet_json.encode("utf-8")),
+        )
+
+    def test_a_small_context_fits_far_below_any_fixed_floor(self) -> None:
+        # There is no universal minimum packet size: a sparse history packs
+        # into a few kilobytes. Driven through the real budgeting path with an
+        # allowance of exactly 8,000 bytes, so a fixed floor of any consequence
+        # — an earlier draft used 32,000 — would reject this valid run.
+        config = self.config()
+        arguments = self.prompt_arguments()
+        memory = {"revision": 0, "state": None, "items": []}
+        scaffold = runner.model_prompt_scaffold_bytes(config, **arguments)
+        max_prompt_bytes = scaffold + 8_000
+        self.assertEqual(
+            runner.model_input_packet_budget(
+                config, max_prompt_bytes=max_prompt_bytes, **arguments
+            ),
+            8_000,
+        )
+        bundle = runner.build_budgeted_input_bundle(
+            config,
+            facts=self.facts,
+            memory_body=memory,
+            recovery=self.recovery,
+            max_prompt_bytes=max_prompt_bytes,
+            **arguments,
+        )
+        self.assertLess(bundle.telemetry["totalInputBytes"], 8_000)
+        self.assertTrue(bundle.inputs["briefingEvidencePacket"]["allowedEvidenceIds"])
+        prompt = runner.build_model_prompt(
+            config,
+            facts=self.facts,
+            snapshot_body=None,
+            memory_body=memory,
+            recovery=self.recovery,
+            input_bundle=bundle,
+            max_prompt_bytes=max_prompt_bytes,
+            **arguments,
+        )
+        self.assertLessEqual(len(prompt.encode("utf-8")), max_prompt_bytes)
+
+    def test_a_scaffold_that_cannot_fit_at_all_fails_clearly(self) -> None:
+        config = self.temporary_config(
+            instructions="#" + "x" * runner.MODEL_PROMPT_MAX_BYTES,
+            guide=f"Guide version `{runner.EVIDENCE_GUIDE_VERSION}`.\n",
+        )
+        with self.assertRaisesRegex(
+            runner.ConfigError, "alone exceeds the .* prompt budget"
+        ):
+            runner.model_input_packet_budget(config, **self.prompt_arguments())
+
+    def test_mandatory_data_that_cannot_fit_names_both_causes(self) -> None:
+        # The packet builder owns "how small can THIS input get"; the wrapper
+        # adds where the rest of the budget went.
+        facts, memory = self.saturated_facts(movements=3, sessions=4)
+        config = self.config()
+        arguments = self.prompt_arguments()
+        scaffold = runner.model_prompt_scaffold_bytes(config, **arguments)
+        with self.assertRaises(runner.ConfigError) as caught:
+            runner.build_budgeted_input_bundle(
+                config,
+                facts=facts,
+                memory_body=memory,
+                recovery=self.recovery,
+                max_prompt_bytes=scaffold + 1_000,
+                **arguments,
+            )
+        message = str(caught.exception)
+        self.assertIn("Mandatory safety, current-plan", message)
+        self.assertIn(str(scaffold), message)
+        self.assertIn("leaving 1000 bytes for evidence", message)
+
+    def test_a_caller_supplied_bundle_is_rendered_exactly_as_built(self) -> None:
+        # Generation and validation must see one trimming decision, so a
+        # supplied bundle is never silently re-trimmed to a different budget.
+        facts, memory = self.saturated_facts(movements=3, sessions=4)
+        config = self.config()
+        arguments = self.prompt_arguments()
+        # A deliberately tighter custom budget than this run would derive.
+        custom_budget = 28_000
+        bundle = runner.build_model_input_bundle(
+            facts=facts,
+            memory_body=memory,
+            recovery=self.recovery,
+            today=arguments["today"],
+            max_input_bytes=custom_budget,
+        )
+        self.assertLess(
+            custom_budget,
+            runner.model_input_packet_budget(config, **arguments),
+        )
+        prompt = runner.build_model_prompt(
+            config,
+            facts=facts,
+            snapshot_body=None,
+            memory_body=memory,
+            recovery=self.recovery,
+            input_bundle=bundle,
+            **arguments,
+        )
+        self.assertEqual(bundle.telemetry["maxInputBytes"], custom_budget)
+        self.assertIn(runner.compact_json_text(bundle.inputs), prompt)
+
+    def test_telemetry_records_the_scaffold_and_validation_checks_it(self) -> None:
+        facts, memory = self.saturated_facts(movements=3, sessions=4)
+        config = self.config()
+        arguments = self.prompt_arguments()
+        bundle = runner.build_budgeted_input_bundle(
+            config,
+            facts=facts,
+            memory_body=memory,
+            recovery=self.recovery,
+            **arguments,
+        )
+        prompt = runner.build_model_prompt(
+            config,
+            facts=facts,
+            snapshot_body=None,
+            memory_body=memory,
+            recovery=self.recovery,
+            input_bundle=bundle,
+            **arguments,
+        )
+        telemetry = runner.model_prompt_telemetry(prompt, bundle)
+        self.assertEqual(
+            telemetry["promptScaffoldBytes"],
+            runner.model_prompt_scaffold_bytes(config, **arguments),
+        )
+        validated = self.validate(
+            self.mode_output("normal", []),
+            memory=memory,
+            facts=facts,
+            input_bundle=bundle,
+            packet_telemetry=telemetry,
+        )
+        summary = validated["briefing"]["inputSummary"]
+        self.assertEqual(
+            summary["promptScaffoldBytes"], telemetry["promptScaffoldBytes"]
+        )
+        self.assertEqual(summary["maxInputBytes"], bundle.telemetry["maxInputBytes"])
+        # Telemetry paired with a different bundle is rejected.
+        with self.assertRaisesRegex(runner.ConfigError, "telemetry is inconsistent"):
+            self.validate(
+                self.mode_output("normal", []),
+                memory=memory,
+                facts=facts,
+                input_bundle=bundle,
+                packet_telemetry={**telemetry, "promptScaffoldBytes": 1},
+            )
 
 
 if __name__ == "__main__":

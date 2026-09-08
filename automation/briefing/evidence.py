@@ -3450,4 +3450,9 @@ def model_prompt_telemetry(
         "promptBytes": prompt_bytes,
         "promptMaxBytes": max_prompt_bytes,
         "promptBudgetRemainingBytes": max_prompt_bytes - prompt_bytes,
+        # What the instructions and the shared evidence guide cost before any
+        # evidence. The packet allowance is derived from exactly this number,
+        # so recording it makes a budget failure diagnosable from the published
+        # metadata alone rather than by re-deriving it later.
+        "promptScaffoldBytes": prompt_bytes - bundle.telemetry["totalInputBytes"],
     }

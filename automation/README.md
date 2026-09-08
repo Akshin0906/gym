@@ -363,8 +363,32 @@ Launchd uses these safe defaults:
 - Model: `gpt-6-astra`
 - Reasoning effort: High (`high`)
 - Codex timeout: 20 minutes
-- Model-input data budget: 48,000 serialized UTF-8 bytes
 - Full prompt budget: 81,920 serialized UTF-8 bytes
+- Model-input data budget: **derived per run**, as the full prompt budget minus
+  the measured UTF-8 size of the rendered scaffold (the instructions file, the
+  shared evidence guide, the fixed wording, and the trusted run-context JSON),
+  capped at 48,000 bytes. With the shipped 3.10 prompt the scaffold is about
+  44.6 KB, so the evidence allowance is about 37.3 KB rather than 48 KB.
+
+  Runner 3.9 applied the 48,000-byte cap on its own, as if the instructions and
+  the guide were free. They are more than half the prompt, and the first real
+  full-context run failed at Codex-invocation time with *"Model prompt requires
+  92415 bytes, exceeding the 81920-byte full prompt budget"*. The allowance is
+  now derived from the rendered bytes, the packet is built against it once, and
+  that same trimmed bundle is what gets rendered, measured, and validated.
+  `promptScaffoldBytes` is recorded in briefing metadata so a future budget
+  failure is diagnosable from published metadata alone.
+
+  There is no fixed minimum allowance: a sparse history packs into a few
+  kilobytes. If the scaffold alone exceeds the prompt budget the run fails
+  naming the scaffold; otherwise the deterministic packet builder reports the
+  irreducible mandatory size for that specific input, and the runner appends
+  where the rest of the budget went.
+
+  A consequence worth knowing: a saturated history now has roughly 10.7 KB less
+  room, and the comparable-exposure lane is what the trimmer sheds first.
+  Shortening the prompt or the guide, or raising the 81,920-byte guard, are the
+  levers that buy that room back — both are deliberate decisions, not defaults.
 - Oura sync and briefing window: 45 days
 - Snapshot maximum age: 7 Pacific calendar days
 

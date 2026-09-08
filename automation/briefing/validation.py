@@ -575,19 +575,32 @@ def validate_model_output(
         prompt_bytes = packet_telemetry.get("promptBytes")
         prompt_max_bytes = packet_telemetry.get("promptMaxBytes")
         prompt_remaining = packet_telemetry.get("promptBudgetRemainingBytes")
+        scaffold_bytes = packet_telemetry.get("promptScaffoldBytes")
         if any(
             not isinstance(value, int) or isinstance(value, bool)
-            for value in (prompt_bytes, prompt_max_bytes, prompt_remaining)
+            for value in (
+                prompt_bytes,
+                prompt_max_bytes,
+                prompt_remaining,
+                scaffold_bytes,
+            )
         ):
             raise ConfigError("Trusted prompt byte telemetry is invalid")
         assert isinstance(prompt_bytes, int)
         assert isinstance(prompt_max_bytes, int)
         assert isinstance(prompt_remaining, int)
+        assert isinstance(scaffold_bytes, int)
+        total_input_bytes = trusted_packet_metrics["totalInputBytes"]
         if (
             prompt_bytes < 0
             or prompt_max_bytes < 1
             or prompt_bytes > prompt_max_bytes
             or prompt_remaining != prompt_max_bytes - prompt_bytes
+            # The scaffold is whatever the prompt costs beyond the packet it
+            # carried. A mismatch means the telemetry was paired with a
+            # different bundle than the one being validated.
+            or scaffold_bytes < 0
+            or scaffold_bytes != prompt_bytes - total_input_bytes
         ):
             raise ConfigError("Trusted prompt byte telemetry is inconsistent")
         trusted_packet_metrics.update(
@@ -595,6 +608,7 @@ def validate_model_output(
                 "promptBytes": prompt_bytes,
                 "promptMaxBytes": prompt_max_bytes,
                 "promptBudgetRemainingBytes": prompt_remaining,
+                "promptScaffoldBytes": scaffold_bytes,
             }
         )
 
