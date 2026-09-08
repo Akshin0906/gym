@@ -392,12 +392,12 @@ describe('warm-up sets stay out of performance comparisons', () => {
     })
     await endSession(sessionId)
 
-    const points = await getRecentSessionE1RMsForExercise(
+    const trend = await getRecentSessionE1RMsForExercise(
       exerciseId,
       undefined,
       5,
     )
-    expect(points).toHaveLength(1)
-    expect(points[0].e1rm).toBe(233)
+    expect(trend.points).toHaveLength(1)
+    expect(trend.points[0].e1rm).toBe(233)
   })
 })

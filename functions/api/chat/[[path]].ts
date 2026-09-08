@@ -8,7 +8,12 @@ import {
   type D1PreparedStatement,
 } from '../../lib/cloudAuth'
 
-type ReasoningEffort = 'medium' | 'xhigh'
+// Every effort a stored row may carry and the API will accept. `medium` and
+// `xhigh` were the defaults of bridge <= 1.4 on `gpt-5.6-sol`; `gpt-6-astra`
+// advertises all three, so a client that has not reloaded yet is not stranded
+// mid-rollout. The current app composes at `high`.
+type ReasoningEffort = 'medium' | 'high' | 'xhigh'
+const REQUEST_EFFORTS: readonly ReasoningEffort[] = ['medium', 'high', 'xhigh']
 type MessageRole = 'user' | 'assistant'
 type JobStatus = 'queued' | 'leased' | 'completed' | 'failed' | 'cancelled'
 type ProposalStatus = 'proposed' | 'applied' | 'failed' | 'dismissed'
@@ -333,14 +338,17 @@ function optionalString(
 }
 
 function assertReasoningEffort(value: unknown): ReasoningEffort {
-  if (value !== 'medium' && value !== 'xhigh') {
+  if (
+    typeof value !== 'string' ||
+    !REQUEST_EFFORTS.includes(value as ReasoningEffort)
+  ) {
     throw new ApiError(
       400,
       'invalid_reasoning_effort',
-      'reasoningEffort must be medium or xhigh',
+      `reasoningEffort must be ${REQUEST_EFFORTS.join(' or ')}`,
     )
   }
-  return value
+  return value as ReasoningEffort
 }
 
 function boundedInteger(
@@ -2177,11 +2185,19 @@ async function handleHeartbeat(ctx: PagesContext): Promise<Response> {
   // The marker is independent of heartbeat version so a rolling old edge
   // cannot make the new edge mistake an unperformed migration for completion.
   // D1 batches commit atomically: detach first, then durably mark it complete.
+  //
+  // Every bridge from 1.4 onward performs the pending detachment, not 1.4
+  // alone: a Mac upgrading straight from 1.3 to 1.5 would otherwise skip the
+  // one-time canonical-thread detachment entirely. The
+  // `bridge_v14_thread_detached_at IS NULL` guard is what makes it one-time, so
+  // a healthy thread is never detached twice and an already-completed marker
+  // stays completed.
   const [migration] = await ctx.env.WORKOUT_DB.batch([
     ctx.env.WORKOUT_DB.prepare(
       `UPDATE codex_chat_conversations
        SET codex_thread_id = NULL, updated_at = ?
-       WHERE id = ? AND codex_thread_id IS NOT NULL AND ? = '1.4'
+       WHERE id = ? AND codex_thread_id IS NOT NULL
+         AND ? IN ('1.4', '1.5')
          AND EXISTS (
            SELECT 1 FROM codex_chat_maintenance
            WHERE id = ? AND bridge_v14_thread_detached_at IS NULL
@@ -2191,7 +2207,7 @@ async function handleHeartbeat(ctx: PagesContext): Promise<Response> {
       `UPDATE codex_chat_maintenance
        SET bridge_v14_thread_detached_at = ?
        WHERE id = ? AND bridge_v14_thread_detached_at IS NULL
-         AND ? = '1.4'`,
+         AND ? IN ('1.4', '1.5')`,
     ).bind(now, CONVERSATION_ID, bridgeVersion),
     ctx.env.WORKOUT_DB.prepare(
       `INSERT INTO codex_chat_bridge_heartbeat
@@ -2201,7 +2217,7 @@ async function handleHeartbeat(ctx: PagesContext): Promise<Response> {
          last_seen_at = excluded.last_seen_at,
          status = excluded.status,
          bridge_version = CASE
-           WHEN codex_chat_bridge_heartbeat.bridge_version = '1.4'
+           WHEN codex_chat_bridge_heartbeat.bridge_version IN ('1.4', '1.5')
              AND (excluded.bridge_version IS NULL OR excluded.bridge_version = '1.3')
            THEN codex_chat_bridge_heartbeat.bridge_version
            ELSE excluded.bridge_version

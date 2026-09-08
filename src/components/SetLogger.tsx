@@ -10,7 +10,7 @@ import { vibrate } from '../lib/audio'
 import {
   LOAD_CONVENTION_SHORT_LABELS,
   allowsZeroLoad,
-  loadConventionsComparable,
+  loadConventionsComparableForProgression,
   resolveSetLoadConvention,
   setKindOf,
 } from '../lib/measurement'
@@ -42,6 +42,10 @@ export function shouldStartSetRowSwipe(target: EventTarget | null): boolean {
   )
 }
 
+function isWorkingSet(set: Pick<LoggedSet, 'setKind'>): boolean {
+  return setKindOf(set) === 'working'
+}
+
 export function SetLogger({
   sessionId,
   exerciseId,
@@ -61,11 +65,27 @@ export function SetLogger({
   // Only pre-fill from a prior session whose sets measured the same thing.
   // Carrying "60" across from an assistance machine into a total-load exercise
   // would seed a plausible-looking but wrong number.
+  //
+  // Strict equality, matching the progression rules elsewhere: an unrecorded
+  // legacy load is read as total pounds for DISPLAY, but "it probably meant
+  // total" is not a good enough reason to type a number into today's set for
+  // the user. The strip still shows those sets, labelled.
   const previousComparable =
     previousSets.length === 0 ||
     previousSets.every((set) =>
-      loadConventionsComparable(resolveSetLoadConvention(set), loadConvention),
+      loadConventionsComparableForProgression(
+        resolveSetLoadConvention(set),
+        loadConvention,
+      ),
     )
+
+  // A new WORKING set is seeded from the last comparable WORKING set. Seeding
+  // from whatever happened to be logged last put a warm-up single's 100x1 into
+  // a working-set row after a 40x11 working set.
+  const lastWorkingHere = existingSets.filter(isWorkingSet).at(-1) ?? null
+  const lastWorkingPrevious = previousComparable
+    ? (previousSets.filter(isWorkingSet).at(-1) ?? null)
+    : null
 
   const handleDelete = useCallback(
     async (set: LoggedSet) => {
@@ -108,6 +128,9 @@ export function SetLogger({
                 {s.rpe !== null && (
                   <span className="text-[var(--color-fg-faint)]"> @{s.rpe}</span>
                 )}
+                {!isWorkingSet(s) && (
+                  <span className="text-[var(--color-fg-faint)]"> warm-up</span>
+                )}
               </span>
             ))}
           </div>
@@ -142,10 +165,7 @@ export function SetLogger({
             ? Math.max(...existingSets.map((s) => s.setNumber)) + 1
             : 1
         }
-        previousSet={
-          existingSets.at(-1) ??
-          (previousComparable ? (previousSets.at(-1) ?? null) : null)
-        }
+        previousSet={lastWorkingHere ?? lastWorkingPrevious}
         defaultRestSeconds={defaultRestSeconds}
         loadConvention={loadConvention}
         onLogged={() => {
@@ -162,6 +182,24 @@ export function SetLogger({
         durationMs={5000}
       />
     </div>
+  )
+}
+
+// RPE here is a SET rating, and it is an estimate the lifter makes — not a
+// measurement and not the whole-session rating collected after the workout.
+// Stating the reps-in-reserve anchors next to the field is what makes the
+// number mean the same thing from one set to the next; leaving it blank stays
+// a perfectly good answer.
+export const RPE_ANCHOR_HINT =
+  'RPE is optional and per set — roughly 8 = about 2 reps left, 9 = about 1, ' +
+  '10 = no more with good technique. Your own estimate; the after-workout ' +
+  'rating is a separate whole-session number.'
+
+function RpeAnchorHint() {
+  return (
+    <p className="px-1 text-[11px] leading-relaxed text-[var(--color-fg-faint)]">
+      {RPE_ANCHOR_HINT}
+    </p>
   )
 }
 
@@ -296,6 +334,7 @@ function SetRow({
             optional
           />
         </div>
+        <RpeAnchorHint />
         <label className="flex items-center gap-2 px-1 text-xs text-[var(--color-fg-dim)] cursor-pointer">
           <input
             type="checkbox"
@@ -527,6 +566,7 @@ function NewSetRow({
           optional
         />
       </div>
+      <RpeAnchorHint />
       <label className="flex items-center gap-2 px-1 text-xs text-[var(--color-fg-dim)] cursor-pointer">
         <input
           type="checkbox"

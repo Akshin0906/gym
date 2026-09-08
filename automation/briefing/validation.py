@@ -17,6 +17,7 @@ from .constants import (
     BRIEFING_TODAYS_CALL_MAX,
     BRIEFING_TREND_MAX,
     BRIEFING_WATCH_OUT_MAX,
+    EVIDENCE_GUIDE_VERSION,
     MAX_SAFE_INTEGER,
     MODEL_WATCH_OUT_MAX,
     MODES,
@@ -384,6 +385,22 @@ def validate_model_output(
         contradicting_evidence_ids, "briefing.contradictingEvidenceIds"
     )
     support_set = set(supporting_evidence_ids)
+    # A current emergency-warning symptom and an explicit planned rest day are
+    # not tie-breakers to weigh against good recent sessions: they settle the
+    # question. Allowing `rest` while still accepting an ordinary training call
+    # is exactly the failure this check exists to make impossible.
+    if bundle.mandatory_rest_evidence_ids and mode != "rest":
+        raise ConfigError(
+            "a current emergency-warning report or planned rest day makes "
+            f"{mode} mode invalid; today's call must be rest"
+        )
+    if bundle.mandatory_rest_evidence_ids and not support_set.intersection(
+        bundle.mandatory_rest_evidence_ids
+    ):
+        raise ConfigError(
+            "rest mode must cite the current report or planned rest day that "
+            "requires it"
+        )
     current_plan_status = bundle.inputs["briefingEvidencePacket"][
         "currentProgrammedSession"
     ].get("status")
@@ -394,9 +411,19 @@ def validate_model_output(
         raise ConfigError(
             f"{mode} mode requires a current trainable session in the current plan"
         )
-    if mode == "rest" and not support_set.intersection(bundle.rest_evidence_ids):
+    # Rest covers three different situations, and only one of them is medical.
+    # A keyword screen cannot decide safety, so a current user-authored report
+    # is citable for stopping even when no lexicon matched it; a deliberate
+    # rest day is ordinary programming and needs no adverse finding at all.
+    rest_eligible_ids = (
+        bundle.rest_evidence_ids
+        | bundle.conservative_stop_evidence_ids
+        | bundle.planned_rest_evidence_ids
+    )
+    if mode == "rest" and not support_set.intersection(rest_eligible_ids):
         raise ConfigError(
-            "rest mode requires stopped-pain or unresolved red-flag evidence"
+            "rest mode requires stopped-pain evidence, an unresolved red flag, "
+            "an explicit planned rest day, or a current user report"
         )
     if mode == "light" and not support_set.intersection(
         bundle.light_adverse_evidence_ids
@@ -424,6 +451,12 @@ def validate_model_output(
         if len(cited_stories) < 2:
             raise ConfigError("push evidence must come from distinct sessions")
     if mode == "deload":
+        # A planned deload is programming, not a reaction. It never needed a
+        # measured downturn, and demanding one made the supervisor unable to
+        # respect the user's own written plan.
+        planned_deload = bool(
+            support_set.intersection(bundle.planned_deload_evidence_ids)
+        )
         qualifying_group = next(
             (
                 group
@@ -432,18 +465,47 @@ def validate_model_output(
             ),
             None,
         )
-        if qualifying_group is None:
+        # Repeated high effort without improvement is a second, independent
+        # reactive route. Its group already carries the internal-response atom,
+        # so it supplies its own second domain.
+        difficulty_group = next(
+            (
+                group
+                for group in bundle.deload_difficulty_groups
+                if group.issubset(support_set)
+            ),
+            None,
+        )
+        if not planned_deload and qualifying_group is None and difficulty_group is None:
             raise ConfigError(
-                "deload mode requires a repeated comparable external decline"
+                "deload mode requires an explicit planned deload, a repeated "
+                "comparable external decline, or repeated comparable difficulty"
             )
-        decline_stories = {
-            bundle.evidence_source_story_ids[item_id]
-            for item_id in qualifying_group
-        }
-        if len(decline_stories) != len(qualifying_group):
-            raise ConfigError("deload decline evidence must come from distinct sessions")
-        if not support_set.intersection(
-            bundle.deload_secondary_adverse_evidence_ids
+        for group in (qualifying_group, difficulty_group):
+            if group is None:
+                continue
+            # Every external-work atom in the group must be a different
+            # session. A difficulty group also carries that session's own
+            # internal-response atom, which correctly shares a story.
+            work_atoms = [
+                item_id
+                for item_id in group
+                if item_id in bundle.external_work_evidence_ids
+            ]
+            work_stories = {
+                bundle.evidence_source_story_ids[item_id] for item_id in work_atoms
+            }
+            if len(work_atoms) < 2 or len(work_stories) != len(work_atoms):
+                raise ConfigError(
+                    "deload evidence must come from distinct sessions"
+                )
+        if (
+            qualifying_group is not None
+            and difficulty_group is None
+            and not planned_deload
+            and not support_set.intersection(
+                bundle.deload_secondary_adverse_evidence_ids
+            )
         ):
             raise ConfigError("deload mode requires a second adverse evidence domain")
     sections = require_object(briefing.get("sections"), "briefing.sections")
@@ -536,6 +598,31 @@ def validate_model_output(
             }
         )
 
+    # Supervisor-owned, never model-authored. `rest` means three different
+    # things — a medical stop, a deliberate day off, and a precautionary stop
+    # on an unclassified current report — and the app should not have to guess
+    # which. Omitted entirely when the mode carries no such distinction, so the
+    # persisted sections shape stays backwards compatible.
+    mode_reason_label: str | None = None
+    if mode == "rest":
+        # Medical first when both are true. A note can say "today is my planned
+        # rest day, and I have new crushing chest pressure" — labelling that as
+        # ordinary programming would bury the part that matters.
+        if support_set.intersection(bundle.medical_rest_evidence_ids):
+            mode_reason_label = "medical_stop"
+        elif support_set.intersection(bundle.planned_rest_evidence_ids):
+            mode_reason_label = "planned_rest"
+        else:
+            mode_reason_label = "precautionary_stop"
+    elif mode == "deload":
+        mode_reason_label = (
+            "planned_deload"
+            if support_set.intersection(bundle.planned_deload_evidence_ids)
+            else "reactive_deload"
+        )
+    elif mode == "light":
+        mode_reason_label = "temporary_training_adjustment"
+
     trusted_briefing = {
         "headline": headline,
         "mode": mode,
@@ -554,6 +641,11 @@ def validate_model_output(
                 BRIEFING_TREND_MAX,
             ),
             "watchOuts": watch_outs,
+            **(
+                {"modeReasonLabel": mode_reason_label}
+                if mode_reason_label is not None
+                else {}
+            ),
         },
         "source": "codex-local",
         "model": model,
@@ -585,6 +677,7 @@ def validate_model_output(
             "validatorCompatibilityVersion": VALIDATOR_COMPATIBILITY_VERSION,
             "promptVersion": PROMPT_VERSION,
             "promptHash": prompt_hash,
+            "evidenceGuideVersion": EVIDENCE_GUIDE_VERSION,
             "packetSchemaVersion": BRIEFING_EVIDENCE_PACKET_VERSION,
             "codexVersion": codex_version,
             "model": model,
@@ -619,6 +712,7 @@ def validate_model_output(
             "validatorCompatibilityVersion": VALIDATOR_COMPATIBILITY_VERSION,
             "promptVersion": PROMPT_VERSION,
             "promptHash": prompt_hash,
+            "evidenceGuideVersion": EVIDENCE_GUIDE_VERSION,
             "codexVersion": codex_version,
             "model": model,
             "reasoningEffort": reasoning_effort,
@@ -656,6 +750,7 @@ def validate_spool(
         "validatorCompatibilityVersion",
         "promptVersion",
         "promptHash",
+        "evidenceGuideVersion",
         "codexVersion",
         "model",
         "reasoningEffort",
@@ -694,6 +789,10 @@ def validate_spool(
         raise ConfigError("Spool prompt version is incompatible")
     if manifest.get("promptHash") != prompt_hash:
         raise ConfigError("Spool prompt fingerprint is incompatible")
+    # A spool written against different curated guidance was produced by a
+    # different set of instructions, even when every other marker matches.
+    if manifest.get("evidenceGuideVersion") != EVIDENCE_GUIDE_VERSION:
+        raise ConfigError("Spool evidence guide version is incompatible")
     if manifest.get("model") != model:
         raise ConfigError("Spool model does not match the configured model")
     if manifest.get("reasoningEffort") != reasoning_effort:

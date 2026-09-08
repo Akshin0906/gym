@@ -1050,6 +1050,17 @@ async function handlePutSnapshot(ctx: PagesContext): Promise<Response> {
   return json(200, { snapshot: row ? snapshotResponse(row) : null })
 }
 
+// Kept in step with BriefingModeReason in src/db/types.ts. The edge worker does
+// not import app modules, so the list is restated here deliberately.
+const BRIEFING_MODE_REASONS: readonly string[] = [
+  'medical_stop',
+  'planned_rest',
+  'precautionary_stop',
+  'planned_deload',
+  'reactive_deload',
+  'temporary_training_adjustment',
+]
+
 export function assertBriefingSections(raw: unknown): string {
   if (!isObject(raw)) throw new Error('sections must be an object')
   // Keep the cloud envelope backward-compatible with installed runner
@@ -1091,6 +1102,16 @@ export function assertBriefingSections(raw: unknown): string {
   ) {
     throw new Error('sections.recoveryStatus must be fresh, stale, or unavailable')
   }
+  // Supervisor-owned reason for the mode. Optional so a rolled-back runner that
+  // does not send it still publishes, and a closed enum so an unexpected value
+  // is rejected rather than stored and rendered.
+  const modeReasonLabel = raw.modeReasonLabel
+  if (
+    modeReasonLabel !== undefined &&
+    !BRIEFING_MODE_REASONS.includes(modeReasonLabel as string)
+  ) {
+    throw new Error('sections.modeReasonLabel is not a known reason')
+  }
   return JSON.stringify({
     todaysCall,
     why,
@@ -1098,6 +1119,7 @@ export function assertBriefingSections(raw: unknown): string {
     ouraRecovery,
     trainingTrend,
     watchOuts,
+    ...(modeReasonLabel ? { modeReasonLabel } : {}),
   })
 }
 

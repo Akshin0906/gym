@@ -46,3 +46,19 @@ class ModelInputBundle:
     deload_secondary_adverse_evidence_ids: frozenset[str]
     evidence_source_story_ids: dict[str, str]
     evidence_domains: dict[str, str]
+    # Current user-authored reports the model may cite to stop or scale back
+    # today, whether or not the keyword screen recognized anything in them.
+    conservative_stop_evidence_ids: frozenset[str] = frozenset()
+    # Deliberate non-training days and planned easy weeks. Ordinary
+    # programming, independent of illness and of any measured downturn.
+    planned_rest_evidence_ids: frozenset[str] = frozenset()
+    planned_deload_evidence_ids: frozenset[str] = frozenset()
+    # A current emergency-warning report or an explicit planned rest day. Any
+    # training mode is invalid while one of these is present.
+    mandatory_rest_evidence_ids: frozenset[str] = frozenset()
+    # Rest atoms that describe something physically wrong. Kept separate from
+    # the planned-rest set because one atom can be both.
+    medical_rest_evidence_ids: frozenset[str] = frozenset()
+    # Second, independent route to a reactive deload: repeated high effort on a
+    # comparable movement without improvement.
+    deload_difficulty_groups: tuple[frozenset[str], ...] = ()

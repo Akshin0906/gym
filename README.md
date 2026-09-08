@@ -42,9 +42,14 @@ enabled for public visitors.
 - **Programs and library:** build reusable training templates, reorder sessions,
   edit targets, and manage custom exercises without losing history.
 - **History and stats:** review completed sessions, muscle-group volume, and
-  estimated one-rep-max trends.
+  estimated one-rep-max trends, each labelled with what it does and does not
+  measure — an estimate is never presented as proof of recovery or fatigue, and
+  loads recorded different ways are never joined into one line.
 - **Coach and AI Memory:** chat over a bounded training context and explicitly
-  approve every proposed data change.
+  approve every proposed data change. Both coaching surfaces are given the same
+  dated, source-linked evidence guide
+  ([automation/evidence_guide.md](automation/evidence_guide.md)), because
+  neither runtime model has browsing or tools.
 - **Settings:** export/import validated JSON backups, request persistent browser
   storage, pair a cloud mirror, and optionally connect Oura recovery data.
 
@@ -60,6 +65,25 @@ flowchart LR
     Bridge[Local automation bridge] <--> Edge
     Bridge <--> Codex[Codex App Server]
 ```
+
+### Coaching claims
+
+The supervisor decides what evidence a briefing is *allowed* to rest on, and it
+is deliberately conservative about what it can know:
+
+- A current emergency-warning report or an explicit planned rest day settles the
+  call; ordinary training advice is rejected outright rather than merely
+  discouraged. An ordinary illness gets ordinary rest advice, not urgent care.
+- The keyword screen is a floor, never a ceiling. A current first-person report
+  it does not recognize is still citable evidence for stopping, so a serious
+  symptom no lexicon anticipated cannot be reasoned away as "no rule matched".
+- Adherence to a rep target, readiness to add load, and comparable observed
+  performance are three separate questions. Beating the target keeps its own
+  progression evidence; falling short stays observable with its uncertainty.
+- Loads recorded under different conventions are never compared and never
+  converted, and an unrecorded legacy load is read as pounds for description
+  only — never paired with a recorded one to claim progress.
+- Deloads can be planned or reactive and have no universal cadence.
 
 IndexedDB remains the trusted workout store. D1 holds an authenticated snapshot
 mirror plus the Coach queue, transcript, action reservations, and receipts. The

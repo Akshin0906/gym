@@ -15,7 +15,12 @@ import { LoadFailure } from '../components/Feedback'
 import { StatsCardSkeleton } from '../components/Skeleton'
 import { listAllExercises } from '../db/repositories/exercises'
 import { listAllSets } from '../db/repositories/sessions'
-import type { Exercise, LoggedSet, MuscleGroup } from '../db/types'
+import type {
+  Exercise,
+  LoadConvention,
+  LoggedSet,
+  MuscleGroup,
+} from '../db/types'
 import {
   buildWeeklySetCountsSplit,
   buildWeeklyTonnage,
@@ -26,6 +31,7 @@ import {
 } from '../lib/analytics'
 import {
   countWorkingSets,
+  loadConventionsComparableForProgression,
   resolveSetLoadConvention,
   setKindOf,
 } from '../lib/measurement'
@@ -126,11 +132,46 @@ export function StatsScreen() {
     })()
   }, [reloadToken])
 
-  const trendData = useMemo<TrendRow[]>(() => {
-    if (selectedExIds.size === 0) return []
+  const trend = useMemo<{
+    rows: TrendRow[]
+    excludedOtherConventionSetCount: number
+    excludedNoEstimateSetCount: number
+    assumedUnitSetCount: number
+  }>(() => {
+    if (selectedExIds.size === 0) {
+      return {
+        rows: [],
+        excludedOtherConventionSetCount: 0,
+        excludedNoEstimateSetCount: 0,
+        assumedUnitSetCount: 0,
+      }
+    }
+    // One line per exercise measures ONE thing. An exercise whose recording
+    // changed — 20 lb per dumbbell then 40 lb total — would otherwise draw a
+    // doubling that never happened, so each exercise is anchored to how its
+    // most recent working set was recorded and sets recorded another way are
+    // excluded and counted. There is no conversion between conventions.
+    // Anchored on the most recent working set, whether or not that set is
+    // chartable: after a switch to machine or assisted work there is no valid
+    // estimate at all, and falling back to an older convention would keep
+    // drawing a line that no longer describes the exercise.
+    const anchorByExercise = new Map<string, LoadConvention>()
+    const newestByExercise = new Map<string, number>()
+    for (const s of allSets) {
+      if (!selectedExIds.has(s.exerciseId)) continue
+      if (setKindOf(s) !== 'working') continue
+      const seen = newestByExercise.get(s.exerciseId)
+      if (seen === undefined || s.loggedAt >= seen) {
+        newestByExercise.set(s.exerciseId, s.loggedAt)
+        anchorByExercise.set(s.exerciseId, resolveSetLoadConvention(s))
+      }
+    }
     // Bucket by day, take the best (max) est-1RM for each (day, exercise).
     // Keys in each row are exercise IDs; <Line dataKey={id}> picks them up.
     const dayMap = new Map<number, Record<string, number>>()
+    let excludedOtherConventionSetCount = 0
+    let excludedNoEstimateSetCount = 0
+    let assumedUnitSetCount = 0
     for (const s of allSets) {
       if (!selectedExIds.has(s.exerciseId)) continue
       const day = startOfDay(s.loggedAt).getTime()
@@ -138,12 +179,24 @@ export function StatsScreen() {
       // one-rep-max estimate, so they are left off the chart entirely.
       // Working sets only, read with the set's own frozen convention.
       if (setKindOf(s) !== 'working') continue
-      const estimate = estimated1RMForLoad(
-        s.weightLbs,
-        s.reps,
-        resolveSetLoadConvention(s),
-      )
-      if (estimate === null) continue
+      const convention = resolveSetLoadConvention(s)
+      const estimate = estimated1RMForLoad(s.weightLbs, s.reps, convention)
+      if (estimate === null) {
+        // A machine setting, an assistance weight, or added bodyweight. The
+        // count exists so the chart can say why it is empty instead of
+        // implying nothing was selected.
+        excludedNoEstimateSetCount += 1
+        continue
+      }
+      const anchor = anchorByExercise.get(s.exerciseId)
+      if (anchor === undefined) continue
+      // Strict equality: an unrecorded legacy load is never joined to a
+      // recorded one to imply the number went up.
+      if (!loadConventionsComparableForProgression(convention, anchor)) {
+        excludedOtherConventionSetCount += 1
+        continue
+      }
+      if (convention === 'unknown') assumedUnitSetCount += 1
       const e1 = Math.round(estimate)
       let row = dayMap.get(day)
       if (!row) {
@@ -152,10 +205,16 @@ export function StatsScreen() {
       }
       if ((row[s.exerciseId] ?? 0) < e1) row[s.exerciseId] = e1
     }
-    return Array.from(dayMap.entries())
-      .map(([day, values]) => ({ day, ...values }) as TrendRow)
-      .sort((a, b) => a.day - b.day)
+    return {
+      rows: Array.from(dayMap.entries())
+        .map(([day, values]) => ({ day, ...values }) as TrendRow)
+        .sort((a, b) => a.day - b.day),
+      excludedOtherConventionSetCount,
+      excludedNoEstimateSetCount,
+      assumedUnitSetCount,
+    }
   }, [allSets, selectedExIds])
+  const trendData = trend.rows
 
   const selectedExs = useMemo(
     () => eligibleExs.filter((e) => selectedExIds.has(e.id)),
@@ -292,7 +351,7 @@ export function StatsScreen() {
             {summary.warmupSets7d > 0 &&
               ` ${summary.warmupSets7d} warm-up set${summary.warmupSets7d === 1 ? '' : 's'} excluded from the set count.`}
             {summary.tonnage.excludedSets > 0 &&
-              ` ${summary.tonnage.excludedSets} set${summary.tonnage.excludedSets === 1 ? '' : 's'} excluded from volume (machine setting, assistance, or bodyweight).`}
+              ` ${summary.tonnage.excludedSets} set${summary.tonnage.excludedSets === 1 ? '' : 's'} excluded from volume (recorded per dumbbell, as a machine setting, as assistance, or as added bodyweight).`}
             {summary.tonnage.assumedUnitSets > 0 &&
               ` ${summary.tonnage.assumedUnitSets} set${summary.tonnage.assumedUnitSets === 1 ? '' : 's'} assume pounds because no load unit was recorded.`}
           </p>
@@ -355,7 +414,11 @@ export function StatsScreen() {
               <div className="card p-2">
                 {selectedExs.length === 0 || trendData.length === 0 ? (
                   <p className="text-sm text-[var(--color-fg-faint)] p-4 text-center">
-                    Select one or more exercises to see progression.
+                    {selectedExs.length === 0
+                      ? 'Select one or more exercises to see progression.'
+                      : trend.excludedNoEstimateSetCount > 0
+                        ? 'These sets record a machine setting, assistance, or added bodyweight rather than the weight lifted, so there is no one-rep-max estimate. Compare reps at the same setting instead.'
+                        : 'No comparable sets yet for the selected exercises.'}
                   </p>
                 ) : (
                   <>
@@ -439,6 +502,15 @@ export function StatsScreen() {
                   </>
                 )}
               </div>
+              <p className="text-[11px] text-[var(--color-fg-faint)] px-1">
+                Estimated from load and reps only — it has no term for how hard
+                a set felt, and it describes recorded work rather than recovery
+                or fatigue.
+                {trend.excludedOtherConventionSetCount > 0 &&
+                  ` ${trend.excludedOtherConventionSetCount} set${trend.excludedOtherConventionSetCount === 1 ? '' : 's'} recorded a different way (per dumbbell, machine setting, assistance, added bodyweight, or no recorded unit) are left out; there is no conversion between them.`}
+                {trend.assumedUnitSetCount > 0 &&
+                  ` ${trend.assumedUnitSetCount} set${trend.assumedUnitSetCount === 1 ? '' : 's'} have no recorded unit and are read as total pounds.`}
+              </p>
             </>
           )}
         </section>
@@ -533,17 +605,21 @@ export function StatsScreen() {
             )}
           </div>
           <p className="text-[11px] text-[var(--color-fg-faint)] px-1">
-            Volume in lb·reps. Muscle rows give secondary muscles 50% credit, so
-            they overlap; &ldquo;Total lifted&rdquo; counts each set once and is
-            not the sum of the rows above.
+            Volume in lb·reps. Splitting a lift&rsquo;s pound-reps 100% to the
+            primary mover and 50% to each secondary is bookkeeping, not a
+            measured stimulus: there is no validated equivalence between a
+            weighted pound-rep figure and muscle growth. Rows overlap;
+            &ldquo;Total lifted&rdquo; counts each set once and is not the sum
+            of the rows above. Tonnage is not a cross-exercise score of muscle
+            growth.
             {tonnageWeeks.some((row) => (row?.excludedSets ?? 0) > 0) &&
-              ' Sets measured as a machine setting, assistance, or bodyweight are excluded.'}
+              ' Sets recorded per dumbbell, as a machine setting, as assistance, or as added bodyweight are excluded, because those numbers are not a total weight lifted.'}
           </p>
         </section>
 
         <section className="space-y-3">
           <h2 className="text-[11px] font-bold uppercase tracking-widest text-[var(--color-fg-faint)] px-1">
-            Weekly sets per muscle
+            Weekly working sets per muscle
           </h2>
           <div className="card overflow-x-auto">
             {setCountMuscles.length === 0 ? (
@@ -553,7 +629,7 @@ export function StatsScreen() {
             ) : (
               <table className="w-full text-sm border-collapse">
                 <caption className="sr-only">
-                  Weekly set counts by muscle group, shown as direct sets where
+                  Weekly working-set counts by muscle group, shown as direct sets where
                   the muscle was the primary mover plus secondary sets
                 </caption>
                 <thead>
@@ -620,10 +696,12 @@ export function StatsScreen() {
             )}
           </div>
           <p className="text-[11px] text-[var(--color-fg-faint)] px-1">
+            Working sets only — warm-ups are preparation, not training credit.
             Whole sets, counted once each: the first number is direct work where
             the muscle was the primary mover, the &ldquo;+n&rdquo; is sets where
             it was a listed secondary. The two are reported separately rather
-            than blended into one weighted figure.
+            than blended into one weighted figure. A muscle being involved in a
+            lift is not the same as that lift growing it.
           </p>
         </section>
       </div>

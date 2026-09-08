@@ -14,16 +14,44 @@ import { format } from 'date-fns'
 import { ExercisePickerSheet } from './ExercisePickerSheet'
 import { getExercise } from '../db/repositories/exercises'
 import {
-  type ExerciseE1RMPoint,
+  type ExerciseE1RMTrend,
   getLastSessionSetsForExercise,
   getRecentSessionE1RMsForExercise,
   swapExerciseInSession,
 } from '../db/repositories/sessions'
 import type { Exercise, LoggedSet } from '../db/types'
-import { estimated1RM } from '../lib/analytics'
+import {
+  estimated1RMForLoad,
+  oneRepMaxEstimateNotes,
+  setVolumeForLoad,
+} from '../lib/analytics'
+import {
+  LOAD_CONVENTION_SHORT_LABELS,
+  commonLoadConvention,
+  loadSemantics,
+  resolveSetLoadConvention,
+  setKindOf,
+} from '../lib/measurement'
 import { relativeOrAbsolute } from '../lib/dates'
 import { MUSCLE_LABEL } from '../lib/muscles'
 import { AccessibleDialog } from './AccessibleDialog'
+
+// Why there is no chart. "Need a couple more sessions" is wrong and misleading
+// for a measurement that has no one-rep-max estimate at all: more assisted
+// pull-up sessions will never produce one, and telling somebody to keep
+// training for a number that cannot exist is worse than saying nothing.
+export function estimateUnavailableReason(trend: ExerciseE1RMTrend): string {
+  if (trend.mixedConventionSessionCount > 0 && trend.points.length === 0) {
+    return 'Sets in these sessions were recorded in different units, so there is no single estimate to chart. Record the load the same way to compare them.'
+  }
+  if (trend.excludedNoEstimateSessionCount > 0 && trend.points.length === 0) {
+    return 'This exercise records assistance, a machine setting, or added weight rather than the total weight lifted, so a one-rep-max estimate is not defined for it. Compare reps at the same setting instead — more sessions will not change that.'
+  }
+  if (trend.excludedOtherConventionSessionCount > 0) {
+    return 'Earlier sessions recorded load a different way, so they are not joined to this one. A couple more sessions recorded the current way will chart a trend.'
+  }
+  return 'Need a couple more sessions to chart progress.'
+}
 
 interface Props {
   exerciseId: string
@@ -36,7 +64,7 @@ interface Props {
 interface Data {
   exercise: Exercise
   lastSets: LoggedSet[]
-  points: ExerciseE1RMPoint[]
+  trend: ExerciseE1RMTrend
 }
 
 export function ExerciseDetailOverlay({
@@ -58,13 +86,13 @@ export function ExerciseDetailOverlay({
       getExercise(exerciseId),
       getLastSessionSetsForExercise(exerciseId, currentSessionId),
       getRecentSessionE1RMsForExercise(exerciseId, currentSessionId, 10),
-    ]).then(([exercise, lastSets, points]) => {
+    ]).then(([exercise, lastSets, trend]) => {
       if (cancelled) return
       if (!exercise) {
         onClose()
         return
       }
-      setData({ exercise, lastSets, points })
+      setData({ exercise, lastSets, trend })
     })
     return () => {
       cancelled = true
@@ -101,18 +129,56 @@ export function ExerciseDetailOverlay({
     )
   }
 
-  const { exercise, lastSets, points } = data
+  const { exercise, lastSets, trend } = data
+  const points = trend.points
   const lastDate = lastSets[0]?.loggedAt ?? null
+  // The heaviest WORKING set, ranked with each set's own frozen convention. The
+  // previous version ranked by a raw Epley on every row, so a warm-up single
+  // could win and a machine pin number or an assistance weight was scored as
+  // if it were pounds on a bar.
+  const lastWorkingSets = lastSets.filter((s) => setKindOf(s) === 'working')
+  const lastConvention = commonLoadConvention(lastWorkingSets)
   let topSet: LoggedSet | null = null
   let topE1 = 0
-  for (const s of lastSets) {
-    const e = estimated1RM(s.weightLbs, s.reps)
-    if (e > topE1) {
+  let topByLoad: LoggedSet | null = null
+  for (const s of lastWorkingSets) {
+    const convention = resolveSetLoadConvention(s)
+    const e = estimated1RMForLoad(s.weightLbs, s.reps, convention)
+    if (e !== null && e > topE1) {
       topE1 = e
       topSet = s
     }
+    // Fallback ordering for loads with no valid estimate: the hardest recorded
+    // setting, which for assistance means the LOWEST number.
+    if (topByLoad === null) {
+      topByLoad = s
+    } else if (
+      loadSemantics(convention).higherIsHarder
+        ? s.weightLbs > topByLoad.weightLbs ||
+          (s.weightLbs === topByLoad.weightLbs && s.reps > topByLoad.reps)
+        : s.weightLbs < topByLoad.weightLbs ||
+          (s.weightLbs === topByLoad.weightLbs && s.reps > topByLoad.reps)
+    ) {
+      topByLoad = s
+    }
   }
-  const totalVol = lastSets.reduce((sum, s) => sum + s.weightLbs * s.reps, 0)
+  const headlineSet = topSet ?? topByLoad
+  // Tonnage only where the recorded number is a real external load, and only
+  // when the whole session measured the same thing.
+  let totalVol: number | null = 0
+  for (const s of lastWorkingSets) {
+    if (totalVol === null) break
+    const v: number | null = setVolumeForLoad(
+      s.weightLbs,
+      s.reps,
+      resolveSetLoadConvention(s),
+    )
+    totalVol = v === null ? null : totalVol + v
+  }
+  if (lastConvention === null || lastWorkingSets.length === 0) totalVol = null
+  const estimateNotes = oneRepMaxEstimateNotes(lastSets)
+  const unitLabel =
+    lastConvention === null ? null : LOAD_CONVENTION_SHORT_LABELS[lastConvention]
 
   return (
     <>
@@ -167,9 +233,11 @@ export function ExerciseDetailOverlay({
             <h3 className="text-xs font-bold uppercase tracking-widest text-[var(--color-fg-faint)] mb-2 px-1">
               Last workout
             </h3>
-            {lastSets.length === 0 || !topSet ? (
+            {lastSets.length === 0 || !headlineSet ? (
               <p className="text-sm text-[var(--color-fg-dim)] px-1">
-                No prior sessions yet.
+                {lastSets.length === 0
+                  ? 'No prior sessions yet.'
+                  : 'Last session logged warm-ups only.'}
               </p>
             ) : (
               <div className="card overflow-hidden">
@@ -184,13 +252,26 @@ export function ExerciseDetailOverlay({
                       {lastDate !== null && relativeOrAbsolute(lastDate)}
                     </p>
                     <p className="text-xs text-[var(--color-fg-dim)] nums mt-0.5">
-                      top {topSet.weightLbs}×{topSet.reps}
-                      {topSet.rpe !== null && ` @ RPE ${topSet.rpe}`}
+                      top {headlineSet.weightLbs}
+                      {unitLabel ? ` ${unitLabel}` : ''}×{headlineSet.reps}
+                      {headlineSet.rpe !== null && ` @ RPE ${headlineSet.rpe}`}
                       {' · '}
-                      {lastSets.length} {lastSets.length === 1 ? 'set' : 'sets'}
-                      {' · '}
-                      {totalVol.toLocaleString()} lb·reps
+                      {lastWorkingSets.length}{' '}
+                      {lastWorkingSets.length === 1 ? 'working set' : 'working sets'}
+                      {totalVol !== null && (
+                        <>
+                          {' · '}
+                          {totalVol.toLocaleString()} lb·reps
+                        </>
+                      )}
                     </p>
+                    {totalVol === null && (
+                      <p className="text-[11px] text-[var(--color-fg-faint)] mt-0.5">
+                        {lastConvention === null
+                          ? 'Sets recorded in different units, so they are not summed.'
+                          : 'This load is not a weight lifted, so tonnage is not shown.'}
+                      </p>
+                    )}
                   </div>
                   <ChevronDown
                     size={16}
@@ -230,11 +311,12 @@ export function ExerciseDetailOverlay({
 
           <section>
             <h3 className="text-xs font-bold uppercase tracking-widest text-[var(--color-fg-faint)] mb-2 px-1">
-              Estimated 1RM · last {Math.min(points.length, 10)}
+              Estimated 1RM
+              {points.length > 0 && ` · last ${Math.min(points.length, 10)}`}
             </h3>
             {points.length < 2 ? (
               <p className="text-sm text-[var(--color-fg-dim)] px-1">
-                Need a couple more sessions to chart progress.
+                {estimateUnavailableReason(trend)}
               </p>
             ) : (
               <div className="card p-3" style={{ height: 220 }}>
@@ -304,6 +386,29 @@ export function ExerciseDetailOverlay({
                   </tbody>
                 </table>
               </div>
+            )}
+            {points.length >= 2 && (
+              <p className="text-[11px] text-[var(--color-fg-faint)] mt-2 px-1">
+                Estimated from load and reps only — it does not know how hard a
+                set felt
+                {estimateNotes.manyRepsExtrapolatedFrom &&
+                  ', and high-rep sets stretch the estimate furthest'}
+                {estimateNotes.noSetEffortRecorded && '; no set RPE was recorded'}
+                . It describes recorded work, not recovery or fatigue.
+                {trend.excludedOtherConventionSessionCount > 0 && (
+                  <>
+                    {' '}
+                    {trend.excludedOtherConventionSessionCount}{' '}
+                    {trend.excludedOtherConventionSessionCount === 1
+                      ? 'session was'
+                      : 'sessions were'}{' '}
+                    left out because they recorded load a different way; there is
+                    no conversion between them.
+                  </>
+                )}
+                {trend.includesAssumedUnits &&
+                  ' Older sets have no recorded unit and are read as total pounds.'}
+              </p>
             )}
           </section>
 

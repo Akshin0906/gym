@@ -448,7 +448,8 @@ function setVolume(weightLbs: number, reps: number): number {
 For each `LoggedSet` whose `loggedAt` falls in the week, contribute volume to muscle-group buckets using the following rule:
 
 - The exercise's `primaryMuscle` receives **100%** of `setVolume = weightLbs × reps`.
-- Each entry in the exercise's `secondaryMuscles` array receives `SECONDARY_VOLUME_WEIGHT` (default 0.5) of `setVolume`.
+- Each entry in the exercise's `secondaryMuscles` array receives `SECONDARY_VOLUME_WEIGHT` (default 0.5) of `setVolume`. **This tonnage split is bookkeeping and nothing more.** The published evidence for a fractional indirect weighting concerns counting *sets*, and it does not validate apportioning weighted pound-repetitions: there is no established equivalence between a share of tonnage and a share of stimulus. Report direct and secondary set counts separately wherever the distinction matters, and never read tonnage as a cross-exercise score of muscle growth. See `automation/evidence_guide.md` for the sourced statement of what the set-count modelling does and does not support.
+- `secondaryMuscles` lists muscles a lift meaningfully trains, not every muscle it involves. Squats, leg presses, and hip thrusts do not credit the hamstrings. For squats and hip thrusts that rests on longitudinal trials that measured hamstring size directly and found little or none; for leg press it rests on a trial whose reported result is quadriceps, gluteal, and adductor growth — a reported result, not a demonstrated verdict on every muscle it did not report. Movements with no direct measurement keep their existing editorial mapping, retained conservatively rather than asserted as established. `automation/evidence_guide.md` carries the citations and their limits; do not restate a stronger claim here.
 
 So a 225 × 10 bench press (primary: chest, secondary: triceps, shoulders) contributes:
 - chest: +2250
@@ -550,9 +551,9 @@ export const SEED_EXERCISES: Omit<Exercise, "id" | "createdAt">[] = [
   { name: "Reverse Wrist Curl (Barbell)", primaryMuscle: "forearms", secondaryMuscles: [], notes: "", defaultRestSeconds: 60, isCustom: false, hiddenFromLibrary: false },
 
   // ----- Quads -----
-  { name: "Barbell Back Squat", primaryMuscle: "quads", secondaryMuscles: ["glutes", "hamstrings"], notes: "", defaultRestSeconds: 210, isCustom: false, hiddenFromLibrary: false },
+  { name: "Barbell Back Squat", primaryMuscle: "quads", secondaryMuscles: ["glutes"], notes: "", defaultRestSeconds: 210, isCustom: false, hiddenFromLibrary: false },
   { name: "Front Squat", primaryMuscle: "quads", secondaryMuscles: ["glutes"], notes: "", defaultRestSeconds: 180, isCustom: false, hiddenFromLibrary: false },
-  { name: "Leg Press", primaryMuscle: "quads", secondaryMuscles: ["glutes", "hamstrings"], notes: "", defaultRestSeconds: 180, isCustom: false, hiddenFromLibrary: false },
+  { name: "Leg Press", primaryMuscle: "quads", secondaryMuscles: ["glutes"], notes: "", defaultRestSeconds: 180, isCustom: false, hiddenFromLibrary: false },
   { name: "Hack Squat (Machine)", primaryMuscle: "quads", secondaryMuscles: ["glutes"], notes: "", defaultRestSeconds: 180, isCustom: false, hiddenFromLibrary: false },
   { name: "Bulgarian Split Squat", primaryMuscle: "quads", secondaryMuscles: ["glutes"], notes: "", defaultRestSeconds: 120, isCustom: false, hiddenFromLibrary: false },
   { name: "Walking Lunge", primaryMuscle: "quads", secondaryMuscles: ["glutes", "hamstrings"], notes: "", defaultRestSeconds: 120, isCustom: false, hiddenFromLibrary: false },
@@ -566,7 +567,7 @@ export const SEED_EXERCISES: Omit<Exercise, "id" | "createdAt">[] = [
   { name: "Good Morning", primaryMuscle: "hamstrings", secondaryMuscles: ["glutes", "back"], notes: "", defaultRestSeconds: 150, isCustom: false, hiddenFromLibrary: false },
 
   // ----- Glutes -----
-  { name: "Hip Thrust (Barbell)", primaryMuscle: "glutes", secondaryMuscles: ["hamstrings"], notes: "", defaultRestSeconds: 150, isCustom: false, hiddenFromLibrary: false },
+  { name: "Hip Thrust (Barbell)", primaryMuscle: "glutes", secondaryMuscles: [], notes: "", defaultRestSeconds: 150, isCustom: false, hiddenFromLibrary: false },
   { name: "Cable Glute Kickback", primaryMuscle: "glutes", secondaryMuscles: [], notes: "", defaultRestSeconds: 75, isCustom: false, hiddenFromLibrary: false },
   { name: "Sumo Deadlift", primaryMuscle: "glutes", secondaryMuscles: ["hamstrings", "back"], notes: "", defaultRestSeconds: 210, isCustom: false, hiddenFromLibrary: false },
 

@@ -18,6 +18,9 @@ from pathlib import Path
 
 
 SOURCE_AUTOMATION = Path(__file__).resolve().parents[1]
+# Pinned in the installer, in briefing/constants.py, and in the guide itself.
+# The fixture guide must declare it or the staged-release check refuses.
+EVIDENCE_GUIDE_VERSION = "2026-09-08-shared-evidence-guide-v1"
 DAILY_LABEL = "com.workout-tracker.codex-daily-briefing"
 AWAKE_LABEL = "com.workout-tracker.codex-keep-awake"
 
@@ -69,6 +72,7 @@ class ManageDailyBriefingTests(unittest.TestCase):
         "constants.py",
         "primitives.py",
         "models.py",
+        "safety.py",
         "textutil.py",
         "measurement.py",
         "recovery.py",
@@ -162,6 +166,14 @@ class ManageDailyBriefingTests(unittest.TestCase):
                 )
 
                 RUNNER_VERSION = "fixture"
+                EVIDENCE_GUIDE_VERSION = "2026-09-08-shared-evidence-guide-v1"
+
+
+                def read_evidence_guide(path):
+                    text = Path(path).read_text(encoding="utf-8").strip()
+                    if EVIDENCE_GUIDE_VERSION not in text:
+                        raise SystemExit("staged evidence guide version mismatch")
+                    return text
 
 
                 def publish_spool(*args, **kwargs):
@@ -225,6 +237,14 @@ class ManageDailyBriefingTests(unittest.TestCase):
         )
         (self.automation / "codex_daily_briefing_prompt.md").write_text(
             "# Fixture prompt\n", encoding="utf-8"
+        )
+        # The shared evidence guide ships with every release and the installer
+        # checks that the staged copy declares the version the code expects.
+        (self.automation / "evidence_guide.md").write_text(
+            "# Fixture guide\n\nGuide version `"
+            + EVIDENCE_GUIDE_VERSION
+            + "`.\n",
+            encoding="utf-8",
         )
         (self.automation / "codex_daily_briefing_output_schema.json").write_text(
             json.dumps({"type": "object"}) + "\n", encoding="utf-8"
@@ -627,7 +647,7 @@ class ManageDailyBriefingTests(unittest.TestCase):
         )
         self.assertEqual(
             daily_plist["EnvironmentVariables"]["WORKOUT_CODEX_MODEL"],
-            "gpt-5.6-sol",
+            "gpt-6-astra",
         )
 
         release_id = Path(new_current).name

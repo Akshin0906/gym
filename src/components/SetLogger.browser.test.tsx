@@ -341,4 +341,92 @@ describe('SetLogger set classification (browser)', () => {
     ).toBe('95')
     expect(screen.queryByText(/different measurement/i)).toBeNull()
   })
+
+  it('seeds a new working set from the last WORKING set, not a warm-up', async () => {
+    // The reported fixture: a 40x11 working set followed by a 100x1 single
+    // explicitly marked as a warm-up. Seeding from whatever was logged last
+    // typed the warm-up single into the next working-set row.
+    const exerciseId = await seed('total')
+    const previous: LoggedSet[] = [
+      {
+        id: 'prev-working',
+        workoutSessionId: 'older-session',
+        exerciseId,
+        setNumber: 1,
+        weightLbs: 40,
+        reps: 11,
+        rpe: null,
+        loggedAt: 1,
+        loadConvention: 'total',
+        setKind: 'working',
+      },
+      {
+        id: 'prev-warmup',
+        workoutSessionId: 'older-session',
+        exerciseId,
+        setNumber: 2,
+        weightLbs: 100,
+        reps: 1,
+        rpe: null,
+        loggedAt: 2,
+        loadConvention: 'total',
+        setKind: 'warmup',
+      },
+    ]
+
+    render(
+      <SetLogger
+        sessionId={SESSION_ID}
+        exerciseId={exerciseId}
+        existingSets={[]}
+        previousSets={previous}
+        defaultRestSeconds={75}
+        loadConvention="total"
+        onChange={vi.fn()}
+      />,
+    )
+
+    expect(
+      (screen.getByLabelText(/weight in pounds/i) as HTMLInputElement).value,
+    ).toBe('40')
+    expect((screen.getByLabelText('Reps') as HTMLInputElement).value).toBe('11')
+    // And the strip says which of the two was a warm-up.
+    expect(screen.getAllByText(/warm-up$/i).length).toBeGreaterThan(0)
+  })
+
+  it('does not prefill an unrecorded legacy load into a recorded exercise', async () => {
+    // Reading a legacy row as total pounds is the right DISPLAY default. It is
+    // not a good enough reason to type that number into today's set.
+    const exerciseId = await seed('total')
+    const previous: LoggedSet[] = [
+      {
+        id: 'legacy',
+        workoutSessionId: 'older-session',
+        exerciseId,
+        setNumber: 1,
+        weightLbs: 95,
+        reps: 8,
+        rpe: null,
+        loggedAt: 1,
+      },
+    ]
+
+    render(
+      <SetLogger
+        sessionId={SESSION_ID}
+        exerciseId={exerciseId}
+        existingSets={[]}
+        previousSets={previous}
+        defaultRestSeconds={75}
+        loadConvention="total"
+        onChange={vi.fn()}
+      />,
+    )
+
+    expect(
+      (screen.getByLabelText(/weight in pounds/i) as HTMLInputElement).value,
+    ).toBe('')
+    // Still shown, still explained.
+    expect(screen.getByText(/different measurement/i)).toBeTruthy()
+  })
 })

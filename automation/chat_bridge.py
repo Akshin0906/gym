@@ -36,10 +36,20 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-BRIDGE_VERSION = "1.4"
-MODEL = "gpt-5.6-sol"
-ALLOWED_EFFORTS = {"medium", "xhigh"}
-DEFAULT_EFFORT = "medium"
+BRIDGE_VERSION = "1.5"
+MODEL = "gpt-6-astra"
+# Every effort `gpt-6-astra` advertises and this bridge will execute. A job
+# queued by an older client at `medium` or `xhigh` is still runnable, so a
+# rollout never strands work that is already in the queue.
+ALLOWED_EFFORTS = {"medium", "high", "xhigh"}
+# The product default for newly composed messages. It is a policy choice, not a
+# catalog limitation, and the bridge never silently substitutes a different
+# model or effort for the one a job actually requested.
+DEFAULT_EFFORT = "high"
+# Efforts written by bridge <= 1.4 against `gpt-5.6-sol`. They stay readable and
+# executable; the distinction exists so telemetry can say which rows predate the
+# default switch without rewriting them.
+LEGACY_DEFAULT_EFFORTS = {"medium", "xhigh"}
 MUSCLE_GROUPS = {
     "chest",
     "back",
@@ -54,6 +64,13 @@ MUSCLE_GROUPS = {
     "abs",
     "traps",
 }
+# The shared, versioned evidence guide. The same reviewed file is appended to
+# the daily briefing prompt; this runtime has no browsing or tools, so curated
+# guidance only reaches it because it ships in the package.
+EVIDENCE_GUIDE_VERSION = "2026-09-08-shared-evidence-guide-v1"
+EVIDENCE_GUIDE_FILENAME = "evidence_guide.md"
+EVIDENCE_GUIDE_HEADING = "## Shared training-evidence guide (curated, versioned)"
+EVIDENCE_GUIDE_MAX_BYTES = 32_768
 API_ROOT = "/api/chat/automation"
 MAX_HTTP_BYTES = 16 * 1024 * 1024
 MAX_CONTEXT_BYTES = 2 * 1024 * 1024
@@ -183,6 +200,7 @@ class Config:
     state_dir: Path
     log_dir: Path
     prompt_file: Path
+    evidence_guide_file: Path
     schema_file: Path
     credential_file: Path
     isolated_cwd: Path
@@ -223,6 +241,12 @@ class Config:
             prompt_file=Path(
                 os.environ.get(
                     "WORKOUT_CHAT_PROMPT_FILE", release_root / "codex_chat_prompt.md"
+                )
+            ).expanduser(),
+            evidence_guide_file=Path(
+                os.environ.get(
+                    "WORKOUT_EVIDENCE_GUIDE_FILE",
+                    release_root / EVIDENCE_GUIDE_FILENAME,
                 )
             ).expanduser(),
             schema_file=Path(
@@ -449,10 +473,18 @@ class IdleClaimBackoff:
 
 
 def validate_effort(value: Any) -> str:
+    """Accept any effort the configured model advertises.
+
+    A missing value means the caller expressed no preference and gets the
+    current default. Anything else is executed exactly as requested: the bridge
+    never maps one effort onto another, so the effort recorded on a completion
+    is the effort the turn actually ran at.
+    """
     if value is None:
         return DEFAULT_EFFORT
+    allowed = ", ".join(sorted(ALLOWED_EFFORTS))
     if not isinstance(value, str) or value not in ALLOWED_EFFORTS:
-        raise ConfigError("reasoningEffort must be exactly medium or xhigh")
+        raise ConfigError(f"reasoningEffort must be one of {allowed}")
     return value
 
 
@@ -2060,7 +2092,12 @@ class ChatBridge:
         self.logger = logger
         self.worker_id = worker_id(config)
         self.codex = resolve_codex_binary(config.codex_override)
-        self.prompt = config.prompt_file.read_text(encoding="utf-8")
+        # The composed contract + shared evidence guide, exactly what the model
+        # receives as base instructions on every thread start and resume.
+        self.prompt = compose_base_instructions(
+            config.prompt_file.read_text(encoding="utf-8"),
+            read_evidence_guide(config.evidence_guide_file),
+        )
         self.output_schema = require_object(read_json(config.schema_file), "output schema")
         self.app_server: AppServerClient | None = None
         self.stop_requested = False
@@ -2397,15 +2434,61 @@ class ChatBridge:
                 self.app_server.close()
 
 
+def read_evidence_guide(path: Path) -> str:
+    """The curated guidance this runtime actually receives.
+
+    The identical file ships with the daily briefing release. Both surfaces are
+    tool-free, so guidance that is not in the package does not exist for them.
+    """
+    if not path.is_file():
+        raise ConfigError(f"Missing shared evidence guide: {path}")
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        raise ConfigError(f"Shared evidence guide is empty: {path}")
+    size = len(text.encode("utf-8"))
+    if size > EVIDENCE_GUIDE_MAX_BYTES:
+        raise ConfigError(
+            f"Shared evidence guide requires {size} bytes, exceeding the "
+            f"{EVIDENCE_GUIDE_MAX_BYTES}-byte limit"
+        )
+    if EVIDENCE_GUIDE_VERSION not in text:
+        raise ConfigError(
+            f"Shared evidence guide does not declare {EVIDENCE_GUIDE_VERSION}"
+        )
+    return text
+
+
+def compose_base_instructions(prompt: str, evidence_guide: str) -> str:
+    """The exact instruction text handed to the model.
+
+    The guide is appended after the execution contract and explicitly framed as
+    reference that cannot relax it, so a curated summary can never be read as
+    permission to skip an approval or a security rule.
+    """
+    return (
+        f"{prompt.rstrip()}\n\n"
+        f"{EVIDENCE_GUIDE_HEADING}\n\n"
+        "The guidance below is trusted curated reference shipped with this "
+        "release. It never overrides the contract above, never authorizes an "
+        "action, and never supplies evidence about this user.\n\n"
+        f"{evidence_guide}\n"
+    )
+
+
+def evidence_guide_fingerprint(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def validate_files(config: Config) -> tuple[str, dict[str, Any]]:
     if not config.prompt_file.is_file():
         raise ConfigError(f"Missing chat prompt: {config.prompt_file}")
     prompt = config.prompt_file.read_text(encoding="utf-8")
     if not prompt.strip():
         raise ConfigError("Chat prompt is empty")
+    evidence_guide = read_evidence_guide(config.evidence_guide_file)
     schema = require_object(read_json(config.schema_file), "chat output schema")
     parse_env_value(config.credential_file, "CLOUD_AUTOMATION_SECRET")
-    return prompt, schema
+    return compose_base_instructions(prompt, evidence_guide), schema
 
 
 def doctor(config: Config) -> int:
@@ -2417,18 +2500,22 @@ def doctor(config: Config) -> int:
         "bridgeVersion": BRIDGE_VERSION,
         "model": MODEL,
         "allowedEfforts": sorted(ALLOWED_EFFORTS),
+        "defaultEffort": DEFAULT_EFFORT,
         "prompt": False,
+        "evidenceGuide": False,
         "schema": False,
         "cloudCredential": False,
         "chatgptLogin": False,
-        "modelSupportsMedium": False,
-        "modelSupportsXhigh": False,
+        "modelSupportsHigh": False,
         "stableApiOnly": True,
     }
     app: AppServerClient | None = None
     try:
         prompt, _ = validate_files(config)
         checks["prompt"] = True
+        checks["evidenceGuide"] = True
+        checks["evidenceGuideVersion"] = EVIDENCE_GUIDE_VERSION
+        checks["baseInstructionsSha256"] = evidence_guide_fingerprint(prompt)
         checks["schema"] = True
         checks["cloudCredential"] = True
         codex = resolve_codex_binary(config.codex_override)
@@ -2461,8 +2548,10 @@ def doctor(config: Config) -> int:
                 for item in entry.get("supportedReasoningEfforts", [])
                 if isinstance(item, dict)
             }
-            checks["modelSupportsMedium"] = "medium" in efforts
-            checks["modelSupportsXhigh"] = "xhigh" in efforts
+            checks["modelSupportsHigh"] = "high" in efforts
+            checks["modelSupportsLegacyEfforts"] = sorted(
+                effort for effort in LEGACY_DEFAULT_EFFORTS if effort in efforts
+            )
             checks["catalogDefaultEffort"] = entry.get("defaultReasoningEffort")
             break
     except BaseException as exc:
@@ -2472,11 +2561,11 @@ def doctor(config: Config) -> int:
             app.close()
     required = (
         "prompt",
+        "evidenceGuide",
         "schema",
         "cloudCredential",
         "chatgptLogin",
-        "modelSupportsMedium",
-        "modelSupportsXhigh",
+        "modelSupportsHigh",
         "stableApiOnly",
     )
     checks["ok"] = all(checks.get(name) is True for name in required)

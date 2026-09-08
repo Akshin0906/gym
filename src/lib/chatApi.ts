@@ -1,11 +1,12 @@
-import type {
-  CoachConversationState,
-  CoachMessage,
-  CoachPendingJob,
-  CoachProposal,
-  CoachProposalStatus,
-  CoachReasoningEffort,
-  CoachTranscriptPage,
+import {
+  isCoachReasoningEffort,
+  type CoachConversationState,
+  type CoachMessage,
+  type CoachPendingJob,
+  type CoachProposal,
+  type CoachProposalStatus,
+  type CoachRequestReasoningEffort,
+  type CoachTranscriptPage,
 } from './chatTypes'
 
 export const COACH_TRANSCRIPT_PROTOCOL = 'proposal-reservation-v1'
@@ -26,6 +27,18 @@ function optionalString(value: unknown): string | null {
   return typeof value === 'string' && value ? value : null
 }
 
+// Exported for tests: parsing is where a transcript row written by an older
+// bridge could quietly lose its recorded effort or model.
+export function parseCoachStateForTest(raw: {
+  messages: unknown[]
+}): { messages: CoachMessage[] } {
+  return {
+    messages: raw.messages
+      .map(parseMessage)
+      .filter((item): item is CoachMessage => item !== null),
+  }
+}
+
 function parseMessage(raw: unknown): CoachMessage | null {
   if (!isObject(raw)) return null
   const id = stringValue(raw.id)
@@ -39,7 +52,7 @@ function parseMessage(raw: unknown): CoachMessage | null {
     role,
     text,
     createdAt: numberValue(raw.createdAt),
-    reasoningEffort: effort === 'medium' || effort === 'xhigh' ? effort : null,
+    reasoningEffort: isCoachReasoningEffort(effort) ? effort : null,
     model: optionalString(raw.model),
     jobId: optionalString(raw.jobId),
     jobStatus: optionalString(raw.jobStatus),
@@ -246,7 +259,7 @@ export async function cancelCoachJob(jobId: string): Promise<void> {
 export async function postCoachMessage(args: {
   clientMessageId: string
   text: string
-  reasoningEffort: CoachReasoningEffort
+  reasoningEffort: CoachRequestReasoningEffort
   context: unknown
   stateHash: string
 }): Promise<{ message: CoachMessage | null; replayed: boolean }> {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import json
 import logging
@@ -217,21 +218,104 @@ def create_custom_exercise_output() -> dict:
 
 
 class ClaimValidationTests(unittest.TestCase):
-    def test_missing_effort_defaults_to_medium(self) -> None:
+    def test_missing_effort_defaults_to_the_current_product_default(self) -> None:
         claim = bridge.validate_claim(claim_envelope(None))
         self.assertIsNotNone(claim)
         assert claim is not None
-        self.assertEqual(claim.effort, "medium")
+        self.assertEqual(claim.effort, "high")
+        self.assertEqual(bridge.DEFAULT_EFFORT, "high")
 
-    def test_deep_think_maps_only_to_xhigh(self) -> None:
-        claim = bridge.validate_claim(claim_envelope("xhigh"))
+    def test_legacy_queued_efforts_still_run_unchanged(self) -> None:
+        # A job queued by an older client before the default switched is not
+        # stranded, and it runs at exactly the effort it asked for. `gpt-6-astra`
+        # advertises all three, so nothing is remapped.
+        for legacy in sorted(bridge.LEGACY_DEFAULT_EFFORTS):
+            with self.subTest(effort=legacy):
+                claim = bridge.validate_claim(claim_envelope(legacy))
+                self.assertIsNotNone(claim)
+                assert claim is not None
+                self.assertEqual(claim.effort, legacy)
+
+    def test_high_effort_is_accepted(self) -> None:
+        claim = bridge.validate_claim(claim_envelope("high"))
         self.assertIsNotNone(claim)
         assert claim is not None
-        self.assertEqual(claim.effort, "xhigh")
+        self.assertEqual(claim.effort, "high")
 
     def test_unknown_effort_is_rejected(self) -> None:
         with self.assertRaises(bridge.ConfigError):
-            bridge.validate_claim(claim_envelope("high"))
+            bridge.validate_claim(claim_envelope("ultra"))
+
+
+class ThreadConfigurationTests(unittest.TestCase):
+    """A resumed thread must actually run on the configured model.
+
+    Renaming a constant is not a migration: `thread/start`, `thread/resume`, and
+    every `turn/start` have to carry the model, and the turn has to carry the
+    effort the job asked for rather than a remapped one.
+    """
+
+    def build_client(self) -> "bridge.AppServerClient":
+        with tempfile.TemporaryDirectory() as directory:
+            config = bridge.Config.from_env()
+            config = dataclasses.replace(
+                config, isolated_cwd=Path(directory)
+            )
+            return bridge.AppServerClient(
+                Path("/nonexistent/codex"),
+                config,
+                "base instructions",
+                logging.getLogger("thread-config-test"),
+            )
+
+    def test_thread_configuration_names_the_current_model(self) -> None:
+        params = self.build_client()._thread_configuration()
+        self.assertEqual(params["model"], "gpt-6-astra")
+        self.assertEqual(params["baseInstructions"], "base instructions")
+        # Tool-free operation is unchanged by the model switch.
+        self.assertEqual(params["approvalPolicy"], "never")
+        self.assertEqual(params["sandbox"], "read-only")
+        self.assertFalse(params["config"]["tools"]["web_search"])
+
+    def test_start_and_resume_send_the_same_configuration(self) -> None:
+        client = self.build_client()
+        seen: list[tuple[str, dict]] = []
+
+        def fake_request(method, params=None, timeout=None, on_wait=None):
+            seen.append((method, dict(params or {})))
+            return {"thread": {"id": "thread-1"}}
+
+        client.request = fake_request  # type: ignore[assignment]
+        client.start_thread()
+        client.resume_thread("thread-1")
+        self.assertEqual([item[0] for item in seen], ["thread/start", "thread/resume"])
+        for _, params in seen:
+            self.assertEqual(params["model"], "gpt-6-astra")
+        self.assertEqual(seen[1][1]["threadId"], "thread-1")
+
+    def test_a_turn_runs_the_effort_the_job_requested(self) -> None:
+        client = self.build_client()
+        for effort in sorted(bridge.ALLOWED_EFFORTS):
+            with self.subTest(effort=effort):
+                captured: dict = {}
+
+                def fake_request(method, params=None, timeout=None, on_wait=None):
+                    captured.update(params or {})
+                    raise bridge.TransientError("stop after turn/start")
+
+                client.request = fake_request  # type: ignore[assignment]
+                with self.assertRaises(bridge.TransientError):
+                    client.run_turn(
+                        thread_id="thread-1",
+                        user_message_id="message-1",
+                        input_text="hello",
+                        effort=effort,
+                        output_schema={"type": "object"},
+                        on_wait=lambda: None,
+                    )
+                self.assertEqual(captured["model"], "gpt-6-astra")
+                # Executed exactly as requested: never remapped to the default.
+                self.assertEqual(captured["effort"], effort)
 
     def test_claim_requires_numeric_timestamps(self) -> None:
         value = claim_envelope()

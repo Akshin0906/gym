@@ -17,8 +17,10 @@ import {
   subscribeLocalMutations,
 } from '../db/repositories/syncState'
 import type { SyncFence } from '../db/types'
+import { BRIEFING_MODE_REASONS } from '../db/types'
 import type {
   AiMemorySummary,
+  BriefingModeReason,
   AiMemorySummaryType,
   DailyBriefing,
   DailyBriefingSections,
@@ -445,6 +447,13 @@ function parseSections(raw: unknown): DailyBriefingSections {
     raw.recoveryStatus === 'unavailable'
       ? (raw.recoveryStatus as RecoveryStatus)
       : undefined
+  // Unknown or absent stays absent: an older briefing simply does not carry
+  // this, and a value the app does not recognize is not rendered as one.
+  const modeReasonLabel = (
+    BRIEFING_MODE_REASONS as readonly string[]
+  ).includes(raw.modeReasonLabel as string)
+    ? (raw.modeReasonLabel as BriefingModeReason)
+    : undefined
   return {
     todaysCall: stringOrEmpty(raw.todaysCall),
     why: stringArray(raw.why),
@@ -452,7 +461,14 @@ function parseSections(raw: unknown): DailyBriefingSections {
     ouraRecovery: stringOrEmpty(raw.ouraRecovery),
     trainingTrend: stringOrEmpty(raw.trainingTrend),
     watchOuts: stringArray(raw.watchOuts),
+    ...(modeReasonLabel ? { modeReasonLabel } : {}),
   }
+}
+
+// Exported for tests: the parser is where an optional supervisor-owned field
+// gets silently dropped, and that is exactly what needs asserting.
+export function parseCloudBriefingForTest(raw: unknown): DailyBriefing {
+  return parseBriefing(raw)
 }
 
 function parseBriefing(raw: unknown): DailyBriefing {

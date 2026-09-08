@@ -13,6 +13,7 @@ import type {
 } from '../db/types'
 import {
   exerciseLoadConvention,
+  loadConventionsComparableForProgression,
   loadSemantics,
   resolveSetLoadConvention,
   setKindOf,
@@ -92,12 +93,71 @@ export function setVolumeForLoad(
 export interface OneRMPoint {
   loggedAt: number
   est1rm: number
+  convention: LoadConvention
 }
 
-export function buildOneRMTrend(
+export interface OneRMTrend {
+  points: OneRMPoint[]
+  // The one convention every charted point measures, or null when there is
+  // nothing chartable. Points recorded another way are excluded, never joined.
+  convention: LoadConvention | null
+  // Sets left out because their load has no valid estimate (machine settings,
+  // assistance, bodyweight-only work).
+  excludedNoEstimateSetCount: number
+  // Sets left out because they measure something else — 20 lb per dumbbell and
+  // 40 lb total are not one line, and drawing them as one reads as a doubling.
+  // An unrecorded legacy load counts as "something else" too: it is read as
+  // total pounds for description, never joined to a recorded total to imply
+  // that the number went up.
+  excludedOtherConventionSetCount: number
+  // True when at least one charted set only *assumed* pounds (legacy row).
+  includesAssumedUnits: boolean
+}
+
+// Heuristic caveats to show beside an estimate, never calibrated error bands.
+// Epley has no term for effort, and repetition-based prediction depends on the
+// individual and on standardized conditions, so these say what is uncertain
+// without inventing a confidence figure. Mirrors the supervisor's
+// one_rep_max_estimate_context in automation/briefing/measurement.py.
+export interface OneRMEstimateNotes {
+  highestRepCountUsed: number | null
+  setsWithRecordedEffort: number
+  workingSetCount: number
+  manyRepsExtrapolatedFrom: boolean
+  noSetEffortRecorded: boolean
+  hasSingleRepSet: boolean
+}
+
+export function oneRepMaxEstimateNotes(
+  sets: readonly LoggedSet[],
+): OneRMEstimateNotes {
+  let highest: number | null = null
+  let withEffort = 0
+  let working = 0
+  let hasSingle = false
+  for (const s of sets) {
+    if (setKindOf(s) !== 'working') continue
+    working += 1
+    if (Number.isFinite(s.reps) && s.reps >= 1) {
+      if (highest === null || s.reps > highest) highest = s.reps
+      if (s.reps === 1) hasSingle = true
+    }
+    if (s.rpe !== null && Number.isFinite(s.rpe)) withEffort += 1
+  }
+  return {
+    highestRepCountUsed: highest,
+    setsWithRecordedEffort: withEffort,
+    workingSetCount: working,
+    manyRepsExtrapolatedFrom: highest !== null && highest >= 10,
+    noSetEffortRecorded: working > 0 && withEffort === 0,
+    hasSingleRepSet: hasSingle,
+  }
+}
+
+export function buildOneRMTrendDetailed(
   sets: LoggedSet[],
   options: { includeWarmups?: boolean } = {},
-): OneRMPoint[] {
+): OneRMTrend {
   // Working sets only by default: a warm-up single is not a strength data
   // point, and mixing it into a progression chart flattens or spikes the line
   // for reasons that have nothing to do with training.
@@ -105,18 +165,59 @@ export function buildOneRMTrend(
   // Each set is read with its OWN frozen convention — never the exercise's
   // current setting — so a metadata edit cannot reinterpret history, and sets
   // whose load is not a one-rep-max input are omitted rather than charted.
-  const points: OneRMPoint[] = []
-  for (const s of sets) {
-    if (!options.includeWarmups && setKindOf(s) !== 'working') continue
-    const est = estimated1RMForLoad(
-      s.weightLbs,
-      s.reps,
-      resolveSetLoadConvention(s),
-    )
-    if (est === null) continue
-    points.push({ loggedAt: s.loggedAt, est1rm: Math.round(est) })
+  const considered = sets.filter(
+    (s) => options.includeWarmups || setKindOf(s) === 'working',
+  )
+  // The anchor is how the exercise is recorded NOW: the convention of the most
+  // recent considered set, whether or not that set has a valid estimate. Taking
+  // it from the newest *chartable* set instead would quietly fall back to an
+  // older convention after a switch to machine or assisted work and keep
+  // drawing a line that no longer describes the exercise.
+  let anchor: LoadConvention | null = null
+  let anchorAt = Number.NEGATIVE_INFINITY
+  for (const s of considered) {
+    if (s.loggedAt >= anchorAt) {
+      anchorAt = s.loggedAt
+      anchor = resolveSetLoadConvention(s)
+    }
   }
-  return points.sort((a, b) => a.loggedAt - b.loggedAt)
+  const points: OneRMPoint[] = []
+  let excludedNoEstimateSetCount = 0
+  let excludedOtherConventionSetCount = 0
+  for (const s of considered) {
+    const convention = resolveSetLoadConvention(s)
+    // Strict equality, not the descriptive reading: an unrecorded legacy load
+    // is never joined to an explicitly recorded one to imply progress.
+    if (anchor === null || !loadConventionsComparableForProgression(convention, anchor)) {
+      excludedOtherConventionSetCount += 1
+      continue
+    }
+    const est = estimated1RMForLoad(s.weightLbs, s.reps, convention)
+    if (est === null) {
+      excludedNoEstimateSetCount += 1
+      continue
+    }
+    points.push({
+      loggedAt: s.loggedAt,
+      est1rm: Math.round(est),
+      convention,
+    })
+  }
+  points.sort((a, b) => a.loggedAt - b.loggedAt)
+  return {
+    points,
+    convention: anchor,
+    excludedNoEstimateSetCount,
+    excludedOtherConventionSetCount,
+    includesAssumedUnits: anchor === 'unknown' && points.length > 0,
+  }
+}
+
+export function buildOneRMTrend(
+  sets: LoggedSet[],
+  options: { includeWarmups?: boolean } = {},
+): OneRMPoint[] {
+  return buildOneRMTrendDetailed(sets, options).points
 }
 
 export interface WeeklyVolumeRow {
@@ -273,7 +374,8 @@ export interface WeeklySetCountRow {
   secondary: Partial<Record<MuscleGroup, number>>
 }
 
-// Weekly set counts per muscle, split into direct and secondary exposure.
+// Weekly WORKING-set counts per muscle, split into direct and secondary
+// exposure. Warm-ups are excluded unless a caller opts in.
 //
 // `buildWeeklySetCounts` keeps the historical blended shape (primary 1.0 +
 // secondary 0.5) for callers that already chart it; `buildWeeklySetCountsSplit`
@@ -281,7 +383,11 @@ export interface WeeklySetCountRow {
 export function buildWeeklySetCountsSplit(
   sets: LoggedSet[],
   exercises: Map<string, Exercise>,
-  options: { workingSetsOnly?: boolean } = {},
+  // Working sets only by DEFAULT. A warm-up is preparation, not training
+  // credit, and counting it doubled every weekly figure for anyone who logs
+  // warm-ups. A legacy row with no classification still counts as working,
+  // which is the conservative reading every existing view already assumed.
+  options: { includeWarmups?: boolean } = {},
 ): WeeklySetCountRow[] {
   const buckets = new Map<
     string,
@@ -291,7 +397,7 @@ export function buildWeeklySetCountsSplit(
   for (const s of sets) {
     const exercise = exercises.get(s.exerciseId)
     if (!exercise) continue
-    if (options.workingSetsOnly && setKindOf(s) !== 'working') continue
+    if (!options.includeWarmups && setKindOf(s) !== 'working') continue
     const key = `${getISOWeekYear(s.loggedAt)}-W${String(getISOWeek(s.loggedAt)).padStart(2, '0')}`
     let bucket = buckets.get(key)
     if (!bucket) {
@@ -315,15 +421,17 @@ export function buildWeeklySetCountsSplit(
     .sort((a, b) => a.weekStart - b.weekStart)
 }
 
-// Weekly "effective sets" per muscle: 1 per set for the primary mover, and
-// SECONDARY_VOLUME_WEIGHT (0.5) per set for each secondary muscle. Mirrors
-// buildWeeklyVolume's bucketing but counts sets instead of tonnage, so load
-// and reps don't affect the total — only how many sets touched the muscle.
+// Weekly "effective sets" per muscle: 1 per working set for the primary mover,
+// and SECONDARY_VOLUME_WEIGHT (0.5) per working set for each secondary muscle.
+// Mirrors buildWeeklyVolume's bucketing but counts sets instead of tonnage, so
+// load and reps don't affect the total — only how many sets touched the muscle.
+// The 0.5 is a rough modelling convenience, not a physiological equivalence.
 export function buildWeeklySetCounts(
   sets: LoggedSet[],
   exercises: Map<string, Exercise>,
+  options: { includeWarmups?: boolean } = {},
 ): WeeklyVolumeRow[] {
-  return buildWeeklySetCountsSplit(sets, exercises).map((row) => {
+  return buildWeeklySetCountsSplit(sets, exercises, options).map((row) => {
     const values: Partial<Record<MuscleGroup, number>> = {}
     for (const [muscle, count] of Object.entries(row.direct)) {
       values[muscle as MuscleGroup] = count

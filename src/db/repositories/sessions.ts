@@ -649,14 +649,46 @@ export async function countSessions(): Promise<number> {
 export interface ExerciseE1RMPoint {
   completedAt: number
   e1rm: number
+  convention: LoadConvention
+}
+
+export interface ExerciseE1RMTrend {
+  points: ExerciseE1RMPoint[]
+  // What every charted point measures. Null when nothing is chartable.
+  convention: LoadConvention | null
+  // Sessions dropped because their sets were recorded under a different
+  // convention than the newest session. Reported, never converted: nothing in
+  // the data says how many dumbbells a per-dumbbell number stood for.
+  excludedOtherConventionSessionCount: number
+  // Sessions dropped because the exercise's sets mixed conventions inside one
+  // session, so the session has no single top estimate at all.
+  mixedConventionSessionCount: number
+  // Sessions dropped because their load has no valid one-rep-max estimate.
+  excludedNoEstimateSessionCount: number
+  includesAssumedUnits: boolean
+}
+
+// The one convention a session's working sets agreed on, or null when they
+// disagreed. Deliberately strict: unlike `commonLoadConvention`, an unrecorded
+// legacy row does NOT merge into an explicit `total`, because this value gates
+// a progression chart rather than a descriptive total.
+function exactCommonConvention(
+  conventions: ReadonlySet<LoadConvention>,
+): LoadConvention | null {
+  if (conventions.size !== 1) return null
+  for (const value of conventions) return value
+  return null
 }
 
 export async function getRecentSessionE1RMsForExercise(
   exerciseId: string,
   excludeSessionId: string | undefined,
   limit: number,
-): Promise<ExerciseE1RMPoint[]> {
-  const maxBySession = new Map<string, number>()
+): Promise<ExerciseE1RMTrend> {
+  const bySession = new Map<
+    string,
+    { best: number; conventions: Set<LoadConvention>; hadEstimate: boolean }
+  >()
   await db.loggedSets
     .where('exerciseId')
     .equals(exerciseId)
@@ -667,28 +699,81 @@ export async function getRecentSessionE1RMsForExercise(
       // Read with the set's own frozen convention. Machine settings,
       // assistance, and bodyweight-only loads have no valid one-rep-max
       // estimate; leaving them out beats charting a fake number.
-      const e = estimated1RMForLoad(
-        s.weightLbs,
-        s.reps,
-        resolveSetLoadConvention(s),
-      )
-      if (e === null) return
-      const cur = maxBySession.get(s.workoutSessionId) ?? 0
-      if (e > cur) maxBySession.set(s.workoutSessionId, e)
+      const convention = resolveSetLoadConvention(s)
+      const entry = bySession.get(s.workoutSessionId) ?? {
+        best: 0,
+        conventions: new Set<LoadConvention>(),
+        hadEstimate: false,
+      }
+      entry.conventions.add(convention)
+      const e = estimated1RMForLoad(s.weightLbs, s.reps, convention)
+      if (e !== null) {
+        entry.hadEstimate = true
+        if (e > entry.best) entry.best = e
+      }
+      bySession.set(s.workoutSessionId, entry)
     })
 
-  const sessions = await db.workoutSessions.bulkGet(
-    Array.from(maxBySession.keys()),
-  )
-  const points: ExerciseE1RMPoint[] = []
+  const sessions = await db.workoutSessions.bulkGet(Array.from(bySession.keys()))
+  // Every completed session that logged this exercise, newest first, each with
+  // the single convention its working sets agreed on — or null when they did
+  // not, which means that session has no top estimate at all.
+  const observed: {
+    completedAt: number
+    best: number
+    convention: LoadConvention | null
+    hadEstimate: boolean
+  }[] = []
   for (const s of sessions) {
     if (!s || s.completedAt === null) continue
-    const e = maxBySession.get(s.id)
-    if (e === undefined) continue
-    points.push({ completedAt: s.completedAt, e1rm: Math.round(e) })
+    const entry = bySession.get(s.id)
+    if (entry === undefined) continue
+    observed.push({
+      completedAt: s.completedAt,
+      best: entry.best,
+      convention: exactCommonConvention(entry.conventions),
+      hadEstimate: entry.hadEstimate,
+    })
   }
-  points.sort((a, b) => b.completedAt - a.completedAt)
-  return points.slice(0, limit).reverse()
+  observed.sort((a, b) => b.completedAt - a.completedAt)
+  // Anchored on the NEWEST session, even when that session is mixed or records
+  // something with no valid estimate. Skipping ahead to the newest chartable
+  // session would quietly resume an abandoned way of measuring the lift.
+  const anchor = observed[0]?.convention ?? null
+  let mixedConventionSessionCount = 0
+  let excludedNoEstimateSessionCount = 0
+  let excludedOtherConventionSessionCount = 0
+  const comparable: ExerciseE1RMPoint[] = []
+  for (const item of observed) {
+    if (item.convention === null) {
+      mixedConventionSessionCount += 1
+      continue
+    }
+    // Strict equality: an unrecorded legacy load is read as total pounds for
+    // description, never joined to a recorded total to imply progress.
+    if (anchor === null || item.convention !== anchor) {
+      excludedOtherConventionSessionCount += 1
+      continue
+    }
+    if (!item.hadEstimate) {
+      excludedNoEstimateSessionCount += 1
+      continue
+    }
+    comparable.push({
+      completedAt: item.completedAt,
+      e1rm: Math.round(item.best),
+      convention: item.convention,
+    })
+  }
+  const points = comparable.slice(0, limit).reverse()
+  return {
+    points,
+    convention: anchor,
+    excludedOtherConventionSessionCount,
+    mixedConventionSessionCount,
+    excludedNoEstimateSessionCount,
+    includesAssumedUnits: anchor === 'unknown' && points.length > 0,
+  }
 }
 
 export async function swapExerciseInSession(

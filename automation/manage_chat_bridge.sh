@@ -83,6 +83,10 @@ os.replace(temporary, target)
 PY
 }
 
+# Pinned alongside the value in chat_bridge.py so a package whose guide and code
+# disagree about the version fails the install.
+CHAT_EVIDENCE_GUIDE_VERSION="2026-09-08-shared-evidence-guide-v1"
+
 deploy_release() {
   mkdir -p "$RUNTIME_ROOT/releases" "$RUNTIME_ROOT/logs" "$RUNTIME_ROOT/state"
   chmod 700 "$RUNTIME_ROOT" "$RUNTIME_ROOT/releases" "$RUNTIME_ROOT/logs" "$RUNTIME_ROOT/state"
@@ -92,11 +96,30 @@ deploy_release() {
   install -m 700 "$SCRIPT_DIR/run_codex_chat_bridge.sh" "$release/"
   install -m 600 "$SCRIPT_DIR/chat_bridge.py" "$release/"
   install -m 600 "$SCRIPT_DIR/codex_chat_prompt.md" "$release/"
+  # The shared, versioned evidence guide. The bridge refuses to start without
+  # it, so a release that omits it must fail here rather than at runtime.
+  install -m 600 "$SCRIPT_DIR/evidence_guide.md" "$release/"
   install -m 600 "$SCRIPT_DIR/codex_chat_output_schema.json" "$release/"
 
   /usr/bin/python3 -m py_compile "$release/chat_bridge.py"
   /bin/bash -n "$release/run_codex_chat_bridge.sh"
   /usr/bin/python3 -m json.tool "$release/codex_chat_output_schema.json" >/dev/null
+  if ! /usr/bin/grep -q "$CHAT_EVIDENCE_GUIDE_VERSION" "$release/evidence_guide.md"; then
+    echo "Staged evidence guide does not declare $CHAT_EVIDENCE_GUIDE_VERSION." >&2
+    return 1
+  fi
+  /usr/bin/python3 - "$release" <<'PY'
+import sys
+from pathlib import Path
+
+release = Path(sys.argv[1])
+source = (release / "chat_bridge.py").read_text(encoding="utf-8")
+if "compose_base_instructions" not in source:
+    raise SystemExit("Chat bridge does not compose the shared evidence guide")
+guide = (release / "evidence_guide.md").read_text(encoding="utf-8")
+if not guide.strip():
+    raise SystemExit("Staged evidence guide is empty")
+PY
 
   local next_link="$RUNTIME_ROOT/.current-next-$$"
   ln -s "$release" "$next_link"

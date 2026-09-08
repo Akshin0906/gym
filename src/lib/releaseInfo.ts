@@ -127,7 +127,7 @@ export function runnerFreshness(
 
 // The version the working tree ships. Compared against the version the last
 // briefing reported so Settings can say "installed runner is behind this build".
-export const EXPECTED_RUNNER_VERSION = '3.8'
+export const EXPECTED_RUNNER_VERSION = '3.9'
 
 export function runnerVersionState(
   release: RunnerRelease,

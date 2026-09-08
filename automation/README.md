@@ -360,8 +360,8 @@ other error, malformed event lifecycle, or tool item is still rejected.
 
 Launchd uses these safe defaults:
 
-- Model: `gpt-5.6-sol`
-- Reasoning effort: Extra High (`xhigh`)
+- Model: `gpt-6-astra`
+- Reasoning effort: High (`high`)
 - Codex timeout: 20 minutes
 - Model-input data budget: 48,000 serialized UTF-8 bytes
 - Full prompt budget: 81,920 serialized UTF-8 bytes
@@ -371,13 +371,59 @@ Launchd uses these safe defaults:
 For a manual run, environment variables can override them:
 
 ```bash
-WORKOUT_CODEX_MODEL=gpt-5.6-sol \
-WORKOUT_CODEX_REASONING_EFFORT=xhigh \
+WORKOUT_CODEX_MODEL=gpt-6-astra \
+WORKOUT_CODEX_REASONING_EFFORT=high \
 ./automation/manage_daily_briefing.sh run-now
 ```
 
 The runner discovers the CLI from `WORKOUT_CODEX_BIN`, the current ChatGPT app,
 the legacy Codex app, then `PATH`. This prevents another app-rename failure.
+
+## Effort targets: a deliberate non-change
+
+The audit asked whether the app should store an optional per-exercise effort
+target (a saved RPE or RIR ceiling). It does not, on purpose.
+
+Nothing in the current schema records one, so a briefing that states "keep the
+first working set at RPE 8 or below" is stating the model's own suggestion for
+today — and it must say so rather than presenting it as an agreed prescription.
+Both prompts now require that, and both state the reps-in-reserve anchors so the
+number means the same thing from one set to the next. Where the user's own saved
+plan or note *does* prescribe an effort or rep target, that is their target and
+the surfaces are told to use it and name it as theirs.
+
+Adding a saved effort target would touch the exercise schema, the template and
+snapshot shapes, export/import validation, the cloud snapshot, the Coach action
+DSL, and the supervisor's comparators. That is a large change to carry for a
+field with no evidence-based default value: the research does not support one
+correct RIR, and inventing a stored number would be exactly the false precision
+this audit was about. It stays unimplemented and is recorded here as a decision
+rather than an oversight.
+
+## Shared evidence guide
+
+`automation/evidence_guide.md` is one dated, source-linked summary of the
+training evidence the coaching surfaces rely on. Neither runtime model has
+browsing or tools, so guidance that is not in the package does not reach them.
+
+- It is appended verbatim to BOTH runtime prompts: the daily briefing prompt
+  and the conversational Coach's base instructions.
+- It never relaxes a security, approval, or memory rule. Both prompts state
+  that the surface's own contract wins on any apparent conflict.
+- Its version is pinned in three places that must agree — `EVIDENCE_GUIDE_VERSION`
+  in `briefing/constants.py`, the same constant in `chat_bridge.py`, and the
+  version line inside the guide itself. Both installers refuse to stage a
+  release whose guide does not declare the expected version.
+- Its bytes are folded into the daily runner's `promptHash`, so changing it
+  changes the recorded prompt fingerprint and invalidates a same-day spool
+  produced under the old guidance. The version is also recorded in briefing
+  metadata as `evidenceGuideVersion`.
+- `--doctor` reports `evidenceGuide` on both surfaces and fails without it.
+
+A prompt containing a sentence is not evidence that a model reasons from it.
+The packaging tests prove only that the curated text physically reaches the
+runtime; the behavioural tests in `tests/test_coaching_science.py` are what pin
+the supervisor's own decisions.
 
 ## Validation
 
@@ -394,8 +440,13 @@ The Coach page uses a separate long-running bridge built on the stable Codex
 App Server stdio protocol. It also uses the existing ChatGPT login rather than
 an OpenAI API key.
 
-- Normal messages run `gpt-5.6-sol` at `medium` reasoning effort.
-- Messages sent with **Deep Think** run the same model at `xhigh`.
+- Messages run `gpt-6-astra` at `high` reasoning effort. `high` is the product
+  default, not a catalog limit: the model advertises `medium`, `high`, and
+  `xhigh`, and the bridge will still execute a job an older client queued at one
+  of the previous defaults rather than stranding it mid-rollout. Historical
+  transcript rows keep the effort they actually ran at.
+- The composer shows the model and effort instead of offering a choice, because
+  there is only one effort new messages are composed at.
 - One persistent Codex thread is stored per cloud conversation and resumed
   across bridge/App Server restarts.
 - D1 remains the canonical transcript. If a saved Codex thread cannot resume,
@@ -451,8 +502,11 @@ The cloud worker contract is:
 - `POST /api/chat/automation/jobs/:id/fail`
 
 All five requests authenticate with `X-Cloud-Automation-Secret`. Claimed jobs
-must use exactly `medium` or `xhigh`; a missing value safely defaults to
-`medium`. Action plans use the typed DSL in `codex_chat_output_schema.json` and
+must use `medium`, `high`, or `xhigh`; a missing value defaults to `high`. The
+D1 CHECK constraints were widened by `migrations/0009_codex_chat_high_effort.sql`,
+which rebuilds the three linked chat tables — preserving every row, index,
+foreign key, and the `codex_chat_messages` AUTOINCREMENT high-water mark — and
+keeps the two legacy values valid so no stored row is rewritten. Action plans use the typed DSL in `codex_chat_output_schema.json` and
 are proposals only. After validating model output, the trusted bridge binds a
 plan to both the claimed context's global `sourceStateHash` and the 64-character
 lowercase `actionStateHashes[scope]` value as `sourceActionStateHash`. The model

@@ -61,6 +61,10 @@ from briefing.errors import (  # noqa: F401
 )
 from briefing.constants import (  # noqa: F401
     BRIEFING_EVIDENCE_PACKET_VERSION,
+    EVIDENCE_GUIDE_FILENAME,
+    EVIDENCE_GUIDE_HEADING,
+    EVIDENCE_GUIDE_MAX_BYTES,
+    EVIDENCE_GUIDE_VERSION,
     BRIEFING_HEADLINE_MAX,
     BRIEFING_REASON_MAX,
     BRIEFING_RECOVERY_MAX,
@@ -171,7 +175,11 @@ from briefing.measurement import (  # noqa: F401
     estimated_one_rep_max_for_load,
     load_convention,
     load_conventions_comparable,
+    load_conventions_comparable_for_progression,
     load_semantics,
+    one_rep_max_estimate_context,
+    ordinal_progress_marker,
+    rep_attainment_counts,
     normalized_target_range,
     parsed_target_rep_range,
     positive_integer,
@@ -368,6 +376,7 @@ class Config:
     state_dir: Path
     log_dir: Path
     prompt_file: Path
+    evidence_guide_file: Path
     schema_file: Path
     credential_file: Path
     oura_root: Path
@@ -420,6 +429,12 @@ class Config:
                 os.environ.get(
                     "WORKOUT_PROMPT_FILE",
                     release_root / "codex_daily_briefing_prompt.md",
+                )
+            ).expanduser(),
+            evidence_guide_file=Path(
+                os.environ.get(
+                    "WORKOUT_EVIDENCE_GUIDE_FILE",
+                    release_root / EVIDENCE_GUIDE_FILENAME,
                 )
             ).expanduser(),
             schema_file=Path(
@@ -493,12 +508,40 @@ def read_json(path: Path, *, max_bytes: int = 16 * 1024 * 1024) -> Any:
     except (OSError, json.JSONDecodeError) as exc:
         raise ConfigError(f"Invalid JSON file: {path}") from exc
 
+def read_evidence_guide(path: Path) -> str:
+    """The curated guidance that both runtime surfaces actually receive.
+
+    Read from the release directory rather than embedded in code so one
+    reviewed file is the single source for the chat bridge and this runner. It
+    is bounded because it travels inside the model prompt budget.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"Missing shared evidence guide: {path}") from exc
+    text = raw.strip()
+    if not text:
+        raise ConfigError(f"Shared evidence guide is empty: {path}")
+    size = len(text.encode("utf-8"))
+    if size > EVIDENCE_GUIDE_MAX_BYTES:
+        raise ConfigError(
+            f"Shared evidence guide requires {size} bytes, exceeding the "
+            f"{EVIDENCE_GUIDE_MAX_BYTES}-byte limit"
+        )
+    if EVIDENCE_GUIDE_VERSION not in text:
+        raise ConfigError(
+            f"Shared evidence guide does not declare {EVIDENCE_GUIDE_VERSION}"
+        )
+    return text
+
+
 def prompt_fingerprint(config: Config) -> str:
     digest = hashlib.sha256()
-    for path in (config.prompt_file, config.schema_file):
+    for path in (config.prompt_file, config.evidence_guide_file, config.schema_file):
         digest.update(path.read_bytes())
         digest.update(b"\0")
     digest.update(PROMPT_VERSION.encode("utf-8"))
+    digest.update(EVIDENCE_GUIDE_VERSION.encode("utf-8"))
     return digest.hexdigest()
 
 def parse_env_value(path: Path, key: str) -> str:
@@ -817,6 +860,7 @@ def build_model_prompt(
     max_prompt_bytes: int = MODEL_PROMPT_MAX_BYTES,
 ) -> str:
     instructions = config.prompt_file.read_text(encoding="utf-8").rstrip()
+    evidence_guide = read_evidence_guide(config.evidence_guide_file)
     context = {
         "today": today,
         "now": now.isoformat(),
@@ -825,6 +869,7 @@ def build_model_prompt(
         "generatorVersion": RUNNER_VERSION,
         "promptVersion": PROMPT_VERSION,
         "promptHash": prompt_hash,
+        "evidenceGuideVersion": EVIDENCE_GUIDE_VERSION,
         "model": config.codex_model,
     }
     del snapshot_body  # Raw snapshots are never placed in the model context.
@@ -836,6 +881,11 @@ def build_model_prompt(
     )
     prompt = (
         f"{instructions}\n\n"
+        f"{EVIDENCE_GUIDE_HEADING}\n\n"
+        "The guidance below is trusted curated reference shipped with this "
+        "release. It never overrides the contract above and never supplies "
+        "evidence about this user.\n\n"
+        f"{evidence_guide}\n\n"
         "## Trusted run context\n\n"
         f"```json\n{json.dumps(context, ensure_ascii=False, separators=(',', ':'))}\n```\n\n"
         "## Untrusted input data\n\n"
@@ -1195,6 +1245,8 @@ def doctor(config: Config) -> int:
         "automationRoot": str(config.automation_root),
         "codexHome": str(config.codex_home),
         "prompt": config.prompt_file.is_file(),
+        "evidenceGuide": config.evidence_guide_file.is_file(),
+        "evidenceGuideVersion": EVIDENCE_GUIDE_VERSION,
         "schema": config.schema_file.is_file(),
         "credentialFile": config.credential_file.is_file(),
         "ouraRoot": config.oura_root.is_dir(),
@@ -1232,6 +1284,7 @@ def doctor(config: Config) -> int:
         checks.get(name) is True
         for name in (
             "prompt",
+            "evidenceGuide",
             "schema",
             "credentialFile",
             "ouraRoot",

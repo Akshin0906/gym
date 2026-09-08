@@ -2,6 +2,15 @@ import { db } from './schema'
 import { normalizedExerciseName } from '../lib/exerciseName'
 import type { Exercise } from './types'
 
+// Secondary muscles list the muscles a lift meaningfully trains beyond its
+// primary mover. Involvement alone does not qualify.
+//
+// Three entries below are corrected because direct longitudinal measurement
+// found little or no hamstring growth from them. Walking Lunge and Sumo
+// Deadlift keep their hamstring entry as an unverified editorial default,
+// retained conservatively rather than changed on an argument from silence: no
+// study read here measured them either way, and absence of contradiction is not
+// evidence for the mapping. See automation/evidence_guide.md.
 export const SEED_EXERCISES: Omit<Exercise, 'id' | 'createdAt'>[] = [
   // ----- Chest -----
   { name: 'Barbell Bench Press', primaryMuscle: 'chest', secondaryMuscles: ['triceps', 'shoulders'], notes: '', defaultRestSeconds: 180, isCustom: false, hiddenFromLibrary: false },
@@ -60,9 +69,17 @@ export const SEED_EXERCISES: Omit<Exercise, 'id' | 'createdAt'>[] = [
   { name: 'Reverse Wrist Curl (Barbell)', primaryMuscle: 'forearms', secondaryMuscles: [], notes: '', defaultRestSeconds: 60, isCustom: false, hiddenFromLibrary: false },
 
   // ----- Quads -----
-  { name: 'Barbell Back Squat', primaryMuscle: 'quads', secondaryMuscles: ['glutes', 'hamstrings'], notes: '', defaultRestSeconds: 210, isCustom: false, hiddenFromLibrary: false },
+  // Hamstring credit removed: longitudinal squat studies measuring muscle size
+  // report quadriceps, gluteal and adductor growth without hamstring
+  // hypertrophy (Kubo 2019 PMID 31230110; Plotkin 2023 PMID 37877099).
+  // Involvement is not the same as a meaningful growth stimulus.
+  { name: 'Barbell Back Squat', primaryMuscle: 'quads', secondaryMuscles: ['glutes'], notes: '', defaultRestSeconds: 210, isCustom: false, hiddenFromLibrary: false },
   { name: 'Front Squat', primaryMuscle: 'quads', secondaryMuscles: ['glutes'], notes: '', defaultRestSeconds: 180, isCustom: false, hiddenFromLibrary: false },
-  { name: 'Leg Press', primaryMuscle: 'quads', secondaryMuscles: ['glutes', 'hamstrings'], notes: '', defaultRestSeconds: 180, isCustom: false, hiddenFromLibrary: false },
+  // Hamstring credit removed: a leg-press trial assessing all seventeen
+  // lower-limb muscles reports quadriceps, gluteal and adductor growth
+  // (Kinoshita 2026 PMID 41630124). Only that reported result is relied on
+  // here; the trial's full per-muscle findings were not read.
+  { name: 'Leg Press', primaryMuscle: 'quads', secondaryMuscles: ['glutes'], notes: '', defaultRestSeconds: 180, isCustom: false, hiddenFromLibrary: false },
   { name: 'Hack Squat (Machine)', primaryMuscle: 'quads', secondaryMuscles: ['glutes'], notes: '', defaultRestSeconds: 180, isCustom: false, hiddenFromLibrary: false },
   { name: 'Bulgarian Split Squat', primaryMuscle: 'quads', secondaryMuscles: ['glutes'], notes: '', defaultRestSeconds: 120, isCustom: false, hiddenFromLibrary: false },
   { name: 'Walking Lunge', primaryMuscle: 'quads', secondaryMuscles: ['glutes', 'hamstrings'], notes: '', defaultRestSeconds: 120, isCustom: false, hiddenFromLibrary: false },
@@ -76,7 +93,9 @@ export const SEED_EXERCISES: Omit<Exercise, 'id' | 'createdAt'>[] = [
   { name: 'Good Morning', primaryMuscle: 'hamstrings', secondaryMuscles: ['glutes', 'back'], notes: '', defaultRestSeconds: 150, isCustom: false, hiddenFromLibrary: false },
 
   // ----- Glutes -----
-  { name: 'Hip Thrust (Barbell)', primaryMuscle: 'glutes', secondaryMuscles: ['hamstrings'], notes: '', defaultRestSeconds: 150, isCustom: false, hiddenFromLibrary: false },
+  // Hamstring credit removed: the same 9-week trial found little or no
+  // hamstring growth from hip thrusts as well as squats (Plotkin 2023).
+  { name: 'Hip Thrust (Barbell)', primaryMuscle: 'glutes', secondaryMuscles: [], notes: '', defaultRestSeconds: 150, isCustom: false, hiddenFromLibrary: false },
   { name: 'Cable Glute Kickback', primaryMuscle: 'glutes', secondaryMuscles: [], notes: '', defaultRestSeconds: 75, isCustom: false, hiddenFromLibrary: false },
   { name: 'Sumo Deadlift', primaryMuscle: 'glutes', secondaryMuscles: ['hamstrings', 'back'], notes: '', defaultRestSeconds: 210, isCustom: false, hiddenFromLibrary: false },
 

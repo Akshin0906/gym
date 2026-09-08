@@ -134,8 +134,8 @@ run_installed_runner() {
     WORKOUT_ENV_FILE="$RUNTIME_ROOT/credentials.env" \
     WORKOUT_OURA_ROOT="$OURA_LIVE" \
     WORKOUT_CODEX_HOME="$CODEX_HOME_TARGET" \
-    WORKOUT_CODEX_MODEL="${WORKOUT_CODEX_MODEL:-gpt-5.6-sol}" \
-    WORKOUT_CODEX_REASONING_EFFORT="${WORKOUT_CODEX_REASONING_EFFORT:-xhigh}" \
+    WORKOUT_CODEX_MODEL="${WORKOUT_CODEX_MODEL:-gpt-6-astra}" \
+    WORKOUT_CODEX_REASONING_EFFORT="${WORKOUT_CODEX_REASONING_EFFORT:-high}" \
     "$RUNTIME_ROOT/current/run_codex_daily_briefing.sh" "$@"
 }
 
@@ -494,6 +494,7 @@ BRIEFING_MODULES=(
   constants.py
   primitives.py
   models.py
+  safety.py
   textutil.py
   measurement.py
   recovery.py
@@ -508,6 +509,11 @@ BRIEFING_MODULES=(
 # proves the staged tree is self-contained: a module forgotten above fails here
 # rather than at 05:00 tomorrow, and the aligned one-rep-max behaviour is
 # checked against the release copy, not the working tree.
+# Pinned here as well as in briefing/constants.py so a release whose guide file
+# and code disagree about the version fails the install rather than shipping a
+# prompt that claims guidance it does not carry.
+EVIDENCE_GUIDE_VERSION="2026-09-08-shared-evidence-guide-v1"
+
 RELEASE_IMPORT_CHECK='
 import daily_briefing_runner as runner
 assert runner.RUNNER_VERSION, "runner reported no version"
@@ -517,6 +523,9 @@ assert callable(runner.publish_spool)
 assert callable(runner.validate_model_output)
 assert callable(runner.validate_spool)
 assert callable(runner.build_model_input_bundle)
+assert runner.EVIDENCE_GUIDE_VERSION in runner.read_evidence_guide(
+    __import__("pathlib").Path("evidence_guide.md")
+), "staged evidence guide is not loadable"
 print(runner.RUNNER_VERSION)
 '
 
@@ -526,6 +535,10 @@ stage_release() {
   install -m 700 "$SCRIPT_DIR/run_codex_daily_briefing.sh" "$target/"
   install -m 600 "$SCRIPT_DIR/daily_briefing_runner.py" "$target/"
   install -m 600 "$SCRIPT_DIR/codex_daily_briefing_prompt.md" "$target/"
+  # The shared, versioned evidence guide. Both runtime surfaces ship the same
+  # file; a release without it cannot build a prompt and fails here, not at
+  # 05:00 tomorrow.
+  install -m 600 "$SCRIPT_DIR/evidence_guide.md" "$target/"
   install -m 600 "$SCRIPT_DIR/codex_daily_briefing_output_schema.json" "$target/"
   install -m 600 "$SCRIPT_DIR/shared_fixtures/calculations.json" "$target/shared_fixtures/"
   local module
@@ -542,6 +555,14 @@ stage_release() {
     run_tracked "$PYTHON" -m py_compile "$target/briefing/$module"
   done
   run_tracked "$PYTHON" -m json.tool "$target/codex_daily_briefing_output_schema.json" >/dev/null
+  if ! /usr/bin/grep -q "$EVIDENCE_GUIDE_VERSION" "$target/evidence_guide.md"; then
+    echo "Staged evidence guide does not declare $EVIDENCE_GUIDE_VERSION." >&2
+    return 1
+  fi
+  if ! /usr/bin/grep -q "read_evidence_guide" "$target/daily_briefing_runner.py"; then
+    echo "Daily runner does not load the shared evidence guide." >&2
+    return 1
+  fi
   run_tracked "$PYTHON" -m json.tool "$target/shared_fixtures/calculations.json" >/dev/null
   if ! /usr/bin/grep -q 'WORKOUT_CODEX_HOME' "$target/daily_briefing_runner.py"; then
     echo "Daily runner does not implement the required WORKOUT_CODEX_HOME contract." >&2

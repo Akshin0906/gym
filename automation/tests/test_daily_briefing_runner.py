@@ -269,9 +269,9 @@ def summary_item(
 
 
 class EnvTests(unittest.TestCase):
-    def test_daily_briefing_model_defaults_to_sol_and_allows_override(self) -> None:
+    def test_daily_briefing_model_defaults_to_astra_and_allows_override(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(runner.Config.from_env().codex_model, "gpt-5.6-sol")
+            self.assertEqual(runner.Config.from_env().codex_model, "gpt-6-astra")
         with mock.patch.dict(
             os.environ, {"WORKOUT_CODEX_MODEL": "fixture-model"}, clear=True
         ):
@@ -461,7 +461,7 @@ class EnvTests(unittest.TestCase):
             self.assertIn("--ignore-user-config", command)
             self.assertIn("--ignore-rules", command)
             model_index = command.index("--model")
-            self.assertEqual(command[model_index + 1], "gpt-5.6-sol")
+            self.assertEqual(command[model_index + 1], "gpt-6-astra")
             configs = [
                 command[index + 1]
                 for index, value in enumerate(command[:-1])
@@ -682,7 +682,7 @@ class CodexEventAuditTests(unittest.TestCase):
                     "item": {
                         **diagnostic_item,
                         "message": (
-                            "Model metadata for `gpt-5.6-sol` not found. Defaulting "
+                            "Model metadata for `gpt-6-astra` not found. Defaulting "
                             "to fallback metadata; this can degrade performance and "
                             "cause issues."
                         ),
@@ -3637,7 +3637,11 @@ class ModelInputBundleTests(unittest.TestCase):
         )
 
 
-class OutputValidationTests(unittest.TestCase):
+# Fixture construction shared with test_coaching_science.py. Split out as a
+# base class with no tests of its own so the science regressions can build the
+# same snapshots and bundles without duplicating the harness or re-running this
+# module's assertions.
+class BriefingHarness(unittest.TestCase):
     def setUp(self) -> None:
         now = dt.datetime(2026, 8, 1, 12, 0, tzinfo=PACIFIC)
         self.updated_at = int(now.timestamp() * 1000)
@@ -3743,7 +3747,7 @@ class OutputValidationTests(unittest.TestCase):
             run_id="test-run",
             prompt_hash="abc123",
             model=runner.DEFAULT_CODEX_MODEL,
-            reasoning_effort="xhigh",
+            reasoning_effort="high",
             codex_version="codex-cli test",
             generated_at=(
                 generated_at if generated_at is not None else self.updated_at + 1
@@ -3758,6 +3762,9 @@ class OutputValidationTests(unittest.TestCase):
         *,
         include_plan: bool = True,
         today_target_range: str = "5-8",
+        today_load_convention: str | None = None,
+        structured_today_bounds: dict | None = None,
+        current_context: str = "",
     ) -> tuple[runner.SnapshotFacts, dict, runner.ModelInputBundle]:
         body = snapshot_body(self.updated_at)
         data = body["snapshot"]["payload"]["data"]
@@ -3774,7 +3781,15 @@ class OutputValidationTests(unittest.TestCase):
         ):
             data[table] = []
         data["exercises"] = [
-            {"id": "squat", "name": "Squat"},
+            {
+                "id": "squat",
+                "name": "Squat",
+                **(
+                    {"measurement": {"loadConvention": today_load_convention}}
+                    if today_load_convention is not None
+                    else {}
+                ),
+            },
             {"id": "bench", "name": "Bench"},
         ]
         if include_plan:
@@ -3797,6 +3812,11 @@ class OutputValidationTests(unittest.TestCase):
                     "order": 0,
                     "targetSets": 3,
                     "targetRepRange": today_target_range,
+                    **(
+                        {"repBounds": structured_today_bounds}
+                        if structured_today_bounds is not None
+                        else {}
+                    ),
                 }
             ]
 
@@ -3827,6 +3847,16 @@ class OutputValidationTests(unittest.TestCase):
                         "order": 0,
                         "targetSets": target_sets,
                         "targetRepRange": target_range,
+                        **(
+                            {"repBounds": spec["rep_bounds"]}
+                            if "rep_bounds" in spec
+                            else {}
+                        ),
+                        **(
+                            {"loadConvention": spec["load_convention"]}
+                            if "load_convention" in spec
+                            else {}
+                        ),
                     }
                 ],
             }
@@ -3859,6 +3889,11 @@ class OutputValidationTests(unittest.TestCase):
                         "reps": reps,
                         "rpe": spec.get("set_rpe", 7),
                         "loggedAt": completed_at - 2_000 + set_index,
+                        **(
+                            {"loadConvention": spec["load_convention"]}
+                            if "load_convention" in spec
+                            else {}
+                        ),
                     }
                 )
         data["workoutSessions"] = sessions
@@ -3868,7 +3903,7 @@ class OutputValidationTests(unittest.TestCase):
         memory = {
             "revision": 0,
             "state": {
-                "currentContext": "",
+                "currentContext": current_context,
                 "paused": False,
                 "windowStartedAt": start,
                 "fourMonthStartedAt": start,
@@ -3898,13 +3933,16 @@ class OutputValidationTests(unittest.TestCase):
         output["memory"]["newItems"] = []
         return output
 
+
+class OutputValidationTests(BriefingHarness):
+
     def test_supervisor_constructs_all_briefing_metadata(self) -> None:
         validated = self.validate(model_output(self.updated_at))
         briefing = validated["briefing"]
         self.assertEqual(briefing["source"], "codex-local")
         self.assertEqual(briefing["model"], runner.DEFAULT_CODEX_MODEL)
         self.assertEqual(briefing["snapshotUpdatedAt"], self.updated_at)
-        self.assertEqual(briefing["inputSummary"]["modelReasoningEffort"], "xhigh")
+        self.assertEqual(briefing["inputSummary"]["modelReasoningEffort"], "high")
         self.assertEqual(briefing["inputSummary"]["workoutCount"], 1)
         self.assertEqual(briefing["inputSummary"]["newMemoryItemCount"], 1)
         self.assertEqual(briefing["inputSummary"]["deferredMemoryItemIds"], [])
@@ -4615,7 +4653,7 @@ class OutputValidationTests(unittest.TestCase):
                     )
                 else:
                     with self.assertRaisesRegex(
-                        runner.ConfigError, "stopped-pain or unresolved red-flag"
+                        runner.ConfigError, "rest mode requires stopped-pain evidence"
                     ):
                         self.validate(output, memory=memory, input_bundle=bundle)
 
@@ -4645,7 +4683,7 @@ class OutputValidationTests(unittest.TestCase):
                 self.assertTrue(bundle.push_evidence_groups)
                 self.assertIn(context_id, bundle.rest_evidence_ids)
                 self.assertIn(context_id, bundle.push_blocking_evidence_ids)
-                with self.assertRaisesRegex(runner.ConfigError, "blocked"):
+                with self.assertRaisesRegex(runner.ConfigError, "blocked|invalid; today's call must be rest"):
                     self.validate(
                         self.mode_output(
                             "push", sorted(bundle.push_evidence_groups[0])
@@ -4706,7 +4744,7 @@ class OutputValidationTests(unittest.TestCase):
                     )
                 else:
                     with self.assertRaisesRegex(
-                        runner.ConfigError, "stopped-pain or unresolved red-flag"
+                        runner.ConfigError, "rest mode requires stopped-pain evidence"
                     ):
                         self.validate(
                             output,
@@ -4823,10 +4861,14 @@ class OutputValidationTests(unittest.TestCase):
         )
         self.assertTrue(canonical.push_evidence_groups)
 
+        # Reps ABOVE the upper bound are more work at the same load, not a
+        # measurement failure: an exposure that beat its target keeps its own
+        # progression evidence. Only work below the target minimum, or work
+        # that did not complete the planned sets, loses it.
         invalid_specs = (
             {"target_sets": 0},
             {"set_count": 2},
-            {"reps_values": [5, 9, 5]},
+            {"reps_values": [5, 4, 5]},
             {"target_range": "around five"},
             {"target_range": "10-12"},
         )
@@ -4866,7 +4908,7 @@ class OutputValidationTests(unittest.TestCase):
                 facts, memory, bundle = self.progression_bundle(specs)
                 self.assertTrue(bundle.push_evidence_groups)
                 self.assertTrue(bundle.push_blocking_evidence_ids)
-                with self.assertRaisesRegex(runner.ConfigError, "blocked"):
+                with self.assertRaisesRegex(runner.ConfigError, "blocked|invalid; today's call must be rest"):
                     self.validate(
                         self.mode_output(
                             "push", sorted(bundle.push_evidence_groups[0])
@@ -4892,7 +4934,7 @@ class OutputValidationTests(unittest.TestCase):
                     ]
                 )
                 self.assertTrue(bundle.push_blocking_evidence_ids)
-                with self.assertRaisesRegex(runner.ConfigError, "blocked"):
+                with self.assertRaisesRegex(runner.ConfigError, "blocked|invalid; today's call must be rest"):
                     self.validate(
                         self.mode_output(
                             "push", sorted(bundle.push_evidence_groups[0])
@@ -5126,7 +5168,7 @@ class OutputValidationTests(unittest.TestCase):
         self.assertNotIn(safety_id, stale.light_adverse_evidence_ids)
         self.assertFalse(stale.push_blocking_evidence_ids)
         for mode, error in (
-            ("rest", "stopped-pain or unresolved red-flag"),
+            ("rest", "rest mode requires stopped-pain evidence"),
             ("light", "actual adverse non-wearable evidence"),
         ):
             with self.subTest(mode=mode), self.assertRaisesRegex(
@@ -6097,7 +6139,7 @@ class OutputValidationTests(unittest.TestCase):
             memory_revision=0,
             prompt_hash="abc123",
             model=runner.DEFAULT_CODEX_MODEL,
-            reasoning_effort="xhigh",
+            reasoning_effort="high",
         )
         with self.assertRaises(runner.ConfigError):
             runner.validate_spool(
@@ -6107,7 +6149,7 @@ class OutputValidationTests(unittest.TestCase):
                 memory_revision=0,
                 prompt_hash="abc123",
                 model=runner.DEFAULT_CODEX_MODEL,
-                reasoning_effort="xhigh",
+                reasoning_effort="high",
             )
 
     def test_spool_rejects_a_different_reasoning_effort(self) -> None:
@@ -6145,7 +6187,7 @@ class OutputValidationTests(unittest.TestCase):
                         memory_revision=0,
                         prompt_hash="abc123",
                         model=runner.DEFAULT_CODEX_MODEL,
-                        reasoning_effort="xhigh",
+                        reasoning_effort="high",
                     )
 
     def test_spool_recovery_diagnostics_match_the_briefing(self) -> None:
@@ -6166,7 +6208,7 @@ class OutputValidationTests(unittest.TestCase):
                         memory_revision=0,
                         prompt_hash="abc123",
                         model=runner.DEFAULT_CODEX_MODEL,
-                        reasoning_effort="xhigh",
+                        reasoning_effort="high",
                     )
 
         validated = self.validate(model_output(self.updated_at))
@@ -6179,7 +6221,7 @@ class OutputValidationTests(unittest.TestCase):
                 memory_revision=0,
                 prompt_hash="abc123",
                 model=runner.DEFAULT_CODEX_MODEL,
-                reasoning_effort="xhigh",
+                reasoning_effort="high",
             )
 
         validated = self.validate(model_output(self.updated_at))
@@ -6192,7 +6234,7 @@ class OutputValidationTests(unittest.TestCase):
                 memory_revision=0,
                 prompt_hash="abc123",
                 model=runner.DEFAULT_CODEX_MODEL,
-                reasoning_effort="xhigh",
+                reasoning_effort="high",
             )
 
     def test_spool_recovery_fingerprint_is_trusted_and_current(self) -> None:
@@ -6205,7 +6247,7 @@ class OutputValidationTests(unittest.TestCase):
             memory_revision=0,
             prompt_hash="abc123",
             model=runner.DEFAULT_CODEX_MODEL,
-            reasoning_effort="xhigh",
+            reasoning_effort="high",
             recovery_fingerprint=current_fingerprint,
         )
 
@@ -6217,7 +6259,7 @@ class OutputValidationTests(unittest.TestCase):
                 memory_revision=0,
                 prompt_hash="abc123",
                 model=runner.DEFAULT_CODEX_MODEL,
-                reasoning_effort="xhigh",
+                reasoning_effort="high",
                 recovery_fingerprint=(
                     f"{runner.RECOVERY_FINGERPRINT_VERSION}:" + "0" * 64
                 ),
@@ -6237,7 +6279,7 @@ class OutputValidationTests(unittest.TestCase):
                 memory_revision=0,
                 prompt_hash="abc123",
                 model=runner.DEFAULT_CODEX_MODEL,
-                reasoning_effort="xhigh",
+                reasoning_effort="high",
             )
 
     def test_rest_requires_explicit_retained_safety_evidence(self) -> None:

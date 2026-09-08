@@ -200,6 +200,28 @@ export interface Recommendation {
   model: string
 }
 
+// Why the mode is what it is, decided by the trusted supervisor rather than by
+// the model. `rest` covers a medical stop, a deliberate day off, and a
+// precautionary stop on an unclassified current report, and the app should not
+// have to guess which. Optional: briefings published before this existed have
+// no value and stay valid.
+export type BriefingModeReason =
+  | 'medical_stop'
+  | 'planned_rest'
+  | 'precautionary_stop'
+  | 'planned_deload'
+  | 'reactive_deload'
+  | 'temporary_training_adjustment'
+
+export const BRIEFING_MODE_REASONS: readonly BriefingModeReason[] = [
+  'medical_stop',
+  'planned_rest',
+  'precautionary_stop',
+  'planned_deload',
+  'reactive_deload',
+  'temporary_training_adjustment',
+]
+
 export interface DailyBriefingSections {
   todaysCall: string
   why: string[]
@@ -207,6 +229,7 @@ export interface DailyBriefingSections {
   ouraRecovery: string
   trainingTrend: string
   watchOuts: string[]
+  modeReasonLabel?: BriefingModeReason
 }
 
 export interface DailyBriefing {

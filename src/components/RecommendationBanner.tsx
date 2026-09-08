@@ -20,6 +20,7 @@ import {
   subscribeLocalSyncState,
 } from '../db/repositories/syncState'
 import type {
+  BriefingModeReason,
   DailyBriefing,
   DailyBriefingSections,
   RecommendationMode,
@@ -53,6 +54,19 @@ const MODE_LABEL: Record<RecommendationMode, string> = {
   light: 'Light',
   deload: 'Deload',
   rest: 'Rest',
+}
+
+// `Rest` alone is ambiguous: a deliberate day off, a stop on a medical report,
+// and a precautionary stop on something unclassified are different situations
+// and should not read the same. The supervisor decides which; the app only
+// renders it. Absent on briefings published before the field existed.
+const MODE_REASON_LABEL: Record<BriefingModeReason, string> = {
+  medical_stop: 'Reported symptom',
+  planned_rest: 'Planned rest day',
+  precautionary_stop: 'Precaution',
+  planned_deload: 'Planned deload',
+  reactive_deload: 'In response to recent sessions',
+  temporary_training_adjustment: 'Today only',
 }
 
 // The system prompt forbids markdown, but the model occasionally leaks
@@ -196,6 +210,11 @@ export function RecommendationBanner() {
               />
               {MODE_LABEL[latest.mode]}
             </span>
+            {latest.sections.modeReasonLabel && (
+              <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--color-fg-faint)]">
+                {MODE_REASON_LABEL[latest.sections.modeReasonLabel]}
+              </span>
+            )}
             {freshness?.recovery.label && (
               <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--color-fg-faint)]">
                 {freshness.recovery.label}

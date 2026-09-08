@@ -298,6 +298,19 @@ export function loadConventionsComparable(
   return totals.has(a) && totals.has(b)
 }
 
+// Stricter than `loadConventionsComparable`, for any claim that performance
+// went UP or DOWN. Reading a legacy row as total pounds is the right
+// descriptive default, but it is not a safe basis for a progression line: an
+// unrecorded 20 may well have been 20 per dumbbell, and pairing it with an
+// explicit 40 lb total draws a doubling that never happened. Mirrors
+// load_conventions_comparable_for_progression in the Python supervisor.
+export function loadConventionsComparableForProgression(
+  a: LoadConvention,
+  b: LoadConvention,
+): boolean {
+  return a === b
+}
+
 export const LOAD_CONVENTION_LABELS: Record<LoadConvention, string> = {
   unknown: 'Not recorded (read as total pounds)',
   total: 'Total weight lifted',

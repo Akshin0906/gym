@@ -40,12 +40,13 @@ import {
   type CoachRemoteRequestTicket,
 } from '../lib/coachConversationLifecycle'
 import { buildLiveCoachContext, type CoachLiveContext } from '../lib/chatContext'
-import type {
-  CoachActionResult,
-  CoachConversationState,
-  CoachMessage,
-  CoachProposal,
-  CoachReasoningEffort,
+import {
+  COACH_REASONING_EFFORT_LABELS,
+  type CoachActionResult,
+  type CoachConversationState,
+  type CoachMessage,
+  type CoachProposal,
+  type CoachRequestReasoningEffort,
 } from '../lib/chatTypes'
 import { uploadCloudSnapshot } from '../lib/cloud'
 import { useActiveWorkout } from '../store/activeWorkout'
@@ -100,9 +101,10 @@ function MessageBubble({ message }: { message: CoachMessage }) {
         {!user && (
           <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-[var(--color-accent)]">
             <Bot size={13} /> Coach
-            {message.reasoningEffort === 'xhigh' && (
+            {message.reasoningEffort !== null && (
               <span className="inline-flex items-center gap-1 normal-case tracking-normal font-medium text-[var(--color-fg-faint)]">
-                <Sparkles size={11} /> Deep Think
+                <Sparkles size={11} />{' '}
+                {COACH_REASONING_EFFORT_LABELS[message.reasoningEffort]}
               </span>
             )}
           </div>
@@ -468,7 +470,7 @@ export function CoachScreen() {
   const pendingJob = remote?.pendingJobs[0] ?? null
   const waitingForMac = Boolean(pendingJob && remote?.bridge?.online !== true)
 
-  async function send(text: string, reasoningEffort: CoachReasoningEffort) {
+  async function send(text: string, reasoningEffort: CoachRequestReasoningEffort) {
     if (loading || sendingRef.current || clearingRef.current) return
     sendingRef.current = true
     shouldAutoScroll.current = true

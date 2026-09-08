@@ -9,6 +9,7 @@ from .errors import ConfigError
 from .constants import (
     BRIEFING_EVIDENCE_PACKET_VERSION,
     COMPARABLE_EXPOSURE_LIMIT,
+    CONSERVATIVE_STOP_POLICY,
     CURRENT_CONTEXT_EXCERPT_MAX_CHARS,
     CURRENT_PROGRAMMED_SESSION_MAX_BYTES,
     DELOAD_MIN_TOTAL_DECLINE_FRACTION,
@@ -34,6 +35,7 @@ from .constants import (
     RECENT_SESSION_EPISODE_LIMIT,
     REST_RED_FLAG_RE,
     SAFETY_CONTEXT_RE,
+    SAFETY_SCREEN_POLICY,
     SESSION_EPISODE_MAX_BYTES,
     SUMMARY_BULLET_EXCERPT_MAX_CHARS,
 )
@@ -48,6 +50,7 @@ from .models import (
     ModelInputBundle,
     SnapshotFacts,
 )
+from .safety import classify_safety_text
 from .textutil import (
     bounded_source_id,
     canonical_string_list_sha256,
@@ -65,8 +68,15 @@ from .textutil import (
     text_excerpt,
 )
 from .measurement import (
+    common_load_convention,
     load_convention,
+    load_conventions_comparable,
+    load_conventions_comparable_for_progression,
+    load_semantics,
     one_rep_max_eligible_set_count,
+    one_rep_max_estimate_context,
+    ordinal_progress_marker,
+    working_sets,
     valid_rep_bounds,
     plan_rep_bounds,
     rep_bounds_source,
@@ -725,6 +735,23 @@ def enforce_current_plan_budget(packet: dict[str, Any]) -> dict[str, Any]:
         )
     return packet
 
+def exercise_load_convention(
+    exercises: dict[str, dict[str, Any]], exercise_id: str
+) -> str:
+    """The convention today's setup would freeze for this exercise.
+
+    Mirrors exerciseLoadConvention in src/lib/measurement.ts: it describes the
+    exercise as configured NOW and is only ever used for a plan row, never to
+    re-read a historical set.
+    """
+    raw = exercises.get(exercise_id)
+    measurement = raw.get("measurement") if isinstance(raw, dict) else None
+    value = (
+        measurement.get("loadConvention") if isinstance(measurement, dict) else None
+    )
+    return load_convention(value)
+
+
 def build_current_programmed_session(
     facts: SnapshotFacts,
     exercises: dict[str, dict[str, Any]],
@@ -822,6 +849,11 @@ def build_current_programmed_session(
                     "name": session_name,
                     "exercises": planned_exercises,
                     "exerciseCompaction": plan_compaction,
+                },
+                "scheduling": {
+                    "scheduledForToday": True,
+                    "basis": "workout_started_today_and_not_finished",
+                    "meaning": "the user actually began this session today",
                 },
                 "rotation": {
                     "semantics": "today_screen_resumable_v1",
@@ -943,6 +975,26 @@ def build_current_programmed_session(
                 ),
                 "targetRepRange": target_range,
                 "targetRepRangeTruncation": target_range_truncation,
+                # Structured bounds, carried verbatim including an explicit
+                # null, so today's target is compared the way the app resolves
+                # it rather than by re-parsing the display text.
+                **(
+                    {
+                        "repBounds": row["repBounds"],
+                        "targetRepRangeSource": rep_bounds_source(row),
+                    }
+                    if "repBounds" in row
+                    and (row["repBounds"] is None or valid_rep_bounds(row["repBounds"]))
+                    else {}
+                ),
+                # How today's setup will record load. A comparison against a
+                # past exposure recorded under a different convention is not a
+                # comparison, so the reader needs today's unit too.
+                **(
+                    {"loadConvention": exercise_load_convention(exercises, exercise_id)}
+                    if exercise_load_convention(exercises, exercise_id) != "unknown"
+                    else {}
+                ),
             }
         )
     planned_exercises, plan_compaction = compact_rows_by_id(
@@ -982,6 +1034,14 @@ def build_current_programmed_session(
             "order": template.get("order"),
             "exercises": planned_exercises,
             "exerciseCompaction": plan_compaction,
+        },
+        # The rotation names what comes NEXT in the program. Nothing in the
+        # data says it is scheduled for today: there is no calendar, and the
+        # user may be resting, travelling, or training something else.
+        "scheduling": {
+            "scheduledForToday": False,
+            "basis": "next_in_program_rotation_not_calendar_scheduled",
+            "meaning": "the session that would follow the last completed one",
         },
         "rotation": {
             "semantics": "today_screen_v1",
@@ -1068,6 +1128,105 @@ def compact_feedback_for_comparator(
         },
     }
 
+def _movement_load_comparability(
+    exposures: list[dict[str, Any]], today_recorded: bool
+) -> dict[str, Any]:
+    """Whether this movement's retained exposures measure the same thing.
+
+    Reported at the movement level so the model can see, in one field, that a
+    rising number is a change of units rather than a change of strength.
+    """
+    conventions = [
+        exposure["loadMeasurement"]["convention"]
+        for exposure in exposures
+        if isinstance(exposure.get("loadMeasurement"), dict)
+    ]
+    known = [item for item in conventions if item is not None]
+    mixed_within = any(item is None for item in conventions)
+    consistent = all(
+        load_conventions_comparable(known[0], item) for item in known[1:]
+    ) if known else True
+    differs_from_today = any(
+        exposure["loadMeasurement"].get("comparableWithTodaysSetup") is False
+        for exposure in exposures
+        if isinstance(exposure.get("loadMeasurement"), dict)
+    )
+    if mixed_within:
+        status = "mixed_within_an_exposure"
+    elif not consistent:
+        status = "differs_across_exposures"
+    elif differs_from_today:
+        status = "differs_from_todays_setup"
+    elif not known:
+        status = "no_retained_exposures"
+    elif not today_recorded:
+        status = "consistent_across_exposures_today_unrecorded"
+    else:
+        status = "consistent"
+    return {
+        "status": status,
+        "retainedExposureConventions": sorted(
+            {item for item in known}
+        ),
+        "unrecordedLegacyExposureCount": sum(
+            1 for item in known if item == "unknown"
+        ),
+        "policy": "never_inferred_across_conventions_v1",
+    }
+
+
+def _progress_comparison(
+    load_measurement: dict[str, Any],
+    marker: dict[str, Any],
+    ordinal_marker: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """The single basis on which this exposure may be compared with another.
+
+    `estimated_one_rep_max` is a continuous estimate and only valid where the
+    recorded number is an external load. `same_setting_reps` is ordinal: it is
+    only meaningful against an exposure whose `loadValue` is identical.
+    Anything else is `not_comparable`, which is an honest answer, not a defect.
+    """
+    if load_measurement["mixedWithinExposure"]:
+        return {
+            "basis": "not_comparable",
+            "reason": "mixed_load_conventions_within_exposure",
+        }
+    if load_measurement["comparableWithTodaysSetup"] is False:
+        return {
+            "basis": "not_comparable",
+            "reason": "load_convention_differs_from_todays_setup",
+            "loadConvention": load_measurement["convention"],
+        }
+    if load_measurement["progressionComparableWithTodaysSetup"] is False:
+        return {
+            "basis": "not_comparable",
+            "reason": "unrecorded_legacy_load_versus_recorded_setup",
+            "loadConvention": load_measurement["convention"],
+            "descriptiveReadingOnly": "legacy_number_assumed_total_pounds",
+        }
+    if load_measurement["supportsOneRepMax"] and finite_number(marker.get("value")):
+        return {
+            "basis": "estimated_one_rep_max",
+            "loadConvention": load_measurement["convention"],
+            "conventionRecorded": load_measurement["recorded"],
+            "value": marker["value"],
+            "higherIsBetter": True,
+        }
+    if ordinal_marker is not None:
+        return {
+            "basis": "same_setting_reps",
+            "loadConvention": load_measurement["convention"],
+            "conventionRecorded": load_measurement["recorded"],
+            "loadValue": ordinal_marker["loadValue"],
+            "repsAtLoadValue": ordinal_marker["repsAtLoadValue"],
+            "direction": ordinal_marker["direction"],
+            "higherIsBetter": True,
+            "comparability": ordinal_marker["comparability"],
+        }
+    return {"basis": "not_comparable", "reason": "no_usable_progress_reading"}
+
+
 def build_comparable_exposures(
     facts: SnapshotFacts,
     current_plan: dict[str, Any],
@@ -1093,7 +1252,20 @@ def build_comparable_exposures(
     result: list[dict[str, Any]] = []
     for movement in planned:
         exercise_id = movement["exerciseId"]
-        wanted_range = parsed_target_rep_range(movement.get("targetRepRange"))
+        # Structured bounds win over the display string, and an explicit
+        # `repBounds: null` means "deliberately no machine-readable target".
+        # Comparing the prose alone made two plans whose text both read "5-8"
+        # look identical when one had frozen 10-12 structured bounds.
+        wanted_range = plan_rep_bounds(movement)
+        # How today's session will record this movement's load. A plan row that
+        # froze a convention wins; otherwise the exercise's current setup is the
+        # best available statement of today's unit.
+        today_convention = load_convention(
+            movement.get("loadConvention")
+        )
+        if today_convention == "unknown":
+            today_convention = exercise_load_convention(exercises, exercise_id)
+        today_convention_recorded = today_convention != "unknown"
         exact_exposures: list[dict[str, Any]] = []
         noncomparable_exposures: list[dict[str, Any]] = []
         available_exact_count = 0
@@ -1109,11 +1281,11 @@ def build_comparable_exposures(
                 continue
             available_same_exercise_count += 1
             historical_plan = plans_by_session[session_id].get(exercise_id)
-            historical_target = (
-                historical_plan.get("targetRepRange") if historical_plan else None
-            )
+            historical_range = plan_rep_bounds(historical_plan)
+            # Full plan rows, not display strings: `target_range_comparability`
+            # resolves structured bounds exactly the way the app does.
             comparability = target_range_comparability(
-                movement.get("targetRepRange"), historical_target
+                movement, historical_plan
             )
             exact = comparability == "same_exercise_same_target_rep_range"
             if exact:
@@ -1128,12 +1300,82 @@ def build_comparable_exposures(
             )
             source_story_id = evidence_id("story", session_id)
             retained_sets, set_compaction = compact_logged_sets(rows)
+            # What this exposure's numbers MEAN. Two exposures of the same
+            # exercise in the same rep range are not comparable when one
+            # recorded 20 lb per dumbbell and the other 40 lb total: that reads
+            # as doubled strength and is the same work.
+            exposure_convention = common_load_convention(working_sets(rows))
+            semantics = (
+                load_semantics(exposure_convention)
+                if exposure_convention is not None
+                else None
+            )
+            comparable_with_today = (
+                None
+                if exposure_convention is None or not today_convention_recorded
+                else load_conventions_comparable(
+                    exposure_convention, today_convention
+                )
+            )
+            # Descriptive comparability reads a legacy row as total pounds.
+            # Progression comparability does not: an unrecorded old number and
+            # an explicitly recorded new one are not the same measurement, and
+            # "it probably meant total" is not a basis for adding load.
+            progression_comparable_with_today = (
+                None
+                if exposure_convention is None or not today_convention_recorded
+                else load_conventions_comparable_for_progression(
+                    exposure_convention, today_convention
+                )
+            )
+            load_measurement = {
+                "convention": exposure_convention,
+                "recorded": bool(semantics and semantics["recorded"]),
+                "mixedWithinExposure": exposure_convention is None,
+                "supportsOneRepMax": bool(
+                    semantics and semantics["supportsOneRepMax"]
+                ),
+                "supportsTonnage": bool(semantics and semantics["supportsTonnage"]),
+                "higherIsHarder": (
+                    semantics["higherIsHarder"] if semantics is not None else None
+                ),
+                "todaysConvention": (
+                    today_convention if today_convention_recorded else None
+                ),
+                "comparableWithTodaysSetup": comparable_with_today,
+                "progressionComparableWithTodaysSetup": (
+                    progression_comparable_with_today
+                ),
+                # There is no conversion factor between conventions: the number
+                # of dumbbells, the machine's leverage, and the user's
+                # bodyweight are all absent from the data.
+                "conversionPolicy": "never_inferred_across_conventions_v1",
+            }
             marker = {
                 "metric": "top_epley_estimated_one_rep_max_lbs",
                 "value": top_estimated_one_rep_max(rows),
                 "eligibleSetCount": one_rep_max_eligible_set_count(rows),
+                "estimateContext": one_rep_max_estimate_context(rows),
             }
-            completion = comparator_completion(historical_plan, rows)
+            ordinal_marker = (
+                ordinal_progress_marker(rows)
+                if not load_measurement["supportsOneRepMax"]
+                else None
+            )
+            if ordinal_marker is not None:
+                # Machine settings, added bodyweight, and assistance have no
+                # valid external-load estimate. They are still ordered, so the
+                # honest comparison is reps at an identical recorded setting
+                # rather than exclusion from every progress statement.
+                marker["ordinalAlternative"] = ordinal_marker
+            progress_comparison = _progress_comparison(
+                load_measurement, marker, ordinal_marker
+            )
+            completion = comparator_completion(
+                historical_plan,
+                rows,
+                unfinished_work=valid_unfinished_work(session),
+            )
             if not exact:
                 completion["eligibleForProgressionTrend"] = False
                 completion["ineligibilityReasons"] = [
@@ -1173,13 +1415,14 @@ def build_comparable_exposures(
                         if isinstance(value, dict)
                     },
                     "performanceMarker": marker,
+                    "loadMeasurement": load_measurement,
+                    "progressComparison": progress_comparison,
                     "programCompletion": completion,
                     "sourceSetCompaction": set_compaction,
                     "comparability": comparability,
                     "canonicalHistoricalTargetRepRange": (
-                        f"{parsed_target_rep_range(historical_target)[0]}-"
-                        f"{parsed_target_rep_range(historical_target)[1]}"
-                        if parsed_target_rep_range(historical_target) is not None
+                        f"{historical_range[0]}-{historical_range[1]}"
+                        if historical_range is not None
                         else None
                     ),
                 }
@@ -1211,13 +1454,14 @@ def build_comparable_exposures(
                     "loggedSets": retained_sets,
                     "sourceSetCompaction": set_compaction,
                     "performanceMarker": marker,
+                    "loadMeasurement": load_measurement,
+                    "progressComparison": progress_comparison,
                     "programCompletion": completion,
                     **feedback,
                     "comparability": comparability,
                     "canonicalHistoricalTargetRepRange": (
-                        f"{parsed_target_rep_range(historical_target)[0]}-"
-                        f"{parsed_target_rep_range(historical_target)[1]}"
-                        if parsed_target_rep_range(historical_target) is not None
+                        f"{historical_range[0]}-{historical_range[1]}"
+                        if historical_range is not None
                         else None
                     ),
                 }
@@ -1252,6 +1496,22 @@ def build_comparable_exposures(
                 "sourceIds": [exercise_id],
                 "exerciseId": exercise_id,
                 **exercise_display(exercises, exercise_id),
+                "todayLoadMeasurement": {
+                    "convention": (
+                        today_convention if today_convention_recorded else None
+                    ),
+                    "recorded": today_convention_recorded,
+                    "source": (
+                        "frozen_session_plan"
+                        if load_convention(movement.get("loadConvention")) != "unknown"
+                        else "current_exercise_setup"
+                        if today_convention_recorded
+                        else "not_recorded"
+                    ),
+                },
+                "exposureLoadConventionComparability": (
+                    _movement_load_comparability(exposures, today_convention_recorded)
+                ),
                 "todayTarget": {
                     "targetSets": movement.get("targetSets"),
                     "targetRepRange": movement.get("targetRepRange"),
@@ -1514,8 +1774,39 @@ def build_older_periodic_summaries(
     ]
     return retained, len(candidates)
 
+def safety_classification_projection(
+    classification: dict[str, Any],
+) -> dict[str, Any]:
+    """The bounded, model-visible form of one text screen.
+
+    Only what the model needs to reason and cite: what tier fired, what
+    proportionate action that tier justifies, which words matched, and an
+    explicit statement that this is a keyword screen. Never a condition name.
+    """
+    return {
+        "kind": classification["kind"],
+        "guidance": classification["guidance"],
+        "matchedTerms": classification["terms"],
+        "accompanyingSymptomDomains": classification["combinationTerms"],
+        "thirdPartyAttributedMatchCount": classification[
+            "thirdPartyOnlyMatchCount"
+        ],
+        "genericMentionMatchCount": classification[
+            "genericMentionOnlyMatchCount"
+        ],
+        "plannedPause": classification["plannedPause"],
+        # Provenance and currentness, which the supervisor CAN determine, kept
+        # separate from medical meaning, which it cannot.
+        "currentSelfReport": classification["currentSelfReport"],
+        "screenPolicy": classification["screenPolicy"],
+    }
+
+
 def build_user_context(
-    facts: SnapshotFacts, plan: MemoryCandidatePlan
+    facts: SnapshotFacts,
+    plan: MemoryCandidatePlan,
+    *,
+    today: str | None = None,
 ) -> dict[str, Any]:
     if plan.trusted_state["paused"]:
         return {
@@ -1540,7 +1831,8 @@ def build_user_context(
         content_observed_at = updated_at
         full_body = require_string(raw.get("body"), f"AI note {note_id}.body")
         safety_match = SAFETY_CONTEXT_RE.search(full_body) is not None
-        unresolved_red_flag = has_unresolved_red_flag(full_body)
+        classification = classify_safety_text(full_body)
+        unresolved_red_flag = classification["unresolvedRedFlag"]
         body, body_truncation = text_excerpt(
             full_body,
             NOTE_EXCERPT_MAX_CHARS,
@@ -1568,6 +1860,15 @@ def build_user_context(
                 "bodyTruncation": body_truncation,
                 "retrievalSafetyMatch": safety_match,
                 "unresolvedRedFlag": unresolved_red_flag,
+                "safetyClassification": safety_classification_projection(
+                    classification
+                ),
+                # A note written today describes today. An older note is
+                # history, and history cannot stop a session on its own.
+                "currentSelfReport": (
+                    today is not None
+                    and pacific_date_for_epoch(content_observed_at) == today
+                ),
             }
         )
     notes.sort(key=lambda item: (item["observedAt"], item["sourceNoteId"]), reverse=True)
@@ -1586,8 +1887,9 @@ def build_user_context(
     context_truncation = None
     context_has_red_flag = False
     context_has_safety_match = False
+    context_classification = classify_safety_text(context_text)
     if context_text is not None:
-        context_has_red_flag = has_unresolved_red_flag(context_text)
+        context_has_red_flag = context_classification["unresolvedRedFlag"]
         context_has_safety_match = SAFETY_CONTEXT_RE.search(context_text) is not None
         context_excerpt, context_truncation = text_excerpt(
             context_text,
@@ -1620,6 +1922,13 @@ def build_user_context(
             "bodyTruncation": context_truncation,
             "retrievalSafetyMatch": context_has_safety_match,
             "unresolvedRedFlag": context_has_red_flag,
+            "safetyClassification": safety_classification_projection(
+                context_classification
+            ),
+            # The persisted current context is the user's standing description
+            # of right now. It is always citable for a conservative stop, even
+            # when the keyword screen recognized nothing in it.
+            "currentSelfReport": True,
         }
         if context_text is not None
         else None
@@ -2265,6 +2574,19 @@ def build_mode_evidence_contract(
     secondary_adverse_ids: set[str] = set()
     recent_pain_ids: set[str] = set()
     direct_current_adverse_ids: set[str] = set()
+    # Current user-authored reports the model may cite to stop, whether or not
+    # the keyword screen recognized anything in them.
+    conservative_stop_ids: set[str] = set()
+    planned_rest_ids: set[str] = set()
+    planned_deload_ids: set[str] = set()
+    # Atoms that make any training mode invalid for today.
+    mandatory_rest_ids: set[str] = set()
+    # Atoms that stop training because something is physically wrong, tracked
+    # independently of the planned-rest set. One atom can be both — "today is my
+    # planned rest day, and I have new crushing chest pressure" is one sentence
+    # — and subtracting one set from the other would erase the medical fact.
+    medical_rest_ids: set[str] = set()
+    push_blocking_context_ids: set[str] = set()
 
     def classify_domains(domains: dict[str, Any], *, recent: bool) -> None:
         if not recent:
@@ -2298,6 +2620,7 @@ def build_mode_evidence_contract(
                 recent_pain_ids.add(atom_id)
             if pain_impact == "stopped" and atom_id:
                 rest_ids.add(atom_id)
+                medical_rest_ids.add(atom_id)
         if isinstance(internal_response, dict):
             session_rpe = internal_response.get("values", {}).get("sessionRpe")
             atom_id = evidence_atom_id(internal_response)
@@ -2352,29 +2675,96 @@ def build_mode_evidence_contract(
         *context.get("recentGeneralNotes", []),
     ]
     for item in context_items:
-        if not isinstance(item, dict) or not item.get("unresolvedRedFlag"):
+        if not isinstance(item, dict):
             continue
         is_persistent_context = item is context.get("currentContext")
         is_same_day_note = (
             isinstance(item.get("sourceNoteId"), str)
             and item.get("observedDate") == briefing_packet["today"]
         )
+        # Only the standing current context and a note written today describe
+        # right now. Anything older is history and cannot stop this session.
         if not is_persistent_context and not is_same_day_note:
             continue
         atom_id = evidence_atom_id(item)
         if atom_id is None and isinstance(item.get("sourceEvidenceId"), str):
             atom_id = item["sourceEvidenceId"]
-        if atom_id is not None:
+        if atom_id is None:
+            continue
+        classification = item.get("safetyClassification")
+        kind = (
+            classification.get("kind") if isinstance(classification, dict) else None
+        )
+        planned_pause = (
+            classification.get("plannedPause")
+            if isinstance(classification, dict)
+            else None
+        )
+        # A current report that describes something physically wrong is citable
+        # for stopping even when the urgent lexicons did not classify it. A
+        # regex does not determine medical safety, and forcing `normal` because
+        # no exact keyword fired is the failure this route exists to prevent.
+        # Text with no current complaint and no planned pause in it stays
+        # ordinary context and unlocks nothing.
+        self_report = (
+            classification.get("currentSelfReport")
+            if isinstance(classification, dict)
+            else None
+        )
+        if (
+            kind is not None
+            or isinstance(planned_pause, dict)
+            or (isinstance(self_report, dict) and self_report.get("eligible"))
+        ):
+            conservative_stop_ids.add(atom_id)
+        if kind == "unclassified_current_complaint":
+            push_blocking_context_ids.add(atom_id)
+            light_adverse_ids.add(atom_id)
+        # Two situations are not a menu. A current emergency-warning report and
+        # a deliberate non-training day both mean today's answer is "do not
+        # train", so ordinary training advice must be impossible, not merely
+        # discouraged. An ambiguous complaint and a concerning combination stay
+        # options for the model to weigh; they are screening heuristics, not
+        # findings, and equating them with a definite emergency would make the
+        # supervisor cry wolf.
+        if kind == "emergency_warning_symptom":
+            mandatory_rest_ids.add(atom_id)
+        if isinstance(planned_pause, dict) and planned_pause.get(
+            "kind"
+        ) == "planned_rest" and planned_pause.get("scope") in {"today", "unscoped"}:
+            mandatory_rest_ids.add(atom_id)
+        if item.get("unresolvedRedFlag") or kind == "concerning_combination":
             rest_ids.add(atom_id)
+            medical_rest_ids.add(atom_id)
             light_adverse_ids.add(atom_id)
             secondary_adverse_ids.add(atom_id)
+            push_blocking_context_ids.add(atom_id)
+        if isinstance(planned_pause, dict):
+            # Ordinary programming, not illness and not a measured downturn.
+            # A deliberate day off has to be able to stop a push recommendation
+            # without being dressed up as a safety event.
+            if planned_pause.get("kind") == "planned_rest":
+                planned_rest_ids.add(atom_id)
+                rest_ids.add(atom_id)
+            else:
+                planned_deload_ids.add(atom_id)
+                light_adverse_ids.add(atom_id)
+                secondary_adverse_ids.add(atom_id)
+            push_blocking_context_ids.add(atom_id)
 
     push_groups: list[frozenset[str]] = []
-    push_blockers = set(rest_ids) | recent_pain_ids | direct_current_adverse_ids
+    push_blockers = (
+        set(rest_ids)
+        | recent_pain_ids
+        | direct_current_adverse_ids
+        | push_blocking_context_ids
+    )
     decline_groups: list[frozenset[str]] = []
+    difficulty_groups: list[frozenset[str]] = []
     for movement in briefing_packet["comparableMovementExposures"]:
-        eligible_push: list[tuple[str, str, float]] = []
-        eligible_decline: list[tuple[str, str, float]] = []
+        eligible_push: list[dict[str, Any]] = []
+        eligible_decline: list[dict[str, Any]] = []
+        eligible_difficulty: list[dict[str, Any]] = []
         for exposure in movement["exposures"]:
             work_id = exposure.get("evidenceId") or exposure.get(
                 "sourceWorkEvidenceId"
@@ -2431,19 +2821,31 @@ def build_mode_evidence_contract(
                 if internal_id is not None:
                     push_blockers.add(internal_id)
             completion = exposure.get("programCompletion")
-            marker = exposure.get("performanceMarker")
+            comparison = exposure.get("progressComparison")
             exact = (
                 exposure.get("comparability")
                 == "same_exercise_same_target_rep_range"
             )
-            progression_eligible = (
-                isinstance(completion, dict)
-                and completion.get("eligibleForProgressionTrend") is True
-            )
-            marker_value = (
-                marker.get("value") if isinstance(marker, dict) else None
-            )
-            if not exact or not progression_eligible or not finite_number(marker_value):
+            if not exact or not isinstance(completion, dict):
+                continue
+            if not isinstance(comparison, dict):
+                continue
+            basis = comparison.get("basis")
+            if basis == "estimated_one_rep_max":
+                reading = comparison.get("value")
+                load_key: float | None = None
+            elif basis == "same_setting_reps":
+                reading = comparison.get("repsAtLoadValue")
+                load_key = (
+                    float(comparison["loadValue"])
+                    if finite_number(comparison.get("loadValue"))
+                    else None
+                )
+                if load_key is None:
+                    continue
+            else:
+                continue
+            if not finite_number(reading):
                 continue
             if not observed_within_recent_window(
                 exposure.get("observedAt"),
@@ -2451,50 +2853,123 @@ def build_mode_evidence_contract(
                 days=PERFORMANCE_COMPARATOR_WINDOW_DAYS,
             ):
                 continue
-            eligible_decline.append((work_id, story_id, float(marker_value)))
+            item = {
+                "workId": work_id,
+                "storyId": story_id,
+                "basis": basis,
+                "convention": comparison.get("loadConvention"),
+                "loadKey": load_key,
+                "reading": float(reading),
+                "sessionRpe": session_rpe,
+                "internalId": evidence_atom_id(internal),
+                "performance": performance,
+            }
+            # Observed performance — in EITHER direction — needs comparable
+            # measurement, not target adherence. Work that fell short of the
+            # band is exactly what a decline is made of.
+            if completion.get("eligibleForComparableObservation") is True:
+                eligible_decline.append(item)
+                if isinstance(session_rpe, int):
+                    eligible_difficulty.append(item)
+            # Readiness to ADD LOAD is a stricter, separate question: the
+            # planned sets were completed, nothing fell below the target
+            # minimum, and the session was not a bad one. Reps ABOVE the band
+            # no longer disqualify it.
             if (
-                isinstance(performance, int)
+                completion.get("eligibleForProgressionTrend") is True
+                and isinstance(performance, int)
                 and performance >= 3
                 and pain_impact == "none"
                 and not (isinstance(session_rpe, int) and session_rpe >= 9)
             ):
-                eligible_push.append(
-                    (work_id, story_id, float(marker_value))
-                )
-        distinct_push: list[tuple[str, str, float]] = []
-        seen_push_stories: set[str] = set()
-        for item in eligible_push:
-            if item[1] not in seen_push_stories:
-                distinct_push.append(item)
-                seen_push_stories.add(item[1])
+                eligible_push.append(item)
+
+        def distinct_by_story(
+            items: list[dict[str, Any]], limit: int
+        ) -> list[dict[str, Any]]:
+            selected: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for candidate in items:
+                if candidate["storyId"] in seen:
+                    continue
+                selected.append(candidate)
+                seen.add(candidate["storyId"])
+                if len(selected) == limit:
+                    break
+            return selected
+
+        def mutually_comparable(items: list[dict[str, Any]]) -> bool:
+            # One basis for the whole group, and for the ordinal basis the
+            # recorded setting has to be identical — "more reps at a lighter
+            # machine setting" is not progress.
+            if len({item["basis"] for item in items}) != 1:
+                return False
+            # Exactly the same convention, not merely a compatible reading. An
+            # unrecorded legacy row and an explicit total are not paired for a
+            # progression or decline claim.
+            if len({item["convention"] for item in items}) != 1:
+                return False
+            if items[0]["basis"] == "same_setting_reps":
+                return len({item["loadKey"] for item in items}) == 1
+            return True
+
+        distinct_push = distinct_by_story(eligible_push, 2)
         if (
-            len(distinct_push) >= 2
-            and distinct_push[0][2] >= distinct_push[1][2]
+            len(distinct_push) == 2
+            and mutually_comparable(distinct_push)
+            and distinct_push[0]["reading"] >= distinct_push[1]["reading"]
         ):
             push_groups.append(
-                frozenset(item[0] for item in distinct_push[:2])
+                frozenset(item["workId"] for item in distinct_push)
             )
-        distinct_decline: list[tuple[str, str, float]] = []
-        seen_decline_stories: set[str] = set()
-        for item in eligible_decline:
-            if item[1] not in seen_decline_stories:
-                distinct_decline.append(item)
-                seen_decline_stories.add(item[1])
-            if len(distinct_decline) == 3:
-                break
+        distinct_decline = distinct_by_story(eligible_decline, 3)
         if (
             len(distinct_decline) == 3
-            and distinct_decline[0][2] < distinct_decline[1][2]
-            and distinct_decline[1][2] < distinct_decline[2][2]
-            and distinct_decline[2][2] > 0
+            and mutually_comparable(distinct_decline)
+            and distinct_decline[0]["reading"] < distinct_decline[1]["reading"]
+            and distinct_decline[1]["reading"] < distinct_decline[2]["reading"]
+            and distinct_decline[2]["reading"] > 0
             and (
-                (distinct_decline[2][2] - distinct_decline[0][2])
-                / distinct_decline[2][2]
+                # The percentage gate applies only to the continuous estimate.
+                # A strict fall in reps at an identical setting is already a
+                # whole-unit change; there is no meaningful "3% of a rep".
+                distinct_decline[0]["basis"] == "same_setting_reps"
+                or (
+                    (
+                        distinct_decline[2]["reading"]
+                        - distinct_decline[0]["reading"]
+                    )
+                    / distinct_decline[2]["reading"]
+                )
+                >= DELOAD_MIN_TOTAL_DECLINE_FRACTION
             )
-            >= DELOAD_MIN_TOTAL_DECLINE_FRACTION
         ):
             decline_groups.append(
-                frozenset(item[0] for item in distinct_decline)
+                frozenset(item["workId"] for item in distinct_decline)
+            )
+        # Second, independent route to a reactive deload: the same movement
+        # took repeatedly high effort without improving. A percentage fall in a
+        # noisy estimate is not the only way training can be going badly, and
+        # requiring one made the estimate look like physiological truth.
+        distinct_difficulty = distinct_by_story(eligible_difficulty, 2)
+        if (
+            len(distinct_difficulty) == 2
+            and mutually_comparable(distinct_difficulty)
+            and all(
+                isinstance(item["sessionRpe"], int) and item["sessionRpe"] >= 8
+                for item in distinct_difficulty
+            )
+            and distinct_difficulty[0]["reading"]
+            <= distinct_difficulty[1]["reading"]
+            and distinct_difficulty[0]["internalId"] is not None
+        ):
+            difficulty_groups.append(
+                frozenset(
+                    {
+                        *(item["workId"] for item in distinct_difficulty),
+                        distinct_difficulty[0]["internalId"],
+                    }
+                )
             )
     return {
         "restEvidenceIds": frozenset(rest_ids),
@@ -2503,6 +2978,12 @@ def build_mode_evidence_contract(
         "pushBlockingEvidenceIds": frozenset(push_blockers),
         "deloadDeclineGroups": tuple(decline_groups),
         "deloadSecondaryAdverseEvidenceIds": frozenset(secondary_adverse_ids),
+        "conservativeStopEvidenceIds": frozenset(conservative_stop_ids),
+        "plannedRestEvidenceIds": frozenset(planned_rest_ids),
+        "plannedDeloadEvidenceIds": frozenset(planned_deload_ids),
+        "mandatoryRestEvidenceIds": frozenset(mandatory_rest_ids),
+        "medicalRestEvidenceIds": frozenset(medical_rest_ids),
+        "repeatedDifficultyGroups": tuple(difficulty_groups),
     }
 
 def build_model_input_bundle(
@@ -2545,7 +3026,7 @@ def build_model_input_bundle(
         sets_by_session,
         recent_episodes_by_session,
     )
-    user_context = build_user_context(facts, original_plan)
+    user_context = build_user_context(facts, original_plan, today=today)
     session_safety = build_session_safety_events(recent_episodes)
     user_context["safetyEvents"] = sorted(
         [*user_context["safetyEvents"], *session_safety],
@@ -2608,6 +3089,22 @@ def build_model_input_bundle(
                 "deloadMinimumOldestToNewestDeclineFraction": (
                     DELOAD_MIN_TOTAL_DECLINE_FRACTION
                 ),
+                "deloadDeclineFractionAppliesTo": (
+                    "continuous_one_rep_max_estimate_only"
+                ),
+                "deloadAlternativeRoutes": [
+                    "explicit_planned_deload_in_current_user_context",
+                    "repeated_comparable_difficulty_without_improvement",
+                ],
+                "restRoutes": [
+                    "reported_pain_that_stopped_a_retained_workout",
+                    "current_unresolved_red_flag",
+                    "explicit_planned_rest_day_in_current_user_context",
+                    "current_user_report_the_keyword_screen_did_not_classify",
+                ],
+                "safetyScreenPolicy": SAFETY_SCREEN_POLICY,
+                "conservativeStopPolicy": CONSERVATIVE_STOP_POLICY,
+                "deloadCadencePolicy": "no_universal_cadence_individualized_only",
             },
             "eligibleOlderPeriodicSummaryCount": eligible_summary_count,
             "retainedOlderPeriodicSummaryCount": len(older_summaries),
@@ -2931,6 +3428,14 @@ def build_model_input_bundle(
         ],
         evidence_source_story_ids=evidence_stories,
         evidence_domains=evidence_domains,
+        conservative_stop_evidence_ids=mode_contract[
+            "conservativeStopEvidenceIds"
+        ],
+        planned_rest_evidence_ids=mode_contract["plannedRestEvidenceIds"],
+        planned_deload_evidence_ids=mode_contract["plannedDeloadEvidenceIds"],
+        mandatory_rest_evidence_ids=mode_contract["mandatoryRestEvidenceIds"],
+        medical_rest_evidence_ids=mode_contract["medicalRestEvidenceIds"],
+        deload_difficulty_groups=mode_contract["repeatedDifficultyGroups"],
     )
 
 def model_prompt_telemetry(

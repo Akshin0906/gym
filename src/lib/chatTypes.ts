@@ -1,6 +1,35 @@
 import type { MuscleGroup } from '../db/types'
 
-export type CoachReasoningEffort = 'medium' | 'xhigh'
+// Every effort value that can appear on a stored transcript row, and every
+// effort the bridge will execute. `medium` and `xhigh` were the defaults of
+// bridge <= 1.4 on `gpt-5.6-sol`; `gpt-6-astra` advertises all three, so those
+// rows stay readable AND a job an older client already queued still runs.
+export type CoachReasoningEffort = 'medium' | 'high' | 'xhigh'
+
+// The effort newly composed messages are sent at. This is a product default,
+// not a catalog limitation.
+export const COACH_REQUEST_REASONING_EFFORT = 'high' as const
+
+export type CoachRequestReasoningEffort = typeof COACH_REQUEST_REASONING_EFFORT
+
+// The model new Coach turns run on. Historical rows keep whatever model string
+// answered them.
+export const COACH_MODEL = 'gpt-6-astra'
+
+export const COACH_REASONING_EFFORT_LABELS: Record<
+  CoachReasoningEffort,
+  string
+> = {
+  medium: 'Medium reasoning',
+  high: 'High reasoning',
+  xhigh: 'Deep Think',
+}
+
+export function isCoachReasoningEffort(
+  value: unknown,
+): value is CoachReasoningEffort {
+  return value === 'medium' || value === 'high' || value === 'xhigh'
+}
 
 export type CoachMessageRole = 'user' | 'assistant'
 

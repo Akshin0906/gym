@@ -1,4 +1,9 @@
-import { assignUniqueNormalizedNames, db, LOCAL_ONLY_TABLE_NAMES } from '../schema'
+import {
+  assignUniqueNormalizedNames,
+  correctedStockExercise,
+  db,
+  LOCAL_ONLY_TABLE_NAMES,
+} from '../schema'
 import { parseCoachActionResultJson } from '../../lib/coachActionResult'
 import { normalizedExerciseName } from '../../lib/exerciseName'
 import { isLoadConvention, isSetKind, isValidRepBounds } from '../../lib/measurement'
@@ -854,7 +859,11 @@ export function assertImportByteLength(byteLength: number): void {
 // logged set, template reference, and snapshot survives the restore.
 function withUniqueNormalizedNames(rows: Exercise[]): Exercise[] {
   const withKeys = rows.map((row) => ({
-    ...row,
+    // A backup taken before the muscle-mapping correction still carries the old
+    // stock rows, and restore replaces the whole database — so without this the
+    // one-time version-8 upgrade would be undone by a legacy restore. Only an
+    // untouched stock row is rewritten; a customized one is restored verbatim.
+    ...(correctedStockExercise(row) ?? row),
     normalizedName: normalizedExerciseName(row.name),
   }))
   const changes = new Map(

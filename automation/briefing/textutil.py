@@ -12,7 +12,10 @@ from .constants import (
     DISPLAY_TEXT_EXCERPT_MAX_CHARS,
     PACIFIC,
     RECENT_ADVERSE_WINDOW_DAYS,
-    REST_RED_FLAG_RE,
+)
+from .safety import (
+    classify_safety_text,
+    has_unresolved_red_flag as safety_has_unresolved_red_flag,
 )
 from .primitives import (
     finite_number,
@@ -136,147 +139,9 @@ def display_text(value: Any, fallback: str) -> tuple[str, dict[str, Any]]:
     cleaned = optional_text(value) or fallback
     return text_excerpt(cleaned, DISPLAY_TEXT_EXCERPT_MAX_CHARS)
 
-def has_unresolved_red_flag(value: str) -> bool:
-    sentences = [
-        sentence.strip()
-        for sentence in re.split(r"[.!?\n]+", value)
-        if sentence.strip()
-    ]
-    for sentence_index, sentence in enumerate(sentences):
-        for match in REST_RED_FLAG_RE.finditer(sentence):
-            prefix = sentence[max(0, match.start() - 80) : match.start()]
-            suffix = sentence[match.end() : min(len(sentence), match.end() + 80)]
-            next_sentence_raw = (
-                sentences[sentence_index + 1][:120]
-                if sentence_index + 1 < len(sentences)
-                else ""
-            )
-            next_sentence_has_transition = re.search(
-                r"\b(?:return(?:ed|s|ing)?|recur(?:red|s|ring)?|"
-                r"(?:came|come)\s+back|back\s+again|persists?|"
-                r"worsen(?:ed|ing)?|resolved|gone|cleared|recovered|"
-                r"better\s+now|ruled\s+out)\b",
-                next_sentence_raw,
-                re.IGNORECASE,
-            )
-            next_sentence_subject = re.match(
-                r"^(?:it|this|that|they|symptoms?|"
-                r"(?:the|my)\s+(?:pain|symptoms?|issue|problem))\b",
-                next_sentence_raw,
-                re.IGNORECASE,
-            )
-            pronoun_return = re.match(
-                r"^(?:it|this|that|they)\s+return(?:ed|s|ing)?\b(?P<tail>.*)$",
-                next_sentence_raw,
-                re.IGNORECASE,
-            )
-            pronoun_return_is_recurrence = (
-                pronoun_return is None
-                or re.match(
-                    r"^\s*(?:$|today\b|again\b|now\b|yesterday\b|overnight\b|"
-                    r"this\s+(?:morning|afternoon|evening)\b|last\s+night\b|"
-                    r"and\s+(?:worsen(?:ed|ing)?|(?:is|was|feels?|felt|got)\s+worse)\b)",
-                    pronoun_return.group("tail"),
-                    re.IGNORECASE,
-                )
-                is not None
-            )
-            next_sentence = (
-                next_sentence_raw
-                if next_sentence_has_transition is not None
-                and next_sentence_subject is not None
-                and pronoun_return_is_recurrence
-                else ""
-            )
-            forward_context = f"{suffix} {next_sentence}".strip()
-            recurrence = None
-            negated_absence_recurrence = False
-            for candidate in re.finditer(
-                r"\b(?:return(?:ed|s|ing)?|recur(?:red|s|ring)?|"
-                r"(?:came|come)\s+back|"
-                r"back\s+again|persists?|worsen(?:ed|ing)?)\b",
-                forward_context,
-                re.IGNORECASE,
-            ):
-                recurrence_text = candidate.group(0).lower()
-                recurrence_suffix = forward_context[
-                    candidate.end() : min(len(forward_context), candidate.end() + 40)
-                ]
-                if recurrence_text.startswith("return") and re.match(
-                    r"^\s+(?:to\s+(?:normal|baseline|training)\b|home\b)",
-                    recurrence_suffix,
-                    re.IGNORECASE,
-                ):
-                    continue
-                recurrence_prefix = forward_context[
-                    max(0, candidate.start() - 48) : candidate.start()
-                ]
-                local_recurrence_prefix = re.split(
-                    r"\b(?:but|however|although|yet)\b",
-                    recurrence_prefix,
-                    flags=re.IGNORECASE,
-                )[-1]
-                if re.search(
-                    r"\b(?:no|not|never|have\s+not|haven['’]t|"
-                    r"has\s+not|hasn['’]t|had\s+not|"
-                    r"hadn['’]t|did\s+not|didn['’]t|without)\b"
-                    r"(?:\W+\w+){0,3}\W*$",
-                    local_recurrence_prefix,
-                    re.IGNORECASE,
-                ):
-                    if recurrence_text.startswith(
-                        ("return", "recur", "came back", "come back", "back again")
-                    ):
-                        negated_absence_recurrence = True
-                    continue
-                recurrence = candidate
-                break
-            local_prefix = re.split(
-                r"\b(?:but|however|although|yet)\b",
-                prefix,
-                flags=re.IGNORECASE,
-            )[-1]
-            if recurrence is None and re.search(
-                r"\b(?:no|not|never|without|do\s+not|don['’]t|does\s+not|"
-                r"doesn['’]t|did\s+not|didn['’]t|have\s+not|haven['’]t|"
-                r"has\s+not|hasn['’]t|"
-                r"had\s+not|hadn['’]t|den(?:y|ies|ied)|"
-                r"no\s+longer|negative\s+for|history\s+of|"
-                r"previous(?:ly)?|prior|yesterday|last\s+(?:week|month)|"
-                r"earlier|\w+\s+ago)\b(?:\W+\w+){0,5}\W*$",
-                local_prefix,
-                re.IGNORECASE,
-            ):
-                continue
-            historical_after_match = re.match(
-                r"^\W*(?:yesterday|last\s+(?:week|month)|earlier|"
-                r"\d+\s+(?:days?|weeks?|months?)\s+ago)\b",
-                suffix,
-                re.IGNORECASE,
-            )
-            if recurrence is None and historical_after_match is not None:
-                continue
-            if recurrence is None and negated_absence_recurrence:
-                continue
-            resolved = re.search(
-                r"(?:\b(?:resolved|gone|cleared|recovered|better\s+now|ruled\s+out)\b|"
-                r"\breturn(?:ed|s|ing)?\s+to\s+(?:normal|baseline)\b|"
-                r"[-\s]free\b)",
-                forward_context,
-                re.IGNORECASE,
-            )
-            if (
-                resolved is not None
-                and (recurrence is None or resolved.start() > recurrence.start())
-                and not re.search(
-                    r"\bnot\s+(?:resolved|gone|cleared|recovered|better)\b",
-                    forward_context[: resolved.end()],
-                    re.IGNORECASE,
-                )
-            ):
-                continue
-            return True
-    return False
+# Re-exported so every existing import site keeps working while the scoping,
+# symptom-combination, and planned-pause rules live in one reviewed module.
+has_unresolved_red_flag = safety_has_unresolved_red_flag
 
 def compact_rows_by_id(
     rows: list[dict[str, Any]],

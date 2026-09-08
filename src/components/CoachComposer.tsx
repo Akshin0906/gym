@@ -1,6 +1,10 @@
-import { ArrowUp, Brain, Sparkles } from 'lucide-react'
+import { ArrowUp, Sparkles } from 'lucide-react'
 import { useRef, useState } from 'react'
-import type { CoachReasoningEffort } from '../lib/chatTypes'
+import {
+  COACH_MODEL,
+  COACH_REQUEST_REASONING_EFFORT,
+  type CoachRequestReasoningEffort,
+} from '../lib/chatTypes'
 
 const ACTIVE_PROMPTS = [
   'Swap an exercise for me',
@@ -24,11 +28,10 @@ export function CoachComposer({
 }: {
   hasActiveWorkout: boolean
   disabled: boolean
-  onSend: (text: string, effort: CoachReasoningEffort) => Promise<void>
+  onSend: (text: string, effort: CoachRequestReasoningEffort) => Promise<void>
   onDraftChange: () => void
 }) {
   const [text, setText] = useState('')
-  const [deepThink, setDeepThink] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const prompts = hasActiveWorkout ? ACTIVE_PROMPTS : GENERAL_PROMPTS
 
@@ -36,9 +39,10 @@ export function CoachComposer({
     const trimmed = text.trim()
     if (!trimmed || disabled) return
     try {
-      await onSend(trimmed, deepThink ? 'xhigh' : 'medium')
+      // Every new message runs at the single supported effort. There is no
+      // quiet downgrade path, so there is nothing here to choose.
+      await onSend(trimmed, COACH_REQUEST_REASONING_EFFORT)
       setText('')
-      setDeepThink(false)
     } catch {
       // The parent displays the request error and the draft stays available.
     }
@@ -93,26 +97,19 @@ export function CoachComposer({
           className="w-full resize-none bg-transparent px-2 py-1.5 text-base leading-6 outline-none placeholder:text-[var(--color-fg-faint)] disabled:opacity-60"
         />
         <div className="flex items-center gap-2 pt-1">
-          <button
-            type="button"
-            aria-pressed={deepThink}
-            onClick={() => {
-              onDraftChange()
-              setDeepThink((value) => !value)
-            }}
-            disabled={disabled}
+          <span
             className="min-h-11 inline-flex items-center gap-1.5 rounded-full px-3 py-2 text-xs font-semibold border"
             style={{
-              color: deepThink ? 'var(--color-accent)' : 'var(--color-fg-dim)',
-              background: deepThink ? 'var(--color-accent-soft)' : 'transparent',
-              borderColor: deepThink ? 'var(--color-accent-strong)' : 'var(--color-border)',
+              color: 'var(--color-accent)',
+              background: 'var(--color-accent-soft)',
+              borderColor: 'var(--color-accent-strong)',
             }}
           >
-            {deepThink ? <Sparkles size={13} /> : <Brain size={13} />}
-            Deep Think
-          </button>
+            <Sparkles size={13} />
+            High reasoning
+          </span>
           <span className="flex-1 text-[10px] text-[var(--color-fg-faint)]">
-            {deepThink ? 'Extra High intelligence' : 'Medium reasoning'}
+            {COACH_MODEL}
           </span>
           <button
             type="button"

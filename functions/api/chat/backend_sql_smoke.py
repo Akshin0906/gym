@@ -26,6 +26,7 @@ class ChatBackendSqlSmokeTest(unittest.TestCase):
         for migration in (
             "0004_codex_chat.sql",
             "0005_codex_chat_maintenance.sql",
+            "0009_codex_chat_high_effort.sql",
         ):
             self.db.executescript((ROOT / "migrations" / migration).read_text())
         self.db.execute(
@@ -425,6 +426,227 @@ class ChatBackendSqlSmokeTest(unittest.TestCase):
             (CONVERSATION_ID,),
         ).fetchone()[0]
         self.assertGreater(revised, initial)
+
+
+class HighEffortMigrationTest(unittest.TestCase):
+    """Migration 0009 widens the effort constraint without losing anything.
+
+    The chat tables are rebuilt to change a CHECK constraint, which is the one
+    SQLite operation that can silently drop linked rows, indexes, or an
+    AUTOINCREMENT high-water mark. Each of those is asserted here against a
+    populated database, not an empty one.
+    """
+
+    MIGRATION = ROOT / "migrations" / "0009_codex_chat_high_effort.sql"
+
+    def setUp(self) -> None:
+        self.db = sqlite3.connect(":memory:")
+        self.db.execute("PRAGMA foreign_keys = ON")
+        for migration in (
+            "0004_codex_chat.sql",
+            "0005_codex_chat_maintenance.sql",
+        ):
+            self.db.executescript((ROOT / "migrations" / migration).read_text())
+
+    def tearDown(self) -> None:
+        self.db.close()
+
+    def _seed_linked_history(self) -> None:
+        self.db.execute(
+            "INSERT INTO codex_chat_conversations VALUES (?, 1, 1, 'thread-1')",
+            (CONVERSATION_ID,),
+        )
+        self.db.execute(
+            "INSERT INTO codex_chat_contexts VALUES ('ctx-1', ?, ?, '{}', 1)",
+            (CONVERSATION_ID, "a" * 64),
+        )
+        self.db.execute(
+            """INSERT INTO codex_chat_messages
+               (id, conversation_id, role, text, client_message_id,
+                reasoning_effort, model, created_at)
+               VALUES ('m-user', ?, 'user', 'hi', 'client-1', 'xhigh', NULL, 10)""",
+            (CONVERSATION_ID,),
+        )
+        self.db.execute(
+            """INSERT INTO codex_chat_messages
+               (id, conversation_id, role, text, client_message_id,
+                reasoning_effort, model, created_at)
+               VALUES ('m-assistant', ?, 'assistant', 'yo', NULL,
+                       'medium', 'gpt-5.6-sol', 11)""",
+            (CONVERSATION_ID,),
+        )
+        self.db.execute(
+            """INSERT INTO codex_chat_jobs
+               (id, conversation_id, user_message_id, assistant_message_id,
+                context_id, reasoning_effort, status, attempts, max_attempts,
+                available_at, worker_id, lease_token, lease_expires_at,
+                claimed_at, completed_at, last_error, completion_hash,
+                created_at, updated_at)
+               VALUES ('job-1', ?, 'm-user', 'm-assistant', 'ctx-1', 'xhigh',
+                       'completed', 1, 3, 0, NULL, NULL, NULL, NULL, 12, NULL,
+                       'hash', 10, 12)""",
+            (CONVERSATION_ID,),
+        )
+        self.db.execute(
+            """INSERT INTO codex_chat_action_proposals
+               (id, conversation_id, job_id, assistant_message_id, status,
+                action_plan_json, result_json, created_at, updated_at)
+               VALUES ('proposal-1', ?, 'job-1', 'm-assistant', 'proposed',
+                       '{}', NULL, 12, 12)""",
+            (CONVERSATION_ID,),
+        )
+        self.db.commit()
+
+    def _apply(self) -> None:
+        self.db.executescript(self.MIGRATION.read_text())
+
+    def test_linked_history_and_indexes_survive(self) -> None:
+        self._seed_linked_history()
+        before = self.db.execute(
+            "SELECT sequence, id, reasoning_effort, model FROM codex_chat_messages"
+            " ORDER BY sequence"
+        ).fetchall()
+        self._apply()
+        self.assertEqual(
+            self.db.execute("PRAGMA integrity_check").fetchone(), ("ok",)
+        )
+        self.assertEqual(self.db.execute("PRAGMA foreign_key_check").fetchall(), [])
+        self.assertEqual(
+            self.db.execute(
+                "SELECT sequence, id, reasoning_effort, model"
+                " FROM codex_chat_messages ORDER BY sequence"
+            ).fetchall(),
+            before,
+        )
+        # Historical efforts are preserved, never rewritten to the new default.
+        self.assertEqual(
+            self.db.execute(
+                "SELECT reasoning_effort FROM codex_chat_jobs WHERE id = 'job-1'"
+            ).fetchone()[0],
+            "xhigh",
+        )
+        self.assertEqual(
+            self.db.execute(
+                "SELECT COUNT(*) FROM codex_chat_action_proposals"
+            ).fetchone()[0],
+            1,
+        )
+        indexes = {
+            row[0]
+            for row in self.db.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+                " AND name LIKE 'idx_codex_chat%'"
+            )
+        }
+        self.assertLessEqual(
+            {
+                "idx_codex_chat_messages_conversation_sequence",
+                "idx_codex_chat_jobs_claim",
+                "idx_codex_chat_jobs_conversation",
+                "idx_codex_chat_proposals_conversation_status",
+                "idx_codex_chat_jobs_retention",
+                "idx_codex_chat_proposals_retention",
+                "idx_codex_chat_jobs_context",
+                "idx_codex_chat_jobs_assistant_message",
+            },
+            indexes,
+        )
+
+    def test_high_is_accepted_and_nonsense_is_still_rejected(self) -> None:
+        self._seed_linked_history()
+        self._apply()
+        self.db.execute(
+            """INSERT INTO codex_chat_messages
+               (id, conversation_id, role, text, client_message_id,
+                reasoning_effort, model, created_at)
+               VALUES ('m-new', ?, 'user', 'hi', 'client-2', 'high', NULL, 20)""",
+            (CONVERSATION_ID,),
+        )
+        self.db.execute(
+            """INSERT INTO codex_chat_jobs
+               (id, conversation_id, user_message_id, assistant_message_id,
+                context_id, reasoning_effort, status, attempts, max_attempts,
+                available_at, worker_id, lease_token, lease_expires_at,
+                claimed_at, completed_at, last_error, completion_hash,
+                created_at, updated_at)
+               VALUES ('job-2', ?, 'm-new', NULL, 'ctx-1', 'high', 'queued',
+                       0, 3, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                       20, 20)""",
+            (CONVERSATION_ID,),
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute(
+                """INSERT INTO codex_chat_jobs
+                   (id, conversation_id, user_message_id, assistant_message_id,
+                    context_id, reasoning_effort, status, attempts, max_attempts,
+                    available_at, worker_id, lease_token, lease_expires_at,
+                    claimed_at, completed_at, last_error, completion_hash,
+                    created_at, updated_at)
+                   VALUES ('job-3', ?, 'm-new', NULL, 'ctx-1', 'ultra',
+                           'queued', 0, 3, 0, NULL, NULL, NULL, NULL, NULL,
+                           NULL, NULL, 20, 20)""",
+                (CONVERSATION_ID,),
+            )
+
+    def test_cascade_behaviour_is_unchanged(self) -> None:
+        self._seed_linked_history()
+        self._apply()
+        self.db.execute("DELETE FROM codex_chat_jobs WHERE id = 'job-1'")
+        self.assertEqual(
+            self.db.execute(
+                "SELECT COUNT(*) FROM codex_chat_action_proposals"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_the_autoincrement_watermark_is_preserved(self) -> None:
+        # Retention deletes old transcript rows, so the high-water mark is
+        # routinely far above MAX(sequence). Losing it would reissue sequence
+        # numbers that clients and cursors have already seen.
+        self._seed_linked_history()
+        self.db.execute(
+            """INSERT INTO codex_chat_messages
+               (sequence, id, conversation_id, role, text, client_message_id,
+                reasoning_effort, model, created_at)
+               VALUES (1000, 'm-high', ?, 'user', 'hi', 'client-high',
+                       'medium', NULL, 50)""",
+            (CONVERSATION_ID,),
+        )
+        self.db.execute("DELETE FROM codex_chat_messages WHERE id = 'm-high'")
+        self._apply()
+        self.assertEqual(
+            self.db.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'codex_chat_messages'"
+            ).fetchone()[0],
+            1000,
+        )
+        self.db.execute(
+            """INSERT INTO codex_chat_messages
+               (id, conversation_id, role, text, client_message_id,
+                reasoning_effort, model, created_at)
+               VALUES ('m-next', ?, 'user', 'hi', 'client-next', 'high',
+                       NULL, 60)""",
+            (CONVERSATION_ID,),
+        )
+        self.assertEqual(
+            self.db.execute(
+                "SELECT sequence FROM codex_chat_messages WHERE id = 'm-next'"
+            ).fetchone()[0],
+            1001,
+        )
+
+    def test_the_watermark_survives_an_empty_retained_transcript(self) -> None:
+        self._seed_linked_history()
+        self.db.execute("DELETE FROM codex_chat_action_proposals")
+        self.db.execute("DELETE FROM codex_chat_jobs")
+        self.db.execute("DELETE FROM codex_chat_messages")
+        self._apply()
+        self.assertEqual(
+            self.db.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'codex_chat_messages'"
+            ).fetchone()[0],
+            2,
+        )
 
 
 if __name__ == "__main__":
